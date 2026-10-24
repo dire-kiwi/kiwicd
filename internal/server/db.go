@@ -170,6 +170,8 @@ var migrations = []struct{ table, column, sql string }{
 	// Hash of the token a job gets as secrets.KIWICD_TOKEN (see jobtoken.go).
 	{"jobs", "token_hash", `ALTER TABLE jobs ADD COLUMN token_hash TEXT NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS jobs_token ON jobs(token_hash) WHERE token_hash != ''`},
+	// Repositories whose jobs' KIWICD_TOKEN may fetch this one (see jobtoken.go).
+	{"repos", "readers", `ALTER TABLE repos ADD COLUMN readers TEXT NOT NULL DEFAULT '[]'`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

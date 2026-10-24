@@ -804,6 +804,96 @@ function KnownHostsModal({
   );
 }
 
+/** The repositories whose jobs may fetch this one with secrets.KIWICD_TOKEN. */
+function ReadersSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const repos = useFetch<Repo[]>("/api/repos");
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const readers = repo.readers ?? [];
+  const has = (n: string) => readers.some((r) => r.toLowerCase() === n.toLowerCase());
+  const candidates = (repos.data ?? []).map((r) => r.name).filter((n) => n !== repo.name && !has(n));
+
+  const save = async (next: string[]): Promise<boolean> => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { readers: next });
+      onChanged();
+      return true;
+    } catch (e) {
+      setError(errorMessage(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Job access</h3>
+          <p className="muted small">
+            Repositories whose <span className="mono">repository_push</span> and manually run jobs can fetch this one with{" "}
+            <span className="mono">secrets.KIWICD_TOKEN</span>, when their workflow listens to it. Jobs can always fetch their own
+            repository.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv kv-pad">
+        <span className="label">Readers</span>
+        <div className="stack-sm">
+          {readers.length > 0 ? (
+            <ul className="plain-list reader-list">
+              {readers.map((r) => (
+                <li key={r}>
+                  <span className="mono">{r}</span>
+                  <button
+                    className="btn btn-sm"
+                    disabled={busy}
+                    onClick={() => {
+                      if (confirm(`Stop ${r}'s jobs fetching ${repo.name}?`)) void save(readers.filter((x) => x !== r));
+                    }}
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <span className="muted">None: only this repository's own jobs can fetch it.</span>
+          )}
+          <form
+            className="copy-field"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (await save([...readers, name.trim()])) setName("");
+            }}
+          >
+            <input
+              className="input mono"
+              placeholder="owner/name"
+              list="reader-candidates"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+            <datalist id="reader-candidates">
+              {candidates.map((n) => (
+                <option key={n} value={n} />
+              ))}
+            </datalist>
+            <button type="submit" className="btn btn-sm" disabled={busy || !name.trim() || has(name.trim())}>
+              Add
+            </button>
+          </form>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
   const navigate = useNavigate();
   const [confirm, setConfirm] = useState(false);
@@ -847,6 +937,7 @@ function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => voi
         </div>
       </section>
       {repo.kind === "mirror" && <MirrorSettings repo={repo} onChanged={onChanged} />}
+      <ReadersSettings repo={repo} onChanged={onChanged} />
       <section className="box box-danger">
         <div className="box-header">
           <div>

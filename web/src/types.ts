@@ -28,6 +28,8 @@ export interface Repo {
   ssh_known_hosts?: string;
   /** Mirrors: host keys in use, as "host type SHA256:fingerprint". */
   ssh_host_keys?: string[];
+  /** Repositories whose repository_push and dispatched jobs may fetch this one with KIWICD_TOKEN. */
+  readers?: string[];
 }
 
 export interface WorkflowInput {

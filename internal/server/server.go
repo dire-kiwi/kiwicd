@@ -63,6 +63,11 @@ type Server struct {
 
 	// archiveMu serialises moving finished jobs' logs to archive files.
 	archiveMu sync.Mutex
+
+	// Workflow files at the tip of each repository's default branch, by
+	// repository ID (see defaultBranchWorkflows).
+	tipMu        sync.Mutex
+	tipWorkflows map[int64]cachedWorkflows
 }
 
 func New(cfg Config) (*Server, error) {
@@ -102,6 +107,8 @@ func New(cfg Config) (*Server, error) {
 		hub:       newHub(),
 		jobsReady: make(chan struct{}),
 		syncLocks: map[int64]*sync.Mutex{},
+
+		tipWorkflows: map[int64]cachedWorkflows{},
 	}, nil
 }
 

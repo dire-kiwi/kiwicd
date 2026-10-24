@@ -14,11 +14,17 @@ import (
 //	git -c http.extraHeader="Authorization: Bearer $KIWICD_TOKEN" clone "$GITHUB_SERVER_URL/git/OWNER/NAME.git"
 //
 // It reads the job's own repository and, for runs started by repository_push
-// or by hand, the repositories the workflow listens to with repository_push.
-// Push runs get only their own repository: their workflow can come from any
-// branch, and a listener added on a branch of a public repository mustn't
-// open a private one to it. repository_push runs take their workflow from the
-// listener's default branch, and dispatches are started by the admin.
+// or by hand, the repositories the workflow listens to with repository_push
+// that list the job's repository among their readers. Push runs get only
+// their own repository: their workflow can come from any branch, and a
+// listener added on a branch of a public repository mustn't open a private
+// one to it. repository_push runs take their workflow from the listener's
+// default branch, and dispatches are started by the admin.
+//
+// Readers are set on the repository being read, so that a listener can't
+// open a repository to itself: any repository's default branch can name
+// another under repository_push, including a public mirror's, where outside
+// contributions land.
 const jobTokenSecret = "KIWICD_TOKEN"
 
 func (s *Server) issueJobToken(jobID int64) (string, error) {
@@ -48,7 +54,7 @@ func (s *Server) jobCanRead(r *http.Request, name string) bool {
 	if err != nil {
 		return false
 	}
-	for _, repo := range jobReadableRepos(run) {
+	for _, repo := range s.jobReadableRepos(run) {
 		if strings.EqualFold(repo, name) {
 			return true
 		}
@@ -56,13 +62,19 @@ func (s *Server) jobCanRead(r *http.Request, name string) bool {
 	return false
 }
 
-func jobReadableRepos(run *Run) []string {
+func (s *Server) jobReadableRepos(run *Run) []string {
 	repos := []string{run.Repo}
 	if run.Event != wf.RepositoryPush && run.Event != "workflow_dispatch" {
 		return repos
 	}
-	if w, err := wf.Parse([]byte(run.WorkflowYAML)); err == nil {
-		repos = append(repos, wf.RepositoryPushSources(w)...)
+	w, err := wf.Parse([]byte(run.WorkflowYAML))
+	if err != nil {
+		return repos
+	}
+	for _, name := range wf.RepositoryPushSources(w) {
+		if src, err := s.getRepo(name); err == nil && containsFold(src.Readers, run.Repo) {
+			repos = append(repos, src.Name)
+		}
 	}
 	return repos
 }

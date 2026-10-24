@@ -244,6 +244,7 @@ func TestRepositoryPush(t *testing.T) {
 	api("POST", "/api/repos", `{"name":"t/app"}`, nil)
 	api("POST", "/api/repos", `{"name":"t/deploy"}`, nil)
 	api("PUT", "/api/secrets?repo=t/deploy", `{"name":"DEPLOY_KEY","value":"deploy-s3cret"}`, nil)
+	api("PATCH", "/api/repos/t/app", `{"readers":["t/deploy"]}`, nil)
 	u := strings.Replace(ts.URL, "http://", "http://admin:pw@", 1)
 	push := func(repo string, files map[string]string) {
 		t.Helper()

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -37,23 +38,28 @@ type Repo struct {
 	SSHPublicKey  string            `json:"ssh_public_key,omitempty"`
 	SSHKnownHosts string            `json:"ssh_known_hosts,omitempty"`
 	SSHHostKeys   []string          `json:"ssh_host_keys,omitempty"`
+	Readers       []string          `json:"readers"` // see jobtoken.go
 	CloneURL      string            `json:"clone_url,omitempty"`
 	WebhookURL    string            `json:"webhook_url,omitempty"`
 }
 
 const repoCols = `id, name, kind, url, default_branch, webhook_secret, refs, last_sync_at, last_sync_error, created_at,
-	synced_at, ssh_key, ssh_public_key, ssh_known_hosts`
+	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
-	var refs string
+	var refs, readers string
 	if err := row.Scan(&r.ID, &r.Name, &r.Kind, &r.URL, &r.DefaultBranch, &r.WebhookSecret, &refs, &r.LastSyncAt, &r.LastSyncError, &r.CreatedAt,
-		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts); err != nil {
+		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(refs), &r.Refs)
 	if r.Refs == nil {
 		r.Refs = map[string]string{}
+	}
+	_ = json.Unmarshal([]byte(readers), &r.Readers)
+	if r.Readers == nil {
+		r.Readers = []string{}
 	}
 	return &r, nil
 }
@@ -229,15 +235,22 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		URL            *string `json:"url"`
-		DefaultBranch  *string `json:"default_branch"`
-		SSHKey         *string `json:"ssh_key"`
-		GenerateSSHKey bool    `json:"generate_ssh_key"`
-		SSHKnownHosts  *string `json:"ssh_known_hosts"`
+		URL            *string   `json:"url"`
+		DefaultBranch  *string   `json:"default_branch"`
+		SSHKey         *string   `json:"ssh_key"`
+		GenerateSSHKey bool      `json:"generate_ssh_key"`
+		SSHKnownHosts  *string   `json:"ssh_known_hosts"`
+		Readers        *[]string `json:"readers"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		httpError(w, 400, "bad request: %v", err)
 		return
+	}
+	if req.Readers != nil {
+		if repo.Readers, err = cleanReaders(repo.Name, *req.Readers); err != nil {
+			httpError(w, 400, "%v", err)
+			return
+		}
 	}
 	if repo.Kind != "mirror" && (req.URL != nil || req.SSHKey != nil || req.GenerateSSHKey || req.SSHKnownHosts != nil) {
 		httpError(w, 400, "only mirrors have a remote URL and SSH settings")
@@ -280,8 +293,8 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 	// Under the sync lock, so a fetch never runs with half-applied settings.
 	lock := s.repoLock(repo.ID)
 	lock.Lock()
-	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ? WHERE id = ?`,
-		repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, repo.ID)
+	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ? WHERE id = ?`,
+		repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers), repo.ID)
 	if err == nil && req.SSHKnownHosts != nil && repo.SSHKnownHosts == "" {
 		// Forget pinned host keys: the next connection trusts the host again.
 		err = os.Remove(s.knownHostsPath(repo.ID))
@@ -297,6 +310,33 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 	repo, _ = s.getRepoByID(repo.ID)
 	s.decorateRepo(r, repo)
 	writeJSON(w, repo)
+}
+
+// cleanReaders checks a repository's readers: owner/name each, without
+// duplicates or the repository itself, which can always read itself.
+func cleanReaders(self string, names []string) ([]string, error) {
+	out := []string{}
+	for _, name := range names {
+		name = strings.TrimSuffix(strings.TrimSpace(name), ".git")
+		if name == "" || strings.EqualFold(name, self) || containsFold(out, name) {
+			continue
+		}
+		if !repoNameRE.MatchString(name) || strings.Contains(name, "..") {
+			return nil, fmt.Errorf("reader %q must look like owner/repo", name)
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func containsFold(list []string, s string) bool {
+	for _, v := range list {
+		if strings.EqualFold(v, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +389,9 @@ func (s *Server) deleteRepo(id int64, name string) error {
 	if err != nil {
 		return err
 	}
+	s.tipMu.Lock()
+	delete(s.tipWorkflows, id)
+	s.tipMu.Unlock()
 	for _, dir := range []string{s.repoPath(name), s.sshDir(id)} {
 		if err := removeAll(dir); err != nil {
 			s.log.Warn("remove repository files", "dir", dir, "err", err)
@@ -545,6 +588,7 @@ func (s *Server) triggerRepositoryPush(ctx context.Context, src *Repo, ref strin
 	}
 	rows.Close()
 	title := src.Name + ": " + commit.Subject
+	mentionsSrc := mentionsRepo(src.Name)
 	var firstErr error
 	for _, repo := range listeners {
 		dstRef := "refs/heads/" + repo.DefaultBranch
@@ -552,7 +596,7 @@ func (s *Server) triggerRepositoryPush(ctx context.Context, src *Repo, ref strin
 		if err != nil {
 			continue // no commits on the default branch yet
 		}
-		files, err := s.workflowsAt(ctx, repo, sha)
+		files, err := s.defaultBranchWorkflows(ctx, repo, sha)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -561,10 +605,13 @@ func (s *Server) triggerRepositoryPush(ctx context.Context, src *Repo, ref strin
 		}
 		for _, file := range sortedKeys(files) {
 			yaml := files[file]
+			if !bytes.Contains(yaml, []byte(wf.RepositoryPush)) {
+				continue // only listeners need parsing
+			}
 			w, perr := wf.Parse(yaml)
 			if perr != nil {
 				// Report broken workflows that look like they listen to src.
-				if strings.Contains(string(yaml), wf.RepositoryPush) && strings.Contains(strings.ToLower(string(yaml)), strings.ToLower(src.Name)) {
+				if mentionsSrc.Match(yaml) {
 					_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: file, event: wf.RepositoryPush,
 						payload: event, ref: dstRef, sha: sha, actor: commit.Author, title: title, parseErr: perr})
 				}
@@ -584,6 +631,12 @@ func (s *Server) triggerRepositoryPush(ctx context.Context, src *Repo, ref strin
 		}
 	}
 	return firstErr
+}
+
+// mentionsRepo matches text that names the repository: name as a whole,
+// not part of a longer name such as owner/name-deploy or other/owner/name.
+func mentionsRepo(name string) *regexp.Regexp {
+	return regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_./-])` + regexp.QuoteMeta(name) + `($|[^A-Za-z0-9_./-])`)
 }
 
 func sortedKeys[V any](m map[string]V) []string {
