@@ -145,6 +145,10 @@ func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, "mirror repositories need a url")
 		return
 	}
+	if strings.HasPrefix(req.URL, "-") {
+		httpError(w, 400, "invalid url")
+		return
+	}
 	if req.DefaultBranch == "" {
 		req.DefaultBranch = "main"
 	}
@@ -259,6 +263,10 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 	if req.URL != nil {
 		if *req.URL = strings.TrimSpace(*req.URL); *req.URL == "" {
 			httpError(w, 400, "mirror repositories need a url")
+			return
+		}
+		if strings.HasPrefix(*req.URL, "-") {
+			httpError(w, 400, "invalid url")
 			return
 		}
 		repo.URL = *req.URL
