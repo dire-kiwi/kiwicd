@@ -508,6 +508,13 @@ function DispatchModal({
         {ref !== initialRef && wfs.loading && <Spinner label="Loading workflow…" />}
         {wfs.error && <ErrorBox>{wfs.error}</ErrorBox>}
         {unavailable && <Flash kind="warn">This workflow can't be dispatched on {ref}.</Flash>}
+        {!unavailable && !(repo.protected_branches ?? [repo.default_branch]).includes(ref) && (
+          <Flash kind="warn">
+            <span>
+              {ref} isn't a protected ref, so the run gets no secrets except <span className="mono">KIWICD_TOKEN</span>.
+            </span>
+          </Flash>
+        )}
         {inputs.map((inp) => (
           <InputField key={inp.name} input={inp} value={values[inp.name] ?? ""} onChange={(v) => setValues((s) => ({ ...s, [inp.name]: v }))} />
         ))}
@@ -804,21 +811,15 @@ function KnownHostsModal({
   );
 }
 
-/** The repositories whose jobs may fetch this one with secrets.KIWICD_TOKEN. */
-function ReadersSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
-  const repos = useFetch<Repo[]>("/api/repos");
-  const [name, setName] = useState("");
+/** Saves a list setting of a repository, keeping its error and busy state. */
+function useListSetting(repo: Repo, field: "readers" | "protected_refs", onChanged: () => void) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
-  const readers = repo.readers ?? [];
-  const has = (n: string) => readers.some((r) => r.toLowerCase() === n.toLowerCase());
-  const candidates = (repos.data ?? []).map((r) => r.name).filter((n) => n !== repo.name && !has(n));
-
   const save = async (next: string[]): Promise<boolean> => {
     setBusy(true);
     setError(undefined);
     try {
-      await patch(repoPath(repo.name), { readers: next });
+      await patch(repoPath(repo.name), { [field]: next });
       onChanged();
       return true;
     } catch (e) {
@@ -828,6 +829,93 @@ function ReadersSettings({ repo, onChanged }: { repo: Repo; onChanged: () => voi
       setBusy(false);
     }
   };
+  return { busy, error, save };
+}
+
+/** A list of names with Remove buttons and a field to add one. */
+function ListEditor({
+  id,
+  items,
+  fixed,
+  empty,
+  placeholder,
+  candidates = [],
+  same = (a, b) => a === b,
+  confirmRemove,
+  busy,
+  save,
+}: {
+  id: string;
+  items: string[];
+  /** Shown first, without a Remove button. */
+  fixed?: ReactNode;
+  empty: ReactNode;
+  placeholder: string;
+  candidates?: string[];
+  same?: (a: string, b: string) => boolean;
+  confirmRemove: (item: string) => string;
+  busy: boolean;
+  save: (next: string[]) => Promise<boolean>;
+}) {
+  const [name, setName] = useState("");
+  const has = (n: string) => items.some((r) => same(r, n));
+  return (
+    <div className="stack-sm">
+      {items.length > 0 || fixed ? (
+        <ul className="plain-list name-list">
+          {fixed && <li>{fixed}</li>}
+          {items.map((r) => (
+            <li key={r}>
+              <span className="mono">{r}</span>
+              <button
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => {
+                  if (confirm(confirmRemove(r))) void save(items.filter((x) => x !== r));
+                }}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <span className="muted">{empty}</span>
+      )}
+      <form
+        className="copy-field"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (await save([...items, name.trim()])) setName("");
+        }}
+      >
+        <input
+          className="input mono"
+          placeholder={placeholder}
+          list={candidates.length ? `${id}-candidates` : undefined}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+        {candidates.length > 0 && (
+          <datalist id={`${id}-candidates`}>
+            {candidates.filter((n) => !has(n)).map((n) => (
+              <option key={n} value={n} />
+            ))}
+          </datalist>
+        )}
+        <button type="submit" className="btn btn-sm" disabled={busy || !name.trim() || has(name.trim())}>
+          Add
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/** The repositories whose jobs may fetch this one with secrets.KIWICD_TOKEN. */
+function ReadersSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const repos = useFetch<Repo[]>("/api/repos");
+  const { busy, error, save } = useListSetting(repo, "readers", onChanged);
+  const candidates = (repos.data ?? []).map((r) => r.name).filter((n) => n !== repo.name);
 
   return (
     <section className="box">
@@ -836,59 +924,71 @@ function ReadersSettings({ repo, onChanged }: { repo: Repo; onChanged: () => voi
           <h3>Job access</h3>
           <p className="muted small">
             Repositories whose <span className="mono">repository_push</span> and manually run jobs can fetch this one with{" "}
-            <span className="mono">secrets.KIWICD_TOKEN</span>, when their workflow listens to it. Jobs can always fetch their own
-            repository.
+            <span className="mono">secrets.KIWICD_TOKEN</span>, when their workflow listens to it and their run is from a protected
+            ref. Jobs can always fetch their own repository.
           </p>
         </div>
       </div>
       {error && <Flash kind="error">{error}</Flash>}
       <div className="kv kv-pad">
         <span className="label">Readers</span>
-        <div className="stack-sm">
-          {readers.length > 0 ? (
-            <ul className="plain-list reader-list">
-              {readers.map((r) => (
-                <li key={r}>
-                  <span className="mono">{r}</span>
-                  <button
-                    className="btn btn-sm"
-                    disabled={busy}
-                    onClick={() => {
-                      if (confirm(`Stop ${r}'s jobs fetching ${repo.name}?`)) void save(readers.filter((x) => x !== r));
-                    }}
-                  >
-                    Remove
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <span className="muted">None: only this repository's own jobs can fetch it.</span>
-          )}
-          <form
-            className="copy-field"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              if (await save([...readers, name.trim()])) setName("");
-            }}
-          >
-            <input
-              className="input mono"
-              placeholder="owner/name"
-              list="reader-candidates"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-            <datalist id="reader-candidates">
-              {candidates.map((n) => (
-                <option key={n} value={n} />
-              ))}
-            </datalist>
-            <button type="submit" className="btn btn-sm" disabled={busy || !name.trim() || has(name.trim())}>
-              Add
-            </button>
-          </form>
+        <ListEditor
+          id="reader"
+          items={repo.readers ?? []}
+          empty="None: only this repository's own jobs can fetch it."
+          placeholder="owner/name"
+          candidates={candidates}
+          same={(a, b) => a.toLowerCase() === b.toLowerCase()}
+          confirmRemove={(r) => `Stop ${r}'s jobs fetching ${repo.name}?`}
+          busy={busy}
+          save={save}
+        />
+      </div>
+    </section>
+  );
+}
+
+/** The refs whose runs get secrets. */
+function ProtectedRefsSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const { busy, error, save } = useListSetting(repo, "protected_refs", onChanged);
+  const protectedBranches = repo.protected_branches ?? [];
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Protected refs</h3>
+          <p className="muted small">
+            Only runs from these refs get this repository's secrets and the global ones. A run's workflow comes from its ref, so anyone
+            who can push a branch could otherwise read every secret with a workflow on it. Runs from other refs only get{" "}
+            <span className="mono">secrets.KIWICD_TOKEN</span>, which fetches just this repository. Patterns are branch names, as in a
+            push filter (<span className="mono">release/*</span>), or full refs (<span className="mono">refs/tags/v*</span>).
+          </p>
         </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv kv-pad">
+        <span className="label">Refs</span>
+        <ListEditor
+          id="protected-ref"
+          items={repo.protected_refs ?? []}
+          fixed={
+            <>
+              <span className="mono">{repo.default_branch}</span>
+              <span className="muted small">default branch</span>
+            </>
+          }
+          empty=""
+          placeholder="branch, release/* or refs/tags/v*"
+          candidates={branchesOf(repo)}
+          confirmRemove={(r) => `Stop giving secrets to runs from ${r}?`}
+          busy={busy}
+          save={save}
+        />
+        <span className="label">Protected branches</span>
+        <span className="chips">
+          {protectedBranches.length ? protectedBranches.map((b) => <Chip key={b}>{b}</Chip>) : <span className="muted">none yet</span>}
+        </span>
       </div>
     </section>
   );
@@ -937,6 +1037,7 @@ function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => voi
         </div>
       </section>
       {repo.kind === "mirror" && <MirrorSettings repo={repo} onChanged={onChanged} />}
+      <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />
       <section className="box box-danger">
         <div className="box-header">

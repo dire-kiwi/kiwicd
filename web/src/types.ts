@@ -30,6 +30,10 @@ export interface Repo {
   ssh_host_keys?: string[];
   /** Repositories whose repository_push and dispatched jobs may fetch this one with KIWICD_TOKEN. */
   readers?: string[];
+  /** Ref patterns besides the default branch whose runs get secrets: "release/*", "refs/tags/v*". */
+  protected_refs?: string[];
+  /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
+  protected_branches?: string[];
 }
 
 export interface WorkflowInput {
@@ -77,6 +81,8 @@ export interface Run {
   conclusion: Conclusion;
   error: string;
   cancel_requested: boolean;
+  /** Its ref was protected, so its jobs get secrets. */
+  protected: boolean;
   created_at: number;
   started_at: number;
   finished_at: number;

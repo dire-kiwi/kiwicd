@@ -42,9 +42,20 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)).
+- **Protected refs**: only runs from a repository's protected refs get its secrets and the global
+  ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
+  collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The
+  default branch is always protected; add more under the repository's **Settings → Protected
+  refs** or with
+  `curl -u admin -X PATCH -d '{"protected_refs":["release/*","refs/tags/v*"]}' https://SERVER/api/repos/OWNER/NAME`.
+  Patterns are branch names as in a `push` filter (`*` doesn't match `/`, `**` does) or full refs
+  (`refs/tags/v*`). Runs from other refs, including dispatches on them, get only
+  `secrets.KIWICD_TOKEN`, and their page and job logs say so. Whether a run gets secrets is
+  decided when it's created (a re-run decides again), and a ref unprotected since then stops
+  jobs that haven't started yet from getting them.
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
-  `/git/` while the job runs (and, for `repository_push` and dispatched runs, the repositories its
-  workflow listens to that list it as a reader). It can't push or use the API.
+  `/git/` while the job runs (and, for `repository_push` and dispatched runs from a protected ref,
+  the repositories its workflow listens to that list it as a reader). It can't push or use the API.
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
@@ -97,7 +108,7 @@ curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/
 - Listeners are read from the private repository's **default branch** when the push arrives, like
   GitHub's `repository_dispatch`. The run belongs to the private repository: `github.repository`,
   `github.sha` and `github.ref` (and `actions/checkout`) are its default branch, and its secrets
-  and variables apply.
+  and variables apply, since the default branch is protected.
 - `github.event` is the public repository's push event: `github.event.repository.full_name`,
   `github.event.ref`, `github.event.after` (the pushed commit), `github.event.head_commit`. The
   run's title is `owner/app: <commit subject>`, and its page shows the pushed commit.
@@ -105,7 +116,8 @@ curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/
   list the listening repository as a reader, in runs started by `repository_push` or by hand. The
   repository being read has to agree, since any repository's default branch can listen to any
   other, including a public one's where outside contributions land. Runs started by a push to the
-  listening repository only get that repository, since their workflow can come from any branch.
+  listening repository only get that repository, since their workflow can come from any branch,
+  and so do dispatches on refs that aren't protected.
 - GitHub doesn't know `repository_push`, so turn off GitHub Actions on the private repository if
   it's on GitHub, or GitHub reports the workflow as invalid.
 

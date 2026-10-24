@@ -172,6 +172,10 @@ var migrations = []struct{ table, column, sql string }{
 		CREATE INDEX IF NOT EXISTS jobs_token ON jobs(token_hash) WHERE token_hash != ''`},
 	// Repositories whose jobs' KIWICD_TOKEN may fetch this one (see jobtoken.go).
 	{"repos", "readers", `ALTER TABLE repos ADD COLUMN readers TEXT NOT NULL DEFAULT '[]'`},
+	// Ref patterns besides the default branch whose runs get secrets, and
+	// whether a run's ref was one when it was created (see protectedrefs.go).
+	{"repos", "protected_refs", `ALTER TABLE repos ADD COLUMN protected_refs TEXT NOT NULL DEFAULT '[]'`},
+	{"runs", "protected", `ALTER TABLE runs ADD COLUMN protected INTEGER NOT NULL DEFAULT 1`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

@@ -218,21 +218,30 @@ func TestRepositoryPush(t *testing.T) {
 		t.Error("a finished job's token fetched")
 	}
 
-	// Push runs only read their own repository, whatever their workflow says.
+	// Push runs only read their own repository, whatever their workflow says,
+	// and so do runs from refs that aren't protected.
+	deployRun := func(event, ref string) *Run {
+		return &Run{Repo: "t/deploy", RepoID: run.RepoID, Event: event, Ref: ref, Protected: ref == "refs/heads/main", WorkflowYAML: listenerWorkflow}
+	}
 	for event, want := range map[string]int{"push": 1, "workflow_dispatch": 2, "repository_push": 2} {
-		if got := srv.jobReadableRepos(&Run{Repo: "t/deploy", Event: event, WorkflowYAML: listenerWorkflow}); len(got) != want {
+		if got := srv.jobReadableRepos(deployRun(event, "refs/heads/main")); len(got) != want {
 			t.Errorf("%s run reads %v", event, got)
 		}
 	}
+	if got := srv.jobReadableRepos(deployRun("workflow_dispatch", "refs/heads/feature")); len(got) != 1 {
+		t.Errorf("a dispatch from an unprotected branch reads %v", got)
+	}
 	// Other listeners don't get t/app's consent to t/deploy.
-	if got := srv.jobReadableRepos(&Run{Repo: "t/other", Event: "repository_push", WorkflowYAML: listenerWorkflow}); len(got) != 1 {
+	other, _ := srv.getRepo("t/other")
+	if got := srv.jobReadableRepos(&Run{Repo: "t/other", RepoID: other.ID, Event: "repository_push", Ref: "refs/heads/main", Protected: true,
+		WorkflowYAML: listenerWorkflow}); len(got) != 1 {
 		t.Errorf("t/other's listener reads %v", got)
 	}
 	// Removing the reader takes the access away.
 	if code := api("PATCH", "/api/repos/t/app", `{"readers":[]}`, &app); code != 200 || len(app.Readers) != 0 {
 		t.Fatalf("clear readers: %d %+v", code, app.Readers)
 	}
-	if got := srv.jobReadableRepos(&Run{Repo: "t/deploy", Event: "repository_push", WorkflowYAML: listenerWorkflow}); len(got) != 1 {
+	if got := srv.jobReadableRepos(deployRun("repository_push", "refs/heads/main")); len(got) != 1 {
 		t.Errorf("t/deploy reads %v after t/app removed it", got)
 	}
 
