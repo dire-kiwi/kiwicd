@@ -49,8 +49,11 @@ type Config struct {
 	// ReservedLabels keep runner labels for some repositories and refs:
 	// LABEL=OWNER/REPO[@REF][,...], see parseReservedLabels.
 	ReservedLabels []string
-	Version        string
-	Web            fs.FS
+	// ProtectedLabels are runner labels whose runners take only jobs from
+	// protected refs, see protectedLabels.
+	ProtectedLabels []string
+	Version         string
+	Web             fs.FS
 }
 
 type Server struct {
@@ -63,6 +66,8 @@ type Server struct {
 	limiter      *passwordLimiter
 	proxyWarning sync.Once
 	reserved     reservedLabels
+	// protectedLabels: runners with one take only protected refs' jobs.
+	protectedLabels protectedLabels
 
 	// mu serialises scheduling decisions (run advancement, job assignment).
 	mu sync.Mutex
@@ -99,6 +104,10 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	protected, err := parseProtectedLabels(cfg.ProtectedLabels)
+	if err != nil {
+		return nil, err
+	}
 	// Git commands run in other directories, so relative paths into the data
 	// directory would resolve from the wrong place.
 	dataDir, err := filepath.Abs(cfg.DataDir)
@@ -123,15 +132,16 @@ func New(cfg Config) (*Server, error) {
 	}
 	removeSSHKeyFiles(cfg.DataDir)
 	s := &Server{
-		cfg:       cfg,
-		db:        db,
-		box:       box,
-		log:       slog.Default(),
-		hub:       newHub(),
-		limiter:   newPasswordLimiter(),
-		reserved:  reserved,
-		jobsReady: make(chan struct{}),
-		syncLocks: map[int64]*sync.Mutex{},
+		cfg:             cfg,
+		db:              db,
+		box:             box,
+		log:             slog.Default(),
+		hub:             newHub(),
+		limiter:         newPasswordLimiter(),
+		reserved:        reserved,
+		protectedLabels: protected,
+		jobsReady:       make(chan struct{}),
+		syncLocks:       map[int64]*sync.Mutex{},
 
 		tipWorkflows: map[int64]cachedWorkflows{},
 	}

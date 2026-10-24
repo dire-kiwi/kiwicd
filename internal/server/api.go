@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"time"
 
@@ -88,7 +89,16 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			plan = append(plan, plannedJob{Key: key, Name: name, Needs: needs})
 		}
 	}
-	writeJSON(w, map[string]any{"run": run, "jobs": jobs, "plan": plan})
+	// Runners with these labels won't take the run's jobs, as its ref isn't
+	// protected.
+	withheld := []string{}
+	if len(s.protectedLabels) > 0 && !s.runGetsSecrets(run) {
+		for _, l := range s.protectedLabels {
+			withheld = append(withheld, l)
+		}
+		sort.Strings(withheld)
+	}
+	writeJSON(w, map[string]any{"run": run, "jobs": jobs, "plan": plan, "protected_labels": withheld})
 }
 
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
@@ -301,6 +311,7 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal([]byte(labels), &rn.Labels)
 		rn.Online = nowMS()-rn.LastSeenAt < 60_000
 		rn.Reserved = s.reserved.describe(rn.Labels)
+		rn.ProtectedLabels = s.protectedLabels.of(rn.Labels)
 		runners = append(runners, &rn)
 	}
 	rows.Close()

@@ -86,3 +86,58 @@ func (s *Server) runGetsSecrets(run *Run) bool {
 	repo, err := s.getRepoByID(run.RepoID)
 	return err == nil && refProtected(repo, run.Ref)
 }
+
+// Protected labels keep runners for runs from protected refs, of any
+// repository: a runner with one takes only jobs whose run gets secrets,
+// whatever labels the job asks for, and a job from another ref that asks for
+// the label fails at once. Without them a job from an unprotected ref, which
+// gets no secrets, could still leave something behind on a runner that keeps
+// state between jobs (files, processes, the Docker socket) and read the
+// secrets of the next protected job there, such as a deploy.
+type protectedLabels map[string]string // lower case to as given
+
+func parseProtectedLabels(labels []string) (protectedLabels, error) {
+	out := protectedLabels{}
+	for _, l := range labels {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.ContainsAny(l, "=, ") {
+			return nil, fmt.Errorf("protected label %q: expected a runner label", l)
+		}
+		out[strings.ToLower(l)] = l
+	}
+	return out, nil
+}
+
+// of returns those of labels that are protected.
+func (pl protectedLabels) of(labels []string) []string {
+	var out []string
+	for _, l := range labels {
+		if _, ok := pl[strings.ToLower(l)]; ok {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// labelDenied explains why a run may not use a job's runs-on labels: one is
+// reserved for other repositories or refs, or takes only protected refs'
+// jobs and the run's ref isn't protected. It returns "" if the run may.
+func (s *Server) labelDenied(run *Run, labels []string) string {
+	if l, denied := s.runDenied(run, labels); denied {
+		return fmt.Sprintf("runs-on: the runner label %q is reserved for other repositories or branches", l)
+	}
+	if p := s.protectedLabels.of(labels); len(p) > 0 && !s.runGetsSecrets(run) {
+		return fmt.Sprintf("runs-on: runners with the label %q take only jobs from protected refs, and %s is not a protected ref of %s. "+
+			"Protected refs are set in the repository's Settings.", p[0], run.Ref, run.Repo)
+	}
+	return ""
+}
+
+// runnerTakes reports whether a runner may take jobs of the run, given its
+// reserved and protected labels.
+func (s *Server) runnerTakes(rn *Runner, run *Run) bool {
+	if _, denied := s.runDenied(run, rn.Labels); denied {
+		return false
+	}
+	return len(s.protectedLabels.of(rn.Labels)) == 0 || s.runGetsSecrets(run)
+}

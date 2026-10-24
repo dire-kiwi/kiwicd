@@ -52,7 +52,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   (`refs/tags/v*`). Runs from other refs, including dispatches on them, get only
   `secrets.KIWICD_TOKEN`, and their page and job logs say so. Whether a run gets secrets is
   decided when it's created (a re-run decides again), and a ref unprotected since then stops
-  jobs that haven't started yet from getting them.
+  jobs that haven't started yet from getting them. Such runs' jobs can still use any runner
+  whose labels match, and on a runner that keeps state between jobs they could leave something
+  behind that reads a later protected job's secrets. Keep runners for protected refs with the
+  server's `--protected-label`, or isolate jobs (see [Isolating jobs](#isolating-jobs)).
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
   `/git/` while the job runs (and, for `repository_push` and dispatched runs from a protected ref,
   the repositories its workflow listens to that list it as a reader). It can't push or use the API.
@@ -197,6 +200,13 @@ Container jobs don't get the Docker socket unless the agent is given one with `-
 /var/run/docker.sock` (`KIWICD_DOCKER_SOCKET`), which hands its jobs the machine. Give it only to
 a runner whose label is reserved for trusted repositories (see `--reserve-label`).
 
+Runners that don't isolate jobs, or that hold anything a job from an unprotected ref shouldn't
+reach, can be kept for jobs from protected refs: start the server with `--protected-label
+LABEL` and give those runners the label. Jobs from other refs that ask for the label fail at
+once, saying why; those that don't ask for it wait for another runner, and the job's page says
+which runners won't take it. Every runner has `self-hosted`, so `--protected-label self-hosted`
+keeps them all for protected refs and jobs from other refs don't run at all.
+
 ### Server configuration
 
 | Flag / variable | |
@@ -208,6 +218,7 @@ a runner whose label is reserved for trusted repositories (see `--reserve-label`
 | `--client-ip-header` / `KIWICD_CLIENT_IP_HEADER` | Behind a reverse proxy: the header it puts the client's address in (`X-Forwarded-For`, `CF-Connecting-IP`), so wrong admin passwords are limited per client (10, then one a minute) rather than per proxy. Only set it if every request comes through that proxy, since clients can send the header themselves |
 | `KIWICD_REGISTRATION_TOKEN` | Optional long-lived registration token, for agents deployed next to the server |
 | `--reserve-label` / `KIWICD_RESERVED_LABELS` | Keep a runner label for some repositories and refs: `LABEL=OWNER/REPO[@REF][,...]`, repeatable (the variable holds them separated by spaces). A bare `OWNER/REPO` means its default branch; `REF` is a branch, a full ref (`refs/tags/v*`) or a pattern (`@*` for any branch). A runner with a reserved label takes only jobs of runs those allow, whatever labels the jobs ask for, and jobs elsewhere that ask for the label fail at once. For runners that hold deploy credentials, reach production or have the Docker socket |
+| `--protected-label` / `KIWICD_PROTECTED_LABELS` | Runners with this label take only jobs from protected refs, of any repository, whatever labels the jobs ask for; jobs from other refs that ask for it fail at once. Repeatable (the variable holds them separated by spaces). None by default |
 | `--max-log-lines` / `KIWICD_MAX_LOG_LINES` | Most log lines stored per job (default 1000000, `-1` for no limit). Later output is dropped after a notice; the job keeps running |
 | `--max-log-bytes` / `KIWICD_MAX_LOG_BYTES` | Most log bytes stored per job (default 104857600). Lines longer than 64 KiB are cut |
 | `KIWICD_SECRET_KEY` | Key that encrypts secrets and SSH deploy keys in the database: 32 bytes as base64 or hex (`openssl rand -base64 32`). Default: `<data>/secret.key`, generated on first start |

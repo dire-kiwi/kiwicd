@@ -94,6 +94,15 @@ export function RunnersPage() {
                           Takes only jobs of {who.join(", ")} (<code>{label}</code> is reserved)
                         </div>
                       ))}
+                      {(r.protected_labels ?? []).length > 0 && (
+                        <div className="small muted">
+                          Takes only jobs from protected refs (
+                          {(r.protected_labels ?? []).map((l) => (
+                            <code key={l}>{l}</code>
+                          ))}
+                          )
+                        </div>
+                      )}
                     </td>
                     <td data-label="Platform" className="mono small">
                       {[r.os, r.arch].filter(Boolean).join("/") || "—"}
