@@ -37,6 +37,11 @@ type Config struct {
 	// SecretKey encrypts secrets and SSH keys in the database (base64 or hex,
 	// 32 bytes). If empty, <data>/secret.key is used, and made if missing.
 	SecretKey string
+	// ClientIPHeader names the header a reverse proxy puts the client's
+	// address in (X-Forwarded-For, CF-Connecting-IP), for limiting wrong
+	// passwords per client. Only set it when every request comes through
+	// that proxy: clients can send the header themselves.
+	ClientIPHeader string
 	// MaxLogLines and MaxLogBytes cap one job's log; later output is
 	// dropped. 0 means the default, negative means no limit.
 	MaxLogLines int64
@@ -52,7 +57,8 @@ type Server struct {
 	log *slog.Logger
 	hub *hub
 
-	limiter *passwordLimiter
+	limiter      *passwordLimiter
+	proxyWarning sync.Once
 
 	// mu serialises scheduling decisions (run advancement, job assignment).
 	mu sync.Mutex

@@ -47,6 +47,7 @@ func main() {
 	poll := flag.Duration("poll-interval", 60*time.Second, "how often mirrored repositories are fetched")
 	maxLogLines := flag.Int64("max-log-lines", envInt("KIWICD_MAX_LOG_LINES", 1_000_000), "most log lines stored per job (-1: no limit)")
 	maxLogBytes := flag.Int64("max-log-bytes", envInt("KIWICD_MAX_LOG_BYTES", 100<<20), "most log bytes stored per job (-1: no limit)")
+	clientIPHeader := flag.String("client-ip-header", env("KIWICD_CLIENT_IP_HEADER", ""), "header a reverse proxy puts the client's address in (X-Forwarded-For, CF-Connecting-IP); only set it if every request comes through that proxy")
 	debug := flag.Bool("debug", os.Getenv("KIWICD_DEBUG") != "", "debug logging")
 	showVersion := flag.Bool("version", false, "print the version")
 	flag.Parse()
@@ -68,6 +69,7 @@ func main() {
 		PollInterval:      *poll,
 		RetentionDays:     *retention,
 		RegistrationToken: os.Getenv("KIWICD_REGISTRATION_TOKEN"),
+		ClientIPHeader:    *clientIPHeader,
 		MaxLogLines:       *maxLogLines,
 		MaxLogBytes:       *maxLogBytes,
 		SecretKey:         os.Getenv("KIWICD_SECRET_KEY"),

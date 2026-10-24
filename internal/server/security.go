@@ -43,15 +43,15 @@ func (s *Server) secureHeaders(next http.Handler) http.Handler {
 
 // ---------------------------------------------------------------- password guessing
 
-// passwordLimiter caps wrong admin passwords: each client may get a few
-// wrong, then one a minute, and all clients together one every two seconds,
-// so the password can't be guessed by brute force over the API or git. When
-// a client is over its limit its password isn't even checked.
+// passwordLimiter caps wrong admin passwords per client: a few wrong, then
+// one a minute, so the password can't be guessed by brute force over the
+// API or git. When a client is over its limit its password isn't even
+// checked. There is no limit across clients, which would let anyone lock
+// the admin out by guessing wrong from a few addresses.
 type passwordLimiter struct {
 	mu      sync.Mutex
 	now     func() time.Time
 	clients map[string]*bucket
-	global  bucket
 }
 
 type bucket struct {
@@ -62,8 +62,6 @@ type bucket struct {
 const (
 	clientBurst  = 10
 	clientRefill = time.Minute
-	globalBurst  = 100
-	globalRefill = 2 * time.Second
 )
 
 func newPasswordLimiter() *passwordLimiter {
@@ -72,11 +70,11 @@ func newPasswordLimiter() *passwordLimiter {
 
 // fill tops up b for the time since it was last used and reports whether it
 // has a token left.
-func (b *bucket) fill(now time.Time, burst float64, refill time.Duration) bool {
+func (b *bucket) fill(now time.Time) bool {
 	if b.at.IsZero() {
-		b.tokens = burst
+		b.tokens = clientBurst
 	} else {
-		b.tokens = min(burst, b.tokens+float64(now.Sub(b.at))/float64(refill))
+		b.tokens = min(clientBurst, b.tokens+float64(now.Sub(b.at))/float64(clientRefill))
 	}
 	b.at = now
 	return b.tokens >= 1
@@ -86,16 +84,11 @@ func (b *bucket) fill(now time.Time, burst float64, refill time.Duration) bool {
 func (l *passwordLimiter) allow(client string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := l.now()
 	c := l.clients[client]
 	if c == nil {
-		c = &bucket{}
+		return true
 	}
-	ok := c.fill(now, clientBurst, clientRefill) && l.global.fill(now, globalBurst, globalRefill)
-	if c.tokens < clientBurst {
-		l.clients[client] = c
-	}
-	return ok
+	return c.fill(l.now())
 }
 
 // failed records a wrong password from client.
@@ -108,10 +101,8 @@ func (l *passwordLimiter) failed(client string) {
 		c = &bucket{}
 		l.clients[client] = c
 	}
-	c.fill(now, clientBurst, clientRefill)
+	c.fill(now)
 	c.tokens = max(0, c.tokens-1)
-	l.global.fill(now, globalBurst, globalRefill)
-	l.global.tokens = max(0, l.global.tokens-1)
 	// Forget clients that have been quiet long enough to be back to full.
 	if len(l.clients) > 10_000 {
 		for k, b := range l.clients {
@@ -122,30 +113,45 @@ func (l *passwordLimiter) failed(client string) {
 	}
 }
 
-// clientIP names the client for rate limiting. Behind a reverse proxy the
-// peer address is always the proxy's, so the client's address is taken from
-// CF-Connecting-IP (Cloudflare) or X-Forwarded-For. A client that reaches the
-// server directly can forge those, but then the global limit still applies.
-func clientIP(r *http.Request) string {
-	if ip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); ip != "" {
-		return ip
+// clientIP names r's client for rate limiting: the peer address or, with
+// ClientIPHeader set (the server is behind a proxy that sets it), that
+// header's last entry, which the proxy added. Headers aren't trusted
+// otherwise, since any client can send them. IPv6 clients are named by their
+// /64, which one host can have all of.
+func (s *Server) clientIP(r *http.Request) string {
+	addr := ""
+	if h := s.cfg.ClientIPHeader; h != "" {
+		if vals := r.Header.Values(h); len(vals) > 0 {
+			last := vals[len(vals)-1]
+			addr = strings.TrimSpace(last[strings.LastIndex(last, ",")+1:])
+		}
+	} else if r.Header.Get("X-Forwarded-For") != "" {
+		s.proxyWarning.Do(func() {
+			s.log.Warn("requests come through a proxy, so wrong passwords are limited per proxy address, not per client; set KIWICD_CLIENT_IP_HEADER to the header the proxy puts the client's address in")
+		})
 	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first, _, _ := strings.Cut(xff, ",")
-		return strings.TrimSpace(first)
+	if addr == "" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		addr = host
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return addr
 	}
-	return host
+	if ip.To4() == nil {
+		return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	}
+	return ip.String()
 }
 
 var errTooManyPasswords = errors.New("too many wrong passwords; try again in a minute")
 
 // tryPassword checks an admin password from r's client, subject to the limit.
 func (s *Server) tryPassword(r *http.Request, p string) (bool, error) {
-	client := clientIP(r)
+	client := s.clientIP(r)
 	if !s.limiter.allow(client) {
 		return false, errTooManyPasswords
 	}

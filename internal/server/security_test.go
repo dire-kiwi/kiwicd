@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -85,48 +86,91 @@ func TestPasswordLimiter(t *testing.T) {
 		t.Fatal("allowed twice in one refill interval")
 	}
 
-	// Many clients together hit the global limit.
-	for i := 0; l.allow(string(rune('A' + i%50))); i++ {
-		l.failed(string(rune('A' + i%50)))
-		if i > globalBurst {
-			t.Fatal("no global limit")
-		}
+	// However many clients guess wrong, one that hasn't can still try.
+	for i := 0; i < 1000; i++ {
+		l.failed(fmt.Sprint("bot", i))
 	}
-	now = now.Add(globalRefill)
-	if !l.allow("z") {
-		t.Fatal("global limit doesn't refill")
+	if !l.allow("admin") {
+		t.Fatal("other clients' wrong passwords locked out a new client")
 	}
 }
 
 func TestPasswordGuessingBlocked(t *testing.T) {
-	srv, err := New(Config{DataDir: filepath.Join(t.TempDir(), "data"), AdminPassword: "pw", Version: "test"})
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name, header string
+		// Headers of the attacker's guesses (i numbers them) and the
+		// admin's request, and their peer addresses.
+		guess     func(i int) map[string]string
+		guessPeer string
+		admin     map[string]string
+		adminPeer string
+	}{{
+		// Forwarded headers are ignored by default, so rotating them
+		// doesn't give a guesser fresh tries.
+		name: "direct",
+		guess: func(i int) map[string]string {
+			return map[string]string{"X-Forwarded-For": fmt.Sprintf("10.0.%d.1", i), "CF-Connecting-IP": fmt.Sprintf("10.1.%d.1", i)}
+		},
+		guessPeer: "203.0.113.9:4000",
+		adminPeer: "198.51.100.7:5000",
+	}, {
+		// Behind a proxy, the client is the entry the proxy appended.
+		name:   "proxy",
+		header: "X-Forwarded-For",
+		guess: func(i int) map[string]string {
+			return map[string]string{"X-Forwarded-For": fmt.Sprintf("10.0.%d.1, 203.0.113.9", i)}
+		},
+		guessPeer: "192.0.2.1:4000",
+		admin:     map[string]string{"X-Forwarded-For": "198.51.100.7"},
+		adminPeer: "192.0.2.1:5000",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, err := New(Config{DataDir: filepath.Join(t.TempDir(), "data"), AdminPassword: "pw", Version: "test", ClientIPHeader: tc.header})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := srv.Handler()
+			get := func(path, password, peer string, headers map[string]string) int {
+				t.Helper()
+				req := httptest.NewRequest("GET", path, nil)
+				req.RemoteAddr = peer
+				req.SetBasicAuth("admin", password)
+				for k, v := range headers {
+					req.Header.Set(k, v)
+				}
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+				return rec.Code
+			}
+			for i := 0; i < clientBurst; i++ {
+				if code := get("/api/me", "guess", tc.guessPeer, tc.guess(i)); code != 401 {
+					t.Fatalf("guess %d: %d", i, code)
+				}
+			}
+			// The guesser is refused even the right password, over the API
+			// and git, whatever it puts in the headers.
+			if code := get("/api/me", "pw", tc.guessPeer, tc.guess(clientBurst)); code != http.StatusTooManyRequests {
+				t.Errorf("API after guesses: %d, want 429", code)
+			}
+			if code := get("/git/t/r.git/info/refs?service=git-upload-pack", "pw", tc.guessPeer, tc.guess(clientBurst+1)); code != http.StatusTooManyRequests {
+				t.Errorf("git after guesses: %d, want 429", code)
+			}
+			// Another client still gets in.
+			if code := get("/api/me", "pw", tc.adminPeer, tc.admin); code != 200 {
+				t.Errorf("another client's right password: %d, want 200", code)
+			}
+		})
 	}
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	get := func(path, password string) int {
-		t.Helper()
-		req, _ := http.NewRequest("GET", ts.URL+path, nil)
-		req.SetBasicAuth("admin", password)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		return resp.StatusCode
-	}
-	for i := 0; i < clientBurst; i++ {
-		if code := get("/api/me", "guess"); code != 401 {
-			t.Fatalf("guess %d: %d", i, code)
-		}
-	}
-	// Now even the right password is refused, over the API and git.
-	if code := get("/api/me", "pw"); code != http.StatusTooManyRequests {
-		t.Errorf("API after guesses: %d, want 429", code)
-	}
-	if code := get("/git/t/r.git/info/refs?service=git-upload-pack", "pw"); code != http.StatusTooManyRequests {
-		t.Errorf("git after guesses: %d, want 429", code)
+}
+
+func TestClientIPv6Prefix(t *testing.T) {
+	srv := &Server{}
+	a := httptest.NewRequest("GET", "/", nil)
+	a.RemoteAddr = "[2001:db8:1:2::1]:4000"
+	b := httptest.NewRequest("GET", "/", nil)
+	b.RemoteAddr = "[2001:db8:1:2:ffff::9]:4000"
+	if srv.clientIP(a) != srv.clientIP(b) || srv.clientIP(a) != "2001:db8:1:2::/64" {
+		t.Errorf("one /64 is two clients: %s, %s", srv.clientIP(a), srv.clientIP(b))
 	}
 }
 
