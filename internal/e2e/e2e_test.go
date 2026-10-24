@@ -298,3 +298,198 @@ func TestRepositoryPush(t *testing.T) {
 		t.Errorf("t/app has %d runs", len(appRuns))
 	}
 }
+
+const isolatedWorkflow = `
+name: Isolated
+on: push
+jobs:
+  isolated:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: test "$(cat hello.txt)" = hi && touch hello.txt new.txt
+      - name: No Docker socket, a home of its own
+        run: |
+          test ! -e /var/run/docker.sock
+          test "$(id -un)" = runner
+          touch "$HOME/.gitconfig"
+          echo "isolated home=$HOME"
+      - name: The runner's --job-options apply
+        run: test "$(cat /sys/fs/cgroup/memory.max)" = 1073741824
+      - name: Leave a process behind
+        run: setsid sleep 600 >/dev/null 2>&1 < /dev/null &
+      - uses: docker://debian:trixie-slim
+        with:
+          args: test -f hello.txt
+      - uses: ./action
+  services:
+    runs-on: self-hosted
+    services:
+      svc:
+        image: kiwicd-e2e-job:test
+        options: --health-cmd true --health-interval 1s
+    steps:
+      - run: getent hosts svc && echo "service reachable"
+  privileged:
+    runs-on: self-hosted
+    container:
+      image: debian:trixie-slim
+      options: --privileged
+    steps:
+      - run: echo "privileged ran"
+  host-volume:
+    runs-on: self-hosted
+    container:
+      image: debian:trixie-slim
+      volumes: ["/:/host"]
+    steps:
+      - run: echo "host volume ran"
+`
+
+const dockerAction = `
+name: Docker action
+runs:
+  using: docker
+  image: Dockerfile
+`
+
+// TestIsolatedJobs runs jobs with --job-image: each in a container of its
+// own on a network of its own, without the Docker socket, refusing container
+// options that reach the host, and leaving nothing behind.
+func TestIsolatedJobs(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	if out, err := exec.Command("docker", "image", "inspect", "debian:trixie-slim").CombinedOutput(); err != nil {
+		t.Skipf("needs Docker with debian:trixie-slim: %v %s", err, out)
+	}
+	const image = "kiwicd-e2e-job:test"
+	build := exec.Command("docker", "build", "-q", "-t", image, "-")
+	build.Stdin = strings.NewReader("FROM debian:trixie-slim\nRUN useradd -m -u 1000 runner\nUSER runner\nCMD [\"sleep\", \"infinity\"]\n")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("docker build: %v\n%s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", image).Run() })
+
+	tmp := t.TempDir()
+	srv, err := server.New(server.Config{DataDir: filepath.Join(tmp, "data"), AdminPassword: "pw", RegistrationToken: "reg", Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	api := func(method, path, body string, out any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.SetBasicAuth("admin", "pw")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 300 {
+			t.Fatalf("%s %s: %d %s", method, path, resp.StatusCode, b)
+		}
+		if out != nil {
+			if err := json.Unmarshal(b, out); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	creds, err := agent.Register(ctx, ts.URL, "reg", "e2e-isolated", nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agent.New(agent.Config{Creds: creds, WorkDir: filepath.Join(tmp, "work"), Version: "test", JobImage: image,
+		JobOptions: "--memory 1g --pids-limit 512", JobBridgePrefix: "kcdtst-"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = a.Run(ctx) }()
+
+	api("POST", "/api/repos", `{"name":"t/repo"}`, nil)
+	src := filepath.Join(tmp, "src")
+	files := map[string]string{
+		".github/workflows/ci.yml": isolatedWorkflow,
+		"hello.txt":                "hi\n",
+		"action/action.yml":        dockerAction,
+		"action/Dockerfile":        "FROM debian:trixie-slim\nENTRYPOINT [\"sh\", \"-c\", \"echo docker action ran\"]\n",
+	}
+	for name, content := range files {
+		_ = os.MkdirAll(filepath.Dir(filepath.Join(src, name)), 0o755)
+		_ = os.WriteFile(filepath.Join(src, name), []byte(content), 0o644)
+	}
+	run(t, src, "git", "init", "-q", "-b", "main")
+	run(t, src, "git", "add", "-A")
+	run(t, src, "git", "commit", "-qm", "init")
+	u := strings.Replace(ts.URL, "http://", "http://admin:pw@", 1)
+	run(t, src, "git", "push", "-q", u+"/git/t/repo.git", "main")
+
+	var runs []struct{ ID int64 }
+	deadline := time.Now().Add(30 * time.Second)
+	for len(runs) == 0 && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		api("GET", "/api/runs?repo=t/repo", "", &runs)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("expected one run, got %d", len(runs))
+	}
+	var r runResp
+	for time.Now().Before(deadline.Add(3 * time.Minute)) {
+		api("GET", fmt.Sprintf("/api/runs/%d", runs[0].ID), "", &r)
+		if r.Run.Status == "completed" {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	logs := map[string]string{}
+	got := map[string]string{}
+	for _, j := range r.Jobs {
+		got[j.Name] = j.Conclusion
+		var lines []struct{ Text string }
+		api("GET", fmt.Sprintf("/api/jobs/%d/logs", j.ID), "", &lines)
+		for _, l := range lines {
+			logs[j.Name] += l.Text + "\n"
+		}
+	}
+	want := map[string]string{"isolated": "success", "services": "success", "privileged": "failure", "host-volume": "failure"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("job %s: got %q want %q\n%s", k, got[k], v, logs[k])
+		}
+	}
+	for _, s := range []string{"isolated home=/home/runner", "docker action ran"} {
+		if !strings.Contains(logs["isolated"], s) {
+			t.Errorf("isolated job's log lacks %q:\n%s", s, logs["isolated"])
+		}
+	}
+	if !strings.Contains(logs["privileged"], `"--privileged" is not allowed`) || strings.Contains(logs["privileged"], "privileged ran") {
+		t.Errorf("privileged job:\n%s", logs["privileged"])
+	}
+	if !strings.Contains(logs["host-volume"], `"/:/host" is not allowed`) || strings.Contains(logs["host-volume"], "host volume ran") {
+		t.Errorf("host-volume job:\n%s", logs["host-volume"])
+	}
+
+	// The jobs' containers (and the process left running in one), volumes,
+	// networks and action images are gone.
+	prefix := fmt.Sprintf("kiwicd-r%d-j", creds.RunnerID)
+	for _, args := range [][]string{
+		{"ps", "-a", "--format", "{{.Names}}"},
+		{"volume", "ls", "--format", "{{.Name}}"},
+		{"network", "ls", "--format", "{{.Name}}"},
+		{"image", "ls", "--format", "{{.Repository}}"},
+	} {
+		out, err := exec.Command("docker", args...).Output()
+		if err != nil {
+			t.Fatalf("docker %v: %v", args, err)
+		}
+		for _, name := range strings.Fields(string(out)) {
+			if strings.HasPrefix(name, prefix) {
+				t.Errorf("docker %s: %s is left", args[0], name)
+			}
+		}
+	}
+}

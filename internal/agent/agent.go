@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/dire-kiwi/kiwicd/internal/protocol"
+	docker_container "github.com/moby/moby/api/types/container"
 	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/model"
 	"github.com/nektos/act/pkg/runner"
@@ -109,8 +110,23 @@ type Config struct {
 	WorkDir  string
 	Capacity int
 	Version  string
-	// ContainerDaemonSocket is passed to act for docker:// labels and container jobs.
+	// ContainerDaemonSocket is the Docker socket mounted into the containers
+	// of docker:// labels and container jobs; "-" (the default) mounts none.
+	// The socket gives a job the Docker daemon and with it the machine.
 	ContainerDaemonSocket string
+	// JobImage isolates jobs: each one runs in a new container of this image,
+	// removed afterwards, instead of on the agent's machine. Labels without a
+	// docker:// image of their own use it, and so do GitHub's implicit ones.
+	// Isolated jobs also get a network of their own, act's tool cache volume
+	// is left out, Docker actions are rebuilt for each job, and workflows may
+	// not give their containers options or volumes that reach outside them.
+	JobImage string
+	// JobOptions are docker create options for each job's containers, such
+	// as --memory 4g --cpus 2 --pids-limit 4096.
+	JobOptions string
+	// JobBridgePrefix starts the network interface name of an isolated job's
+	// network (default "kiwicd-"), for firewall rules.
+	JobBridgePrefix string
 	// ActionsURL is where `uses: owner/repo@ref` actions are cloned from.
 	ActionsURL string
 }
@@ -129,15 +145,30 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.ActionsURL == "" {
 		cfg.ActionsURL = "https://github.com"
 	}
+	if cfg.ContainerDaemonSocket == "" {
+		cfg.ContainerDaemonSocket = "-"
+	}
+	if cfg.JobBridgePrefix == "" {
+		cfg.JobBridgePrefix = "kiwicd-"
+	}
+	if len(cfg.JobBridgePrefix) > 7 {
+		// Interface names have at most 15 characters: 8 are for the job ID.
+		return nil, fmt.Errorf("the job bridge prefix %q is longer than 7 characters", cfg.JobBridgePrefix)
+	}
 	abs, err := filepath.Abs(cfg.WorkDir)
 	if err != nil {
 		return nil, err
 	}
 	cfg.WorkDir = abs
 	a := &Agent{cfg: cfg, c: newClient(cfg.Creds.URL, cfg.Creds.Token), log: slog.Default(), platforms: map[string]string{}}
-	// GitHub's implicit labels run on the host unless a label overrides them.
+	// GitHub's implicit labels run on the host (or in the job image) unless
+	// a label overrides them.
+	host := "-self-hosted"
+	if cfg.JobImage != "" {
+		host = cfg.JobImage
+	}
 	for _, l := range []string{"self-hosted", "linux", "macos", "windows", "x64", "arm64"} {
-		a.platforms[l] = "-self-hosted"
+		a.platforms[l] = host
 	}
 	for _, spec := range cfg.Creds.Labels {
 		l, err := ParseLabel(spec)
@@ -146,7 +177,7 @@ func New(cfg Config) (*Agent, error) {
 		}
 		img := l.Image
 		if img == "" {
-			img = "-self-hosted"
+			img = host
 		}
 		a.platforms[strings.ToLower(l.Name)] = img
 	}
@@ -155,8 +186,12 @@ func New(cfg Config) (*Agent, error) {
 
 // Run polls for jobs until ctx is cancelled. Running jobs finish first.
 func (a *Agent) Run(ctx context.Context) error {
-	a.log.Info("agent started", "name", a.cfg.Creds.Name, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels)
-	a.removeLeftovers()
+	a.log.Info("agent started", "name", a.cfg.Creds.Name, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels,
+		"job_image", a.cfg.JobImage, "docker_socket", a.cfg.ContainerDaemonSocket)
+	if a.cfg.JobImage == "" {
+		a.log.Warn("jobs run on this machine, as the agent's user, and can read its registration; set --job-image to isolate them")
+	}
+	a.removeLeftovers(ctx)
 	var wg sync.WaitGroup
 	errs := make(chan error, a.cfg.Capacity)
 	for i := 0; i < a.cfg.Capacity; i++ {
@@ -356,6 +391,8 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	}
 	env["RUNNER_NAME"] = a.cfg.Creds.Name
 
+	prefix := jobPrefix(a.cfg.Creds.RunnerID, req.JobID)
+	defer a.removeJobContainers(ctx, prefix)
 	cfg := &runner.Config{
 		Actor:                 req.Actor,
 		Workdir:               workspace,
@@ -373,7 +410,24 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 		ActionsURL:            a.cfg.ActionsURL,
 		AutoRemove:            true,
 		ContainerDaemonSocket: a.cfg.ContainerDaemonSocket,
+		ContainerOptions:      a.cfg.JobOptions,
+		ContainerNamePrefix:   strings.TrimSuffix(prefix, "-"),
 		ConcurrentJobs:        1,
+	}
+	if a.cfg.JobImage != "" {
+		network := prefix + "net"
+		bridge, err := bridgeName(a.cfg.JobBridgePrefix, req.JobID)
+		if err == nil {
+			err = createJobNetwork(ctx, network, bridge)
+		}
+		if err != nil {
+			rep.logf(0, "##[error]Creating the job's network failed: %v", err)
+			return protocol.ResultFailure, nil
+		}
+		cfg.ContainerNetworkMode = docker_container.NetworkMode(network)
+		cfg.RestrictContainers = true
+		cfg.ToolCacheVolume = "-"
+		cfg.ForceRebuild = true
 	}
 	if cfg.Secrets == nil {
 		cfg.Secrets = map[string]string{}
@@ -418,7 +472,8 @@ var actTempDir = regexp.MustCompile(`^[0-9a-f]{16}$`)
 // removeLeftovers deletes what jobs that didn't finish (the agent was killed
 // or crashed) left in the work directory: workspaces and act's temporary
 // files, which can hold the jobs' secrets.
-func (a *Agent) removeLeftovers() {
+func (a *Agent) removeLeftovers(ctx context.Context) {
+	a.removeJobContainers(ctx, runnerPrefix(a.cfg.Creds.RunnerID))
 	dirs := []string{filepath.Join(a.cfg.WorkDir, "jobs")}
 	entries, _ := os.ReadDir(filepath.Join(a.cfg.WorkDir, "actions"))
 	for _, e := range entries {
@@ -491,6 +546,21 @@ func extractTarGz(r io.Reader, dest string) error {
 		case tar.TypeSymlink:
 			_ = root.MkdirAll(path.Dir(name), 0o755)
 			_ = root.Symlink(h.Linkname, name)
+		}
+	}
+}
+
+// removeJobContainers removes the Docker objects named with prefix: a job's,
+// or all of this runner's on start. Only isolated jobs need Docker, so
+// without --job-image a failure is no more than a debug message.
+func (a *Agent) removeJobContainers(ctx context.Context, prefix string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	if err := removeDockerObjects(ctx, prefix); err != nil {
+		if a.cfg.JobImage != "" {
+			a.log.Warn("remove the containers of earlier jobs", "prefix", prefix, "err", err)
+		} else {
+			a.log.Debug("remove the containers of earlier jobs", "prefix", prefix, "err", err)
 		}
 	}
 }
