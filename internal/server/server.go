@@ -52,6 +52,8 @@ type Server struct {
 	log *slog.Logger
 	hub *hub
 
+	limiter *passwordLimiter
+
 	// mu serialises scheduling decisions (run advancement, job assignment).
 	mu sync.Mutex
 	// jobsReady is closed and replaced whenever jobs are queued.
@@ -99,17 +101,23 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	removeSSHKeyFiles(cfg.DataDir)
-	return &Server{
+	s := &Server{
 		cfg:       cfg,
 		db:        db,
 		box:       box,
 		log:       slog.Default(),
 		hub:       newHub(),
+		limiter:   newPasswordLimiter(),
 		jobsReady: make(chan struct{}),
 		syncLocks: map[int64]*sync.Mutex{},
 
 		tipWorkflows: map[int64]cachedWorkflows{},
-	}, nil
+	}
+	if err := s.expireSessionsOnPasswordChange(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 func (s *Server) notifyJobsReady() {
@@ -196,7 +204,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("/git/", s.handleGit)
 	mux.HandleFunc("/", s.handleStatic)
-	return logRequests(s.log, mux)
+	return logRequests(s.log, s.secureHeaders(mux))
 }
 
 func logRequests(log *slog.Logger, next http.Handler) http.Handler {
@@ -268,26 +276,39 @@ func (s *Server) checkPassword(p string) bool {
 	return subtle.ConstantTimeCompare([]byte(p), []byte(s.cfg.AdminPassword)) == 1
 }
 
-func (s *Server) authenticated(r *http.Request) bool {
+// requestPassword returns the password of Basic or Bearer authorization.
+func requestPassword(r *http.Request) (string, bool) {
+	if _, p, ok := r.BasicAuth(); ok {
+		return p, true
+	}
+	return strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+}
+
+// authenticated reports whether r has a session cookie or the admin
+// password. The error is errTooManyPasswords if r's client has had too many
+// wrong passwords to try another now.
+func (s *Server) authenticated(r *http.Request) (bool, error) {
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		var exp int64
 		err := s.db.QueryRow(`SELECT expires_at FROM sessions WHERE token_hash = ?`, hashToken(c.Value)).Scan(&exp)
 		if err == nil && exp > nowMS() {
-			return true
+			return true, nil
 		}
 	}
-	if _, p, ok := r.BasicAuth(); ok && s.checkPassword(p) {
-		return true
+	if p, ok := requestPassword(r); ok && p != "" {
+		return s.tryPassword(r, p)
 	}
-	if t, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && s.checkPassword(t) {
-		return true
-	}
-	return false
+	return false, nil
 }
 
 func (s *Server) requireUser(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.authenticated(r) {
+		ok, err := s.authenticated(r)
+		if err != nil {
+			httpError(w, http.StatusTooManyRequests, "%v", err)
+			return
+		}
+		if !ok {
 			httpError(w, http.StatusUnauthorized, "login required")
 			return
 		}
@@ -299,7 +320,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Password string `json:"password"`
 	}
-	if err := readJSON(r, &req); err != nil || !s.checkPassword(req.Password) {
+	if err := readJSON(r, &req); err != nil {
+		httpError(w, http.StatusBadRequest, "bad request: %v", err)
+		return
+	}
+	if ok, err := s.tryPassword(r, req.Password); err != nil {
+		httpError(w, http.StatusTooManyRequests, "%v", err)
+		return
+	} else if !ok {
 		time.Sleep(500 * time.Millisecond)
 		httpError(w, http.StatusUnauthorized, "wrong password")
 		return
@@ -337,11 +365,19 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		name = rest[:i]
 	}
 	push := strings.HasSuffix(r.URL.Path, "/git-receive-pack") || r.URL.Query().Get("service") == "git-receive-pack"
-	// Jobs can fetch with their KIWICD_TOKEN, but not push.
-	if !s.authenticated(r) && (push || !s.jobCanRead(r, name)) {
-		w.Header().Set("WWW-Authenticate", `Basic realm="kiwicd"`)
-		http.Error(w, "authentication required", http.StatusUnauthorized)
-		return
+	// Jobs can fetch with their KIWICD_TOKEN, but not push. A job token
+	// isn't tried as the admin password, so it doesn't count as a wrong one.
+	if push || !s.jobCanRead(r, name) {
+		ok, err := s.authenticated(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="kiwicd"`)
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
 	}
 	if i < 0 {
 		http.NotFound(w, r)

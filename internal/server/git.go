@@ -84,7 +84,7 @@ func (s *Server) cloneMirror(ctx context.Context, repo *Repo) error {
 		return err
 	}
 	defer cleanup()
-	_, err = gitEnv(ctx, "", env, "clone", "--mirror", repo.URL, p)
+	_, err = gitEnv(ctx, "", env, "clone", "--mirror", "--", repo.URL, p)
 	return err
 }
 
