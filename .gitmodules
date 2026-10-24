@@ -1,0 +1,4 @@
+[submodule "act"]
+	path = act
+	url = https://github.com/dire-kiwi/act.git
+	branch = kiwicd

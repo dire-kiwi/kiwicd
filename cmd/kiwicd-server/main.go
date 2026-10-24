@@ -1,0 +1,87 @@
+// Command kiwicd-server runs the kiwicd server: repositories, workflow runs,
+// the agent API and the web UI.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/dire-kiwi/kiwicd/internal/server"
+	"github.com/dire-kiwi/kiwicd/web"
+)
+
+var version = "dev"
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", key, err)
+		os.Exit(2)
+	}
+	return n
+}
+
+func main() {
+	listen := flag.String("listen", env("KIWICD_LISTEN", ":8080"), "address to listen on")
+	data := flag.String("data", env("KIWICD_DATA", "./data"), "data directory (database, repositories)")
+	publicURL := flag.String("public-url", env("KIWICD_PUBLIC_URL", ""), "URL agents and browsers use to reach the server")
+	retention := flag.Int("retention-days", int(envInt("KIWICD_RETENTION_DAYS", 30)), "days to keep completed runs and their logs (0 keeps them forever)")
+	poll := flag.Duration("poll-interval", 60*time.Second, "how often mirrored repositories are fetched")
+	maxLogLines := flag.Int64("max-log-lines", envInt("KIWICD_MAX_LOG_LINES", 1_000_000), "most log lines stored per job (-1: no limit)")
+	maxLogBytes := flag.Int64("max-log-bytes", envInt("KIWICD_MAX_LOG_BYTES", 100<<20), "most log bytes stored per job (-1: no limit)")
+	debug := flag.Bool("debug", os.Getenv("KIWICD_DEBUG") != "", "debug logging")
+	showVersion := flag.Bool("version", false, "print the version")
+	flag.Parse()
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+
+	srv, err := server.New(server.Config{
+		Listen:            *listen,
+		DataDir:           *data,
+		AdminPassword:     os.Getenv("KIWICD_ADMIN_PASSWORD"),
+		PublicURL:         *publicURL,
+		PollInterval:      *poll,
+		RetentionDays:     *retention,
+		RegistrationToken: os.Getenv("KIWICD_REGISTRATION_TOKEN"),
+		MaxLogLines:       *maxLogLines,
+		MaxLogBytes:       *maxLogBytes,
+		SecretKey:         os.Getenv("KIWICD_SECRET_KEY"),
+		Version:           version,
+		Web:               web.FS(),
+	})
+	if err != nil {
+		slog.Error("startup", "err", err)
+		os.Exit(1)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := srv.Run(ctx); err != nil {
+		slog.Error("server", "err", err)
+		os.Exit(1)
+	}
+}

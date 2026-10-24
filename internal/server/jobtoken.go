@@ -1,0 +1,68 @@
+package server
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/dire-kiwi/kiwicd/internal/protocol"
+	"github.com/dire-kiwi/kiwicd/internal/wf"
+)
+
+// Every job gets a token, secrets.KIWICD_TOKEN, that can fetch repositories
+// over /git/ while the job runs:
+//
+//	git -c http.extraHeader="Authorization: Bearer $KIWICD_TOKEN" clone "$GITHUB_SERVER_URL/git/OWNER/NAME.git"
+//
+// It reads the job's own repository and, for runs started by repository_push
+// or by hand, the repositories the workflow listens to with repository_push.
+// Push runs get only their own repository: their workflow can come from any
+// branch, and a listener added on a branch of a public repository mustn't
+// open a private one to it. repository_push runs take their workflow from the
+// listener's default branch, and dispatches are started by the admin.
+const jobTokenSecret = "KIWICD_TOKEN"
+
+func (s *Server) issueJobToken(jobID int64) (string, error) {
+	token := randomToken(32)
+	_, err := s.db.Exec(`UPDATE jobs SET token_hash = ? WHERE id = ?`, hashToken(token), jobID)
+	return token, err
+}
+
+// jobCanRead reports whether the request carries the token of a running job
+// that may read the repository called name.
+func (s *Server) jobCanRead(r *http.Request, name string) bool {
+	var token string
+	if _, p, ok := r.BasicAuth(); ok {
+		token = p
+	} else if t, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
+		token = t
+	}
+	if token == "" || name == "" {
+		return false
+	}
+	var runID int64
+	err := s.db.QueryRow(`SELECT run_id FROM jobs WHERE token_hash = ? AND status = ?`, hashToken(token), protocol.StatusInProgress).Scan(&runID)
+	if err != nil {
+		return false
+	}
+	run, err := s.getRun(runID)
+	if err != nil {
+		return false
+	}
+	for _, repo := range jobReadableRepos(run) {
+		if strings.EqualFold(repo, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func jobReadableRepos(run *Run) []string {
+	repos := []string{run.Repo}
+	if run.Event != wf.RepositoryPush && run.Event != "workflow_dispatch" {
+		return repos
+	}
+	if w, err := wf.Parse([]byte(run.WorkflowYAML)); err == nil {
+		repos = append(repos, wf.RepositoryPushSources(w)...)
+	}
+	return repos
+}
