@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -269,6 +270,10 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 	stopFlush()
 	<-flushDone
 	logs, steps := rep.finish(result)
+	// Outputs are stored and shown on the run page: mask secrets in them.
+	for k, v := range outputs {
+		outputs[k] = rep.maskSecrets(v)
+	}
 	done := protocol.JobComplete{Result: result, Outputs: outputs, Logs: logs, Steps: steps}
 	for attempt := 0; ; attempt++ {
 		err := a.c.complete(parent, req.JobID, done)
@@ -411,11 +416,19 @@ func short(sha string) string {
 	return sha
 }
 
+// extractTarGz unpacks a source archive into dest. It writes through an
+// os.Root, so neither ".." names nor symlinks in the archive (a link to
+// /home followed by a file under it) can put files outside dest.
 func extractTarGz(r io.Reader, dest string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return err
 	}
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	tr := tar.NewReader(gz)
 	for {
 		h, err := tr.Next()
@@ -425,20 +438,20 @@ func extractTarGz(r io.Reader, dest string) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dest, filepath.Clean("/"+h.Name))
-		if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) {
+		name := strings.TrimPrefix(path.Clean("/"+h.Name), "/")
+		if name == "" {
 			continue
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := root.MkdirAll(name, 0o755); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(path.Dir(name), 0o755); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(h.Mode)&0o777|0o600)
+			f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(h.Mode)&0o777|0o600)
 			if err != nil {
 				return err
 			}
@@ -448,8 +461,8 @@ func extractTarGz(r io.Reader, dest string) error {
 			}
 			f.Close()
 		case tar.TypeSymlink:
-			_ = os.MkdirAll(filepath.Dir(target), 0o755)
-			_ = os.Symlink(h.Linkname, target)
+			_ = root.MkdirAll(path.Dir(name), 0o755)
+			_ = root.Symlink(h.Linkname, name)
 		}
 	}
 }

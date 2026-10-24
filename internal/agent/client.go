@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,7 +22,7 @@ type client struct {
 }
 
 func newClient(base, token string) *client {
-	return &client{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{Timeout: 60 * time.Second}}
+	return &client{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{Timeout: 60 * time.Second, CheckRedirect: sameHost}}
 }
 
 type apiError struct {
@@ -97,7 +98,7 @@ func (c *client) download(ctx context.Context, path string, w io.Writer) error {
 		return err
 	}
 	req.Header.Set(protocol.RunnerTokenHeader, c.token)
-	resp, err := (&http.Client{}).Do(req)
+	resp, err := (&http.Client{CheckRedirect: sameHost}).Do(req)
 	if err != nil {
 		return err
 	}
@@ -108,4 +109,16 @@ func (c *client) download(ctx context.Context, path string, w io.Writer) error {
 	}
 	_, err = io.Copy(w, resp.Body)
 	return err
+}
+
+// sameHost refuses redirects to another host: Go would forward the runner
+// token header there.
+func sameHost(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if req.URL.Host != via[0].URL.Host || (via[0].URL.Scheme == "https" && req.URL.Scheme != "https") {
+		return fmt.Errorf("refusing to follow a redirect to %s", req.URL.Redacted())
+	}
+	return nil
 }
