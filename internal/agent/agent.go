@@ -287,6 +287,9 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	rep.logf(0, "Runner name: %s", a.cfg.Creds.Name)
 	rep.logf(0, "Job: %s (%s, run #%d)", req.DisplayName, req.WorkflowFile, req.RunNumber)
 	rep.logf(0, "Repository: %s @ %s (%s)", req.Repository, short(req.Sha), req.Ref)
+	for _, n := range req.Notices {
+		rep.logf(0, "##[warning]%s", n)
+	}
 
 	jobDir := filepath.Join(a.cfg.WorkDir, "jobs", strconv.FormatInt(req.JobID, 10))
 	defer os.RemoveAll(jobDir)

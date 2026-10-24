@@ -19,7 +19,9 @@ import (
 // their own repository: their workflow can come from any branch, and a
 // listener added on a branch of a public repository mustn't open a private
 // one to it. repository_push runs take their workflow from the listener's
-// default branch, and dispatches are started by the admin.
+// default branch, and dispatches are started by the admin. Either only gets
+// other repositories when its ref is protected, like secrets (see
+// protectedrefs.go).
 //
 // Readers are set on the repository being read, so that a listener can't
 // open a repository to itself: any repository's default branch can name
@@ -64,7 +66,7 @@ func (s *Server) jobCanRead(r *http.Request, name string) bool {
 
 func (s *Server) jobReadableRepos(run *Run) []string {
 	repos := []string{run.Repo}
-	if run.Event != wf.RepositoryPush && run.Event != "workflow_dispatch" {
+	if run.Event != wf.RepositoryPush && run.Event != "workflow_dispatch" || !s.runGetsSecrets(run) {
 		return repos
 	}
 	w, err := wf.Parse([]byte(run.WorkflowYAML))
