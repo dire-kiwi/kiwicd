@@ -558,9 +558,9 @@ func (a *Agent) removeJobContainers(ctx context.Context, prefix string) {
 	defer cancel()
 	if err := removeDockerObjects(ctx, prefix); err != nil {
 		if a.cfg.JobImage != "" {
-			a.log.Warn("remove the containers of earlier jobs", "prefix", prefix, "err", err)
+			a.log.Warn("remove jobs' Docker containers, networks, volumes and images", "prefix", prefix, "err", err)
 		} else {
-			a.log.Debug("remove the containers of earlier jobs", "prefix", prefix, "err", err)
+			a.log.Debug("remove jobs' Docker containers, networks, volumes and images", "prefix", prefix, "err", err)
 		}
 	}
 }
