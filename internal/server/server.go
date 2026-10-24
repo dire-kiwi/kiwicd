@@ -99,6 +99,13 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Git commands run in other directories, so relative paths into the data
+	// directory would resolve from the wrong place.
+	dataDir, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DataDir = dataDir
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "repos"), 0o755); err != nil {
 		return nil, err
 	}

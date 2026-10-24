@@ -37,6 +37,10 @@ export function SettingsTable({ kind, repo }: { kind: Kind; repo?: string }) {
               ? <>Encrypted values available to workflows as <code>{"${{ secrets.NAME }}"}</code>. Values are write-only and masked in logs.</>
               : <>Plain-text configuration available to workflows as <code>{"${{ vars.NAME }}"}</code>.</>}
             {repo ? " Repository values override global ones." : " Global values apply to every repository."}
+            {secret &&
+              (repo
+                ? " Only runs from protected refs get them: the default branch and the refs chosen in Settings."
+                : " Only runs from each repository's protected refs get them: its default branch and the refs chosen in its settings.")}
           </p>
         </div>
         <button className="btn btn-primary" onClick={() => setEditing({ name: "", value: "", isNew: true })}>

@@ -73,6 +73,9 @@ type JobRequest struct {
 
 	Secrets map[string]string `json:"secrets"`
 	Vars    map[string]string `json:"vars"`
+	// Warnings from the server to show in the job's log, such as why it got
+	// no secrets.
+	Notices []string `json:"notices,omitempty"`
 	// Extra environment, mostly GITHUB_* variables.
 	Env map[string]string `json:"env"`
 

@@ -4,7 +4,7 @@ import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
 import { PlanGraph } from "../components/PlanGraph";
 import { StatusIcon } from "../components/StatusIcon";
-import { BranchChip, CodeBlock, ErrorBox, Icon, Spinner } from "../components/ui";
+import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../components/ui";
 import { useDocumentTitle, useEventSource, useFetch, useNow } from "../hooks";
 import { buildGroups, jobState, type PlanGroup } from "../runmodel";
 import type { Job, Run, RunDetail } from "../types";
@@ -166,6 +166,15 @@ export function RunPage() {
         <ErrorBox>
           <span className="pre-wrap">{run.error}</span>
         </ErrorBox>
+      )}
+      {!run.protected && !run.error && (
+        <Flash kind="warn">
+          <span>
+            <span className="mono">{refName(run.ref)}</span> isn't a protected ref of {run.repo}, so this run's jobs get no secrets except{" "}
+            <span className="mono">KIWICD_TOKEN</span>, which only fetches {run.repo}. Protected refs are set in the repository's{" "}
+            <Link to={`/repos/${run.repo}/settings`}>Settings</Link>.
+          </span>
+        </Flash>
       )}
       {actionError && <ErrorBox>{actionError}</ErrorBox>}
 
