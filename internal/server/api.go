@@ -300,6 +300,7 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.Unmarshal([]byte(labels), &rn.Labels)
 		rn.Online = nowMS()-rn.LastSeenAt < 60_000
+		rn.Reserved = s.reserved.describe(rn.Labels)
 		runners = append(runners, &rn)
 	}
 	rows.Close()

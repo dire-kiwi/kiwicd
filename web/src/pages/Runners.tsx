@@ -89,6 +89,11 @@ export function RunnersPage() {
                           <Chip key={l}>{l}</Chip>
                         ))}
                       </div>
+                      {Object.entries(r.reserved ?? {}).map(([label, who]) => (
+                        <div key={label} className="small muted">
+                          Takes only jobs of {who.join(", ")} (<code>{label}</code> is reserved)
+                        </div>
+                      ))}
                     </td>
                     <td data-label="Platform" className="mono small">
                       {[r.os, r.arch].filter(Boolean).join("/") || "—"}

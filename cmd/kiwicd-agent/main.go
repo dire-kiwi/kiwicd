@@ -47,6 +47,7 @@ func usage() {
 Usage:
   kiwicd-agent register --url URL --token TOKEN [--name NAME] [--labels a,b:docker://image]
   kiwicd-agent run [--config .runner] [--work-dir _work] [--capacity N]
+                   [--job-image IMAGE [--job-options OPTS]] [--docker-socket PATH]
   kiwicd-agent version
 `, version)
 }
@@ -104,7 +105,10 @@ func run(ctx context.Context, args []string) error {
 	config := fs.String("config", env("KIWICD_CONFIG", ".runner"), "registration file written by `register`")
 	workDir := fs.String("work-dir", env("KIWICD_WORK_DIR", "_work"), "directory for job workspaces and the action cache")
 	capacity := fs.Int("capacity", 1, "jobs to run at once")
-	socket := fs.String("docker-socket", env("KIWICD_DOCKER_SOCKET", ""), "Docker socket for container jobs (default: autodetect)")
+	socket := fs.String("docker-socket", env("KIWICD_DOCKER_SOCKET", "-"), "Docker socket to mount into job containers, which gives jobs the machine; - for none")
+	jobImage := fs.String("job-image", env("KIWICD_JOB_IMAGE", ""), "run each job in a new container of this image instead of on this machine")
+	jobOptions := fs.String("job-options", env("KIWICD_JOB_OPTIONS", ""), "docker create options for job containers, e.g. --memory 4g --cpus 2")
+	bridgePrefix := fs.String("job-bridge-prefix", env("KIWICD_JOB_BRIDGE_PREFIX", "kiwicd-"), "start of the network interface names of --job-image jobs' networks")
 	actionsURL := fs.String("actions-url", env("KIWICD_ACTIONS_URL", "https://github.com"), "where uses: owner/repo@ref actions are cloned from")
 	_ = fs.Parse(args)
 
@@ -123,7 +127,8 @@ func run(ctx context.Context, args []string) error {
 	// Host jobs inherit the agent's environment: don't hand them a
 	// registration token, which could register a runner that takes jobs.
 	os.Unsetenv("KIWICD_REGISTRATION_TOKEN")
-	a, err := agent.New(agent.Config{Creds: creds, WorkDir: *workDir, Capacity: *capacity, Version: version, ContainerDaemonSocket: *socket, ActionsURL: *actionsURL})
+	a, err := agent.New(agent.Config{Creds: creds, WorkDir: *workDir, Capacity: *capacity, Version: version, ContainerDaemonSocket: *socket, ActionsURL: *actionsURL,
+		JobImage: *jobImage, JobOptions: *jobOptions, JobBridgePrefix: *bridgePrefix})
 	if err != nil {
 		return err
 	}

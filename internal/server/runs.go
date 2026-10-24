@@ -385,6 +385,13 @@ func (s *Server) advanceLocked(_ context.Context, runID int64) error {
 					}
 					continue
 				}
+				if l, denied := s.runDenied(run, labels); denied {
+					msg := fmt.Sprintf("runs-on: the runner label %q is reserved for other repositories or branches", l)
+					if err := s.insertJob(runID, key, name, combo, labels, protocol.StatusCompleted, protocol.ResultFailure, msg); err != nil {
+						return err
+					}
+					continue
+				}
 				if err := s.insertJob(runID, key, name, combo, labels, protocol.StatusQueued, "", ""); err != nil {
 					return err
 				}

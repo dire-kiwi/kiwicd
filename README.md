@@ -166,6 +166,37 @@ Tests: `go test ./internal/...`.
 `name:docker://IMAGE` runs them in a container (needs Docker). Remote actions are cloned from
 `https://github.com` (`--actions-url`).
 
+### Isolating jobs
+
+Jobs on the agent's machine run as the agent's user: they can read its registration (and with
+it take other jobs and their secrets), leave processes behind that read later jobs' secrets, and
+change what later jobs use (`~/.gitconfig`, Go and npm caches, cloned actions). Only run trusted
+code that way. For anything else, start the agent with `--job-image IMAGE`
+(`KIWICD_JOB_IMAGE`): each job then runs in a new container of that image, removed afterwards
+along with any process it left, and none of the agent's files are in it. Labels without a
+`docker://` image of their own, and GitHub's implicit ones (`self-hosted`, `linux`, ...), use
+the job image. The agent needs Docker; its jobs don't get it. Also:
+
+- Each job has a bridge network of its own, so jobs can't reach each other's containers. Its
+  services, `docker://` steps and the builds of its Docker actions use it too. The network's
+  interface is `--job-bridge-prefix` (default `kiwicd-`, at most 7 characters) plus the job ID,
+  so a firewall can match jobs' traffic, e.g. `iptables -I DOCKER-USER -i kiwicd-+ -d
+  10.0.0.0/8 -j DROP`.
+- Workflows may not give their `container` or `services` options or volumes that reach outside
+  the container: host paths, named volumes (they outlive the job), `--privileged`, devices,
+  capabilities, other namespaces, `--env-file`. Options such as `--health-cmd`, `--user`,
+  `-e`, `--memory` and `--tmpfs` work as usual.
+- act's shared tool cache volume is left out and Docker actions are rebuilt for each job.
+- `--job-options` (`KIWICD_JOB_OPTIONS`) are `docker create` options for every job, service and
+  step container, after the workflow's own, e.g. `--memory 4g --cpus 2 --pids-limit 4096`.
+- The agent removes each job's containers, volumes, networks and Docker action images when the
+  job ends, and those of jobs it didn't finish when it starts. They're named
+  `kiwicd-r<runner>-j<job>-...`.
+
+Container jobs don't get the Docker socket unless the agent is given one with `--docker-socket
+/var/run/docker.sock` (`KIWICD_DOCKER_SOCKET`), which hands its jobs the machine. Give it only to
+a runner whose label is reserved for trusted repositories (see `--reserve-label`).
+
 ### Server configuration
 
 | Flag / variable | |
@@ -176,6 +207,7 @@ Tests: `go test ./internal/...`.
 | `--retention-days` / `KIWICD_RETENTION_DAYS` | Days to keep completed runs and their logs (default 30, 0 keeps them forever); also passed to jobs as `GITHUB_RETENTION_DAYS` |
 | `--client-ip-header` / `KIWICD_CLIENT_IP_HEADER` | Behind a reverse proxy: the header it puts the client's address in (`X-Forwarded-For`, `CF-Connecting-IP`), so wrong admin passwords are limited per client (10, then one a minute) rather than per proxy. Only set it if every request comes through that proxy, since clients can send the header themselves |
 | `KIWICD_REGISTRATION_TOKEN` | Optional long-lived registration token, for agents deployed next to the server |
+| `--reserve-label` / `KIWICD_RESERVED_LABELS` | Keep a runner label for some repositories and refs: `LABEL=OWNER/REPO[@REF][,...]`, repeatable (the variable holds them separated by spaces). A bare `OWNER/REPO` means its default branch; `REF` is a branch, a full ref (`refs/tags/v*`) or a pattern (`@*` for any branch). A runner with a reserved label takes only jobs of runs those allow, whatever labels the jobs ask for, and jobs elsewhere that ask for the label fail at once. For runners that hold deploy credentials, reach production or have the Docker socket |
 | `--max-log-lines` / `KIWICD_MAX_LOG_LINES` | Most log lines stored per job (default 1000000, `-1` for no limit). Later output is dropped after a notice; the job keeps running |
 | `--max-log-bytes` / `KIWICD_MAX_LOG_BYTES` | Most log bytes stored per job (default 104857600). Lines longer than 64 KiB are cut |
 | `KIWICD_SECRET_KEY` | Key that encrypts secrets and SSH deploy keys in the database: 32 bytes as base64 or hex (`openssl rand -base64 32`). Default: `<data>/secret.key`, generated on first start |
@@ -204,3 +236,8 @@ nektos/act. So far:
   kiwicd.
 - `docker://` steps of host jobs use the default network and the workspace's container path, as
   Docker actions already did (they tried to join a job container that doesn't exist).
+- For isolated jobs: `Config.ContainerNamePrefix` (unique names for a job's containers,
+  volumes and action images), `ToolCacheVolume`, `RestrictContainers` (refuse workflow container
+  options and volumes that reach the host), `ContainerOptions` applied after the workflow's own to
+  job and service containers and to `docker://` steps, and a user-defined `ContainerNetworkMode`
+  used for services and for building Docker actions too.

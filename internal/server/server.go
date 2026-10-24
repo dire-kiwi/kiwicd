@@ -46,8 +46,11 @@ type Config struct {
 	// dropped. 0 means the default, negative means no limit.
 	MaxLogLines int64
 	MaxLogBytes int64
-	Version     string
-	Web         fs.FS
+	// ReservedLabels keep runner labels for some repositories and refs:
+	// LABEL=OWNER/REPO[@REF][,...], see parseReservedLabels.
+	ReservedLabels []string
+	Version        string
+	Web            fs.FS
 }
 
 type Server struct {
@@ -59,6 +62,7 @@ type Server struct {
 
 	limiter      *passwordLimiter
 	proxyWarning sync.Once
+	reserved     reservedLabels
 
 	// mu serialises scheduling decisions (run advancement, job assignment).
 	mu sync.Mutex
@@ -91,6 +95,10 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxLogBytes == 0 {
 		cfg.MaxLogBytes = defaultMaxLogBytes
 	}
+	reserved, err := parseReservedLabels(cfg.ReservedLabels)
+	if err != nil {
+		return nil, err
+	}
 	// Git commands run in other directories, so relative paths into the data
 	// directory would resolve from the wrong place.
 	dataDir, err := filepath.Abs(cfg.DataDir)
@@ -121,6 +129,7 @@ func New(cfg Config) (*Server, error) {
 		log:       slog.Default(),
 		hub:       newHub(),
 		limiter:   newPasswordLimiter(),
+		reserved:  reserved,
 		jobsReady: make(chan struct{}),
 		syncLocks: map[int64]*sync.Mutex{},
 

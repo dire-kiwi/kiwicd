@@ -150,6 +150,8 @@ export interface Runner {
   job_id?: number;
   run_id?: number;
   job_name?: string;
+  // Reserved labels: who may use them (owner/repo, or owner/repo@ref).
+  reserved?: Record<string, string[]>;
 }
 
 export interface RegistrationToken {
