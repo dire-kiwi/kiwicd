@@ -91,6 +91,13 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxLogBytes == 0 {
 		cfg.MaxLogBytes = defaultMaxLogBytes
 	}
+	// Git commands run in other directories, so relative paths into the data
+	// directory would resolve from the wrong place.
+	dataDir, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DataDir = dataDir
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "repos"), 0o755); err != nil {
 		return nil, err
 	}

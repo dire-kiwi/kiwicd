@@ -265,3 +265,49 @@ func TestRepositoryPush(t *testing.T) {
 		t.Errorf("deploys after changing the listener: %d, want %d", got, before+1)
 	}
 }
+
+// The server works with a relative data directory, though git commands run in
+// other directories.
+func TestRelativeDataDir(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	srv, err := New(Config{DataDir: "data", AdminPassword: "pw", Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	req, _ := http.NewRequest("POST", ts.URL+"/api/repos", strings.NewReader(`{"name":"t/build"}`))
+	req.SetBasicAuth("admin", "pw")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("create repository: %d", resp.StatusCode)
+	}
+
+	src := filepath.Join(tmp, "src")
+	remote := strings.Replace(ts.URL, "http://", "http://admin:pw@", 1) + "/git/t/build.git"
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main", src},
+		{"-C", src, "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", src, "push", "-q", remote, "HEAD:main"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+			"GIT_TERMINAL_PROMPT=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	want, _ := exec.Command("git", "-C", src, "rev-parse", "HEAD").Output()
+	if sha, err := resolveRef(context.Background(), srv.repoPath("t/build"), "refs/heads/main"); err != nil ||
+		sha != strings.TrimSpace(string(want)) {
+		t.Errorf("pushed main: %q %v, want %s", sha, err, want)
+	}
+}
