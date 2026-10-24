@@ -791,6 +791,12 @@ textarea.input {
   padding: 0;
   overflow-wrap: anywhere;
 }
+.reader-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
 .kv .label {
   color: var(--muted);
   font-weight: 500;

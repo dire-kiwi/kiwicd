@@ -104,12 +104,14 @@ func TestRepositoryPush(t *testing.T) {
 	deploySHA := commit("t/deploy", "main", "listener", map[string]string{
 		".github/workflows/deploy.yml": listenerWorkflow,
 		".github/workflows/broken.yml": "on:\n  repository_push:\n    repositories: [t/app]\njobs: [\n",
+		// Names t/app only as part of longer names, so pushes to t/app don't report it.
+		".github/workflows/broken-other.yml": "on:\n  repository_push:\n    repositories: [t/app-legacy, xt/app]\njobs: [\n",
 	})
 	// A listener that's only on another branch of t/other is ignored.
 	commit("t/other", "main", "init", map[string]string{"README": "x"})
 	commit("t/other", "feature", "listener on a branch", map[string]string{".github/workflows/l.yml": listenerWorkflow})
 	// Pushing a listener doesn't run it, but reports it if it's broken.
-	if runs := runsOf("t/deploy"); len(runs) != 1 || runs[0].WorkflowFile != ".github/workflows/broken.yml" || runs[0].Event != "push" {
+	if runs := runsOf("t/deploy"); len(runs) != 2 || runs[0].Event != "push" || runs[1].Event != "push" {
 		t.Fatalf("runs after pushing the listener: %+v", runs)
 	}
 
@@ -132,8 +134,9 @@ func TestRepositoryPush(t *testing.T) {
 			broken = r
 		}
 	}
-	// The broken one is reported for both pushes to t/app, as broken push workflows are.
-	if len(runs) != 4 || run == nil || broken == nil {
+	// The broken one is reported for both pushes to t/app, as broken push
+	// workflows are; the one for other repositories isn't.
+	if len(runs) != 5 || run == nil || broken == nil {
 		t.Fatalf("runs of t/deploy: %+v", runs)
 	}
 	if broken.Conclusion != protocol.ResultFailure || !strings.Contains(broken.Error, "Invalid workflow") {
@@ -150,8 +153,8 @@ func TestRepositoryPush(t *testing.T) {
 		t.Fatalf("run: %+v", run)
 	}
 
-	// The job's token fetches its own repository and the one it listens to,
-	// only while the job runs, and never pushes.
+	// The job's token fetches its own repository, and the one it listens to
+	// once that lists it as a reader, only while the job runs, and never pushes.
 	jobs, err := srv.runJobs(run.ID)
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("jobs: %v %v", jobs, err)
@@ -175,8 +178,27 @@ func TestRepositoryPush(t *testing.T) {
 	if _, err := srv.db.Exec(`UPDATE jobs SET status = ? WHERE id = ?`, protocol.StatusInProgress, jobs[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	if fetch("t/app", bearer) != nil || fetch("t/deploy", bearer) != nil {
-		t.Error("the token can't fetch t/app and t/deploy")
+	if fetch("t/deploy", bearer) != nil {
+		t.Error("the token can't fetch its own repository")
+	}
+	if fetch("t/app", bearer) == nil {
+		t.Error("the token fetched t/app before t/app let t/deploy read it")
+	}
+	// Readers are checked: owner/name each; duplicates and the repository itself are dropped.
+	if code := api("PATCH", "/api/repos/t/app", `{"readers":["not a repo"]}`, nil); code != 400 {
+		t.Errorf("bad reader: %d", code)
+	}
+	var app Repo
+	if code := api("PATCH", "/api/repos/t/app", `{"readers":["t/deploy"," T/Deploy ","t/app","t/x.git",""]}`, &app); code != 200 ||
+		strings.Join(app.Readers, ",") != "t/deploy,t/x" {
+		t.Fatalf("set readers: %d %+v", code, app.Readers)
+	}
+	// Reading t/other needs both its consent and the workflow listening to it.
+	if code := api("PATCH", "/api/repos/t/other", `{"readers":["t/deploy"]}`, nil); code != 200 {
+		t.Fatalf("set readers of t/other: %d", code)
+	}
+	if fetch("t/app", bearer) != nil {
+		t.Error("the token can't fetch t/app")
 	}
 	basic := strings.Replace(ts.URL, "http://", "http://x-access-token:"+token+"@", 1)
 	if gitIn(tmp, "ls-remote", basic+"/git/t/app.git") != nil {
@@ -198,8 +220,39 @@ func TestRepositoryPush(t *testing.T) {
 
 	// Push runs only read their own repository, whatever their workflow says.
 	for event, want := range map[string]int{"push": 1, "workflow_dispatch": 2, "repository_push": 2} {
-		if got := jobReadableRepos(&Run{Repo: "t/deploy", Event: event, WorkflowYAML: listenerWorkflow}); len(got) != want {
+		if got := srv.jobReadableRepos(&Run{Repo: "t/deploy", Event: event, WorkflowYAML: listenerWorkflow}); len(got) != want {
 			t.Errorf("%s run reads %v", event, got)
 		}
+	}
+	// Other listeners don't get t/app's consent to t/deploy.
+	if got := srv.jobReadableRepos(&Run{Repo: "t/other", Event: "repository_push", WorkflowYAML: listenerWorkflow}); len(got) != 1 {
+		t.Errorf("t/other's listener reads %v", got)
+	}
+	// Removing the reader takes the access away.
+	if code := api("PATCH", "/api/repos/t/app", `{"readers":[]}`, &app); code != 200 || len(app.Readers) != 0 {
+		t.Fatalf("clear readers: %d %+v", code, app.Readers)
+	}
+	if got := srv.jobReadableRepos(&Run{Repo: "t/deploy", Event: "repository_push", WorkflowYAML: listenerWorkflow}); len(got) != 1 {
+		t.Errorf("t/deploy reads %v after t/app removed it", got)
+	}
+
+	// A new commit on the listener's default branch replaces the cached
+	// workflows: the listener now deploys t/app's dev branch.
+	countDeploys := func() int {
+		n := 0
+		for _, r := range runsOf("t/deploy") {
+			if r.Event == "repository_push" && r.WorkflowFile == ".github/workflows/deploy.yml" {
+				n++
+			}
+		}
+		return n
+	}
+	before := countDeploys()
+	commit("t/deploy", "main", "deploy dev", map[string]string{
+		".github/workflows/deploy.yml": strings.Replace(listenerWorkflow, "branches: [main]", "branches: [dev]", 1),
+	})
+	commit("t/app", "dev", "Deployed now", map[string]string{"app.txt": "v3"})
+	if got := countDeploys(); got != before+1 {
+		t.Errorf("deploys after changing the listener: %d, want %d", got, before+1)
 	}
 }

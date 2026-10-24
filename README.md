@@ -44,7 +44,7 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   (see [below](#deploy-a-public-repository-from-a-private-one)).
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
   `/git/` while the job runs (and, for `repository_push` and dispatched runs, the repositories its
-  workflow listens to). It can't push or use the API.
+  workflow listens to that list it as a reader). It can't push or use the API.
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
@@ -87,7 +87,12 @@ jobs:
 
 Add both repositories to kiwicd (a mirror of a private GitHub repository needs a deploy key) and
 set the secrets and variables on the private one. The public repository needs no workflow, secret
-or variable in kiwicd, so nothing pushed to it can reach them.
+or variable in kiwicd, so nothing pushed to it can reach them. For the job to clone the public
+repository, add the private one to its readers, in its **Settings → Job access** or with:
+
+```sh
+curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/repos/owner/app
+```
 
 - Listeners are read from the private repository's **default branch** when the push arrives, like
   GitHub's `repository_dispatch`. The run belongs to the private repository: `github.repository`,
@@ -96,9 +101,11 @@ or variable in kiwicd, so nothing pushed to it can reach them.
 - `github.event` is the public repository's push event: `github.event.repository.full_name`,
   `github.event.ref`, `github.event.after` (the pushed commit), `github.event.head_commit`. The
   run's title is `owner/app: <commit subject>`, and its page shows the pushed commit.
-- `secrets.KIWICD_TOKEN` fetches the repositories the workflow lists under `repository_push`, in
-  runs started by `repository_push` or by hand. Runs started by a push to the listening repository
-  only get that repository, since their workflow can come from any branch.
+- `secrets.KIWICD_TOKEN` fetches the repositories the workflow lists under `repository_push` that
+  list the listening repository as a reader, in runs started by `repository_push` or by hand. The
+  repository being read has to agree, since any repository's default branch can listen to any
+  other, including a public one's where outside contributions land. Runs started by a push to the
+  listening repository only get that repository, since their workflow can come from any branch.
 - GitHub doesn't know `repository_push`, so turn off GitHub Actions on the private repository if
   it's on GitHub, or GitHub reports the workflow as invalid.
 

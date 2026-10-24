@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"maps"
 	"mime"
 	"net/http"
 	"regexp"
@@ -53,6 +54,36 @@ func (s *Server) workflowsAt(ctx context.Context, repo *Repo, sha string) (map[s
 			return nil, err
 		}
 	}
+	return s.addUploadedWorkflows(repo, files)
+}
+
+// defaultBranchWorkflows is workflowsAt for the commit sha at the tip of
+// repo's default branch. Every push looks for repository_push listeners
+// there in every repository, so the committed files are kept for each
+// repository's latest tip: a commit's files never change.
+func (s *Server) defaultBranchWorkflows(ctx context.Context, repo *Repo, sha string) (map[string][]byte, error) {
+	s.tipMu.Lock()
+	tip, ok := s.tipWorkflows[repo.ID]
+	s.tipMu.Unlock()
+	if !ok || tip.sha != sha {
+		files, err := workflowFiles(ctx, s.repoPath(repo.Name), sha)
+		if err != nil {
+			return nil, err
+		}
+		tip = cachedWorkflows{sha: sha, files: files}
+		s.tipMu.Lock()
+		s.tipWorkflows[repo.ID] = tip
+		s.tipMu.Unlock()
+	}
+	return s.addUploadedWorkflows(repo, maps.Clone(tip.files))
+}
+
+type cachedWorkflows struct {
+	sha   string
+	files map[string][]byte
+}
+
+func (s *Server) addUploadedWorkflows(repo *Repo, files map[string][]byte) (map[string][]byte, error) {
 	uploaded, err := s.uploadedWorkflows(repo.ID)
 	if err != nil {
 		return nil, err
