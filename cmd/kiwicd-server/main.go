@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -48,6 +49,12 @@ func main() {
 	maxLogLines := flag.Int64("max-log-lines", envInt("KIWICD_MAX_LOG_LINES", 1_000_000), "most log lines stored per job (-1: no limit)")
 	maxLogBytes := flag.Int64("max-log-bytes", envInt("KIWICD_MAX_LOG_BYTES", 100<<20), "most log bytes stored per job (-1: no limit)")
 	clientIPHeader := flag.String("client-ip-header", env("KIWICD_CLIENT_IP_HEADER", ""), "header a reverse proxy puts the client's address in (X-Forwarded-For, CF-Connecting-IP); only set it if every request comes through that proxy")
+	var reserved []string
+	reserved = append(reserved, strings.Fields(os.Getenv("KIWICD_RESERVED_LABELS"))...)
+	flag.Func("reserve-label", "keep a runner label for some repositories: LABEL=OWNER/REPO[@REF][,...] (repeatable; KIWICD_RESERVED_LABELS holds them space-separated)", func(v string) error {
+		reserved = append(reserved, v)
+		return nil
+	})
 	debug := flag.Bool("debug", os.Getenv("KIWICD_DEBUG") != "", "debug logging")
 	showVersion := flag.Bool("version", false, "print the version")
 	flag.Parse()
@@ -72,6 +79,7 @@ func main() {
 		ClientIPHeader:    *clientIPHeader,
 		MaxLogLines:       *maxLogLines,
 		MaxLogBytes:       *maxLogBytes,
+		ReservedLabels:    reserved,
 		SecretKey:         os.Getenv("KIWICD_SECRET_KEY"),
 		Version:           version,
 		Web:               web.FS(),

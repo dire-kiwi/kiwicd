@@ -29,6 +29,8 @@ type Runner struct {
 	JobID      int64    `json:"job_id,omitempty"`
 	RunID      int64    `json:"run_id,omitempty"`
 	JobName    string   `json:"job_name,omitempty"`
+	// Reserved lists who may use the runner's reserved labels.
+	Reserved map[string][]string `json:"reserved,omitempty"`
 }
 
 func (s *Server) runnerFromRequest(r *http.Request) (*Runner, error) {
@@ -170,7 +172,8 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// assignJob gives the oldest queued job whose runs-on labels the runner has.
+// assignJob gives the oldest queued job whose runs-on labels the runner has
+// and whose run may use the runner's reserved labels.
 func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*protocol.JobRequest, error) {
 	s.mu.Lock()
 	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE status = ? ORDER BY id`, protocol.StatusQueued)
@@ -178,7 +181,7 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 		s.mu.Unlock()
 		return nil, err
 	}
-	var picked *Job
+	var candidates []*Job
 	for rows.Next() {
 		j, err := scanJob(rows)
 		if err != nil {
@@ -187,11 +190,25 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 			return nil, err
 		}
 		if labelsMatch(j.RunsOn, rn.Labels) {
-			picked = j
-			break
+			candidates = append(candidates, j)
 		}
 	}
 	rows.Close()
+	var picked *Job
+	reserved := s.reserved.reservesAny(rn.Labels)
+	for _, j := range candidates {
+		if reserved {
+			run, err := s.getRun(j.RunID)
+			if err != nil {
+				continue
+			}
+			if _, denied := s.runDenied(run, rn.Labels); denied {
+				continue
+			}
+		}
+		picked = j
+		break
+	}
 	if picked == nil {
 		s.mu.Unlock()
 		return nil, nil
