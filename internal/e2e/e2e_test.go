@@ -321,6 +321,11 @@ jobs:
       - uses: docker://debian:trixie-slim
         with:
           args: test -f hello.txt
+      - name: The runner's --job-options apply to docker:// steps too
+        uses: docker://debian:trixie-slim
+        with:
+          entrypoint: sh
+          args: -c 'test "$(cat /sys/fs/cgroup/memory.max)" = 1073741824'
       - uses: ./action
   services:
     runs-on: self-hosted
@@ -416,7 +421,12 @@ func TestIsolatedJobs(t *testing.T) {
 		".github/workflows/ci.yml": isolatedWorkflow,
 		"hello.txt":                "hi\n",
 		"action/action.yml":        dockerAction,
-		"action/Dockerfile":        "FROM debian:trixie-slim\nENTRYPOINT [\"sh\", \"-c\", \"echo docker action ran\"]\n",
+		// The action is built on the job's network: its RUN resolves the job
+		// container's alias, which the default bridge can't. The nonce
+		// keeps the layer cache from skipping the RUN.
+		"action/nonce": fmt.Sprint(time.Now().UnixNano()),
+		"action/Dockerfile": "FROM debian:trixie-slim\nCOPY nonce /nonce\nRUN getent hosts isolated\n" +
+			"ENTRYPOINT [\"sh\", \"-c\", \"echo docker action ran\"]\n",
 	}
 	for name, content := range files {
 		_ = os.MkdirAll(filepath.Dir(filepath.Join(src, name)), 0o755)

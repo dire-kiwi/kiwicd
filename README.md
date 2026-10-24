@@ -166,6 +166,7 @@ along with any process it left, and none of the agent's files are in it. Labels 
 the job image. The agent needs Docker; its jobs don't get it. Also:
 
 - Each job has a bridge network of its own, so jobs can't reach each other's containers. Its
+  services, `docker://` steps and the builds of its Docker actions use it too. The network's
   interface is `--job-bridge-prefix` (default `kiwicd-`, at most 7 characters) plus the job ID,
   so a firewall can match jobs' traffic, e.g. `iptables -I DOCKER-USER -i kiwicd-+ -d
   10.0.0.0/8 -j DROP`.
@@ -226,4 +227,5 @@ nektos/act. So far:
 - For isolated jobs: `Config.ContainerNamePrefix` (unique names for a job's containers,
   volumes and action images), `ToolCacheVolume`, `RestrictContainers` (refuse workflow container
   options and volumes that reach the host), `ContainerOptions` applied after the workflow's own to
-  job and service containers, and a user-defined `ContainerNetworkMode` used for services too.
+  job and service containers and to `docker://` steps, and a user-defined `ContainerNetworkMode`
+  used for services and for building Docker actions too.
