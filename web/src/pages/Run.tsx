@@ -189,7 +189,7 @@ export function RunPage() {
         <section className="run-content">
           {jobId ? (
             selectedJob ? (
-              <JobLog key={selectedJob.id} job={selectedJob} onJob={upsertJob} />
+              <JobLog key={selectedJob.id} job={selectedJob} onJob={upsertJob} withheld={detail.data?.protected_labels ?? []} />
             ) : (
               <ErrorBox>
                 Job {jobId} is not part of this run. <Link to={`/runs/${run.id}`}>Back to summary</Link>

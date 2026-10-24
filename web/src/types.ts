@@ -127,6 +127,8 @@ export interface RunDetail {
   run: Run;
   jobs: Job[] | null;
   plan: PlanEntry[] | null;
+  // Labels whose runners won't take this run's jobs, as its ref isn't protected.
+  protected_labels?: string[];
 }
 
 export interface LogLine {
@@ -152,6 +154,8 @@ export interface Runner {
   job_name?: string;
   // Reserved labels: who may use them (owner/repo, or owner/repo@ref).
   reserved?: Record<string, string[]>;
+  // The runner's labels that keep it for jobs from protected refs.
+  protected_labels?: string[];
 }
 
 export interface RegistrationToken {

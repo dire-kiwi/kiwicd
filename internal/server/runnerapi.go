@@ -31,6 +31,9 @@ type Runner struct {
 	JobName    string   `json:"job_name,omitempty"`
 	// Reserved lists who may use the runner's reserved labels.
 	Reserved map[string][]string `json:"reserved,omitempty"`
+	// ProtectedLabels are the runner's labels that keep it for jobs from
+	// protected refs.
+	ProtectedLabels []string `json:"protected_labels,omitempty"`
 }
 
 func (s *Server) runnerFromRequest(r *http.Request) (*Runner, error) {
@@ -173,7 +176,7 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // assignJob gives the oldest queued job whose runs-on labels the runner has
-// and whose run may use the runner's reserved labels.
+// and whose run may use the runner's reserved and protected labels.
 func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*protocol.JobRequest, error) {
 	s.mu.Lock()
 	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE status = ? ORDER BY id`, protocol.StatusQueued)
@@ -195,14 +198,22 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 	}
 	rows.Close()
 	var picked *Job
-	reserved := s.reserved.reservesAny(rn.Labels)
+	// Jobs whose run may no longer use the labels they ask for, say because
+	// their ref stopped being protected after they were queued, would wait
+	// forever: fail them.
+	denied := map[int64]string{}
+	limited := s.reserved.reservesAny(rn.Labels) || len(s.protectedLabels.of(rn.Labels)) > 0
 	for _, j := range candidates {
-		if reserved {
+		if limited {
 			run, err := s.getRun(j.RunID)
 			if err != nil {
 				continue
 			}
-			if _, denied := s.runDenied(run, rn.Labels); denied {
+			if msg := s.labelDenied(run, j.RunsOn); msg != "" {
+				denied[j.ID] = msg
+				continue
+			}
+			if !s.runnerTakes(rn, run) {
 				continue
 			}
 		}
@@ -211,6 +222,7 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 	}
 	if picked == nil {
 		s.mu.Unlock()
+		s.failDenied(ctx, denied)
 		return nil, nil
 	}
 	now := nowMS()
@@ -222,6 +234,7 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 	}
 	req, err := s.buildJobRequest(picked, baseURL)
 	s.mu.Unlock()
+	s.failDenied(ctx, denied)
 	if err != nil {
 		_ = s.completeJob(ctx, picked.ID, protocol.ResultFailure, err.Error(), nil, nil)
 		return nil, nil
@@ -232,6 +245,12 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 	}
 	_ = s.advance(ctx, picked.RunID)
 	return req, nil
+}
+
+func (s *Server) failDenied(ctx context.Context, denied map[int64]string) {
+	for id, msg := range denied {
+		_ = s.completeJob(ctx, id, protocol.ResultFailure, msg, nil, nil)
+	}
 }
 
 func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, error) {

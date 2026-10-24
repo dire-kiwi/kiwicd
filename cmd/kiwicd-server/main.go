@@ -55,6 +55,12 @@ func main() {
 		reserved = append(reserved, v)
 		return nil
 	})
+	var protected []string
+	protected = append(protected, strings.Fields(os.Getenv("KIWICD_PROTECTED_LABELS"))...)
+	flag.Func("protected-label", "runners with this label take only jobs from protected refs (repeatable; KIWICD_PROTECTED_LABELS holds them space-separated)", func(v string) error {
+		protected = append(protected, v)
+		return nil
+	})
 	debug := flag.Bool("debug", os.Getenv("KIWICD_DEBUG") != "", "debug logging")
 	showVersion := flag.Bool("version", false, "print the version")
 	flag.Parse()
@@ -80,6 +86,7 @@ func main() {
 		MaxLogLines:       *maxLogLines,
 		MaxLogBytes:       *maxLogBytes,
 		ReservedLabels:    reserved,
+		ProtectedLabels:   protected,
 		SecretKey:         os.Getenv("KIWICD_SECRET_KEY"),
 		Version:           version,
 		Web:               web.FS(),

@@ -18,8 +18,11 @@ function stepState(s: Step) {
   return "pending" as const;
 }
 
-/** Live log view for one job: collapsible steps streamed over SSE. */
-export function JobLog({ job, onJob }: { job: Job; onJob: (j: unknown) => void }) {
+/**
+ * Live log view for one job: collapsible steps streamed over SSE. Runners
+ * with the withheld labels won't take it, as its run's ref isn't protected.
+ */
+export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unknown) => void; withheld?: string[] }) {
   const [logs, setLogs] = useState<LogState>({ byStep: {}, count: 0 });
   const [streamError, setStreamError] = useState(false);
   const [overrides, setOverrides] = useState<Record<number, boolean>>({});
@@ -237,6 +240,15 @@ export function JobLog({ job, onJob }: { job: Job; onJob: (j: unknown) => void }
                   <code key={l}>{l}</code>
                 ))}{" "}
                 to pick up this job…
+                {withheld.length > 0 && (
+                  <div className="small">
+                    This run's ref isn't protected, so runners with the label{withheld.length > 1 ? "s" : ""}{" "}
+                    {withheld.map((l) => (
+                      <code key={l}>{l}</code>
+                    ))}{" "}
+                    won't take it.
+                  </div>
+                )}
               </>
             ) : job.status === "completed" ? (
               job.conclusion === "skipped" ? (
