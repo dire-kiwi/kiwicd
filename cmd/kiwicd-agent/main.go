@@ -120,6 +120,9 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading registration: %w (run `kiwicd-agent register` first)", err)
 	}
+	// Host jobs inherit the agent's environment: don't hand them a
+	// registration token, which could register a runner that takes jobs.
+	os.Unsetenv("KIWICD_REGISTRATION_TOKEN")
 	a, err := agent.New(agent.Config{Creds: creds, WorkDir: *workDir, Capacity: *capacity, Version: version, ContainerDaemonSocket: *socket, ActionsURL: *actionsURL})
 	if err != nil {
 		return err

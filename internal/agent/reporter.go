@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,10 +41,9 @@ type reporter struct {
 func newReporter(c *client, jobID int64, job *model.Job, secrets map[string]string, cancel context.CancelFunc) *reporter {
 	r := &reporter{c: c, jobID: jobID, cancel: cancel, stepIndex: map[string]int{}, postIndex: map[string]int{}, complete: -1, named: map[int]bool{}}
 	for _, v := range secrets {
-		if v != "" {
-			r.secrets = append(r.secrets, v)
-		}
+		r.secrets = append(r.secrets, maskValues(v)...)
 	}
+	sortLongestFirst(r.secrets)
 	r.steps = append(r.steps, protocol.StepState{Name: "Set up job", Status: protocol.StatusInProgress, StartedAt: nowMS()})
 	for i, st := range job.Steps {
 		if st == nil {
@@ -80,17 +80,50 @@ func stepTitle(st *model.Step) string {
 	return st.String()
 }
 
-// mask hides secrets and ::add-mask:: values in text act did not mask itself.
-func (r *reporter) mask(e *logrus.Entry, s string) string {
+// maskValues returns what to mask for a secret: the value and, since act
+// logs output a line at a time, each line of a multi-line value (an SSH key)
+// as GitHub's runner does. Very short lines, such as a lone "}", are left.
+func maskValues(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	out := []string{v}
+	if strings.ContainsAny(v, "\r\n") {
+		for _, line := range strings.FieldsFunc(v, func(c rune) bool { return c == '\n' || c == '\r' }) {
+			if line = strings.TrimSpace(line); len(line) >= 4 {
+				out = append(out, line)
+			}
+		}
+	}
+	return out
+}
+
+// sortLongestFirst orders masks so that a secret that starts with another
+// one is replaced whole, not as "***" and the rest of it.
+func sortLongestFirst(masks []string) {
+	sort.SliceStable(masks, func(i, j int) bool { return len(masks[i]) > len(masks[j]) })
+}
+
+// maskSecrets hides the job's secrets in s.
+func (r *reporter) maskSecrets(s string) string {
 	for _, v := range r.secrets {
 		s = strings.ReplaceAll(s, v, "***")
 	}
+	return s
+}
+
+// mask hides secrets and ::add-mask:: values in text act did not mask itself.
+func (r *reporter) mask(e *logrus.Entry, s string) string {
+	s = r.maskSecrets(s)
 	if e.Context != nil {
 		if masks := runner.Masks(e.Context); masks != nil {
+			var extra []string
 			for _, v := range *masks {
-				if v != "" {
-					s = strings.ReplaceAll(s, v, "***")
-				}
+				extra = append(extra, maskValues(v)...)
+			}
+			sortLongestFirst(extra)
+			for _, v := range extra {
+				s = strings.ReplaceAll(s, v, "***")
 			}
 		}
 	}
@@ -101,7 +134,8 @@ func (r *reporter) mask(e *logrus.Entry, s string) string {
 func (r *reporter) logf(step int, format string, args ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, line := range strings.Split(strings.TrimRight(fmt.Sprintf(format, args...), "\n"), "\n") {
+	text := r.maskSecrets(fmt.Sprintf(format, args...))
+	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
 		r.pending = append(r.pending, protocol.LogLine{Step: step, TS: nowMS(), Text: line})
 	}
 }

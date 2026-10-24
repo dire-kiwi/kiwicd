@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -155,6 +156,7 @@ func New(cfg Config) (*Agent, error) {
 // Run polls for jobs until ctx is cancelled. Running jobs finish first.
 func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("agent started", "name", a.cfg.Creds.Name, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels)
+	a.removeLeftovers()
 	var wg sync.WaitGroup
 	errs := make(chan error, a.cfg.Capacity)
 	for i := 0; i < a.cfg.Capacity; i++ {
@@ -269,6 +271,10 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 	stopFlush()
 	<-flushDone
 	logs, steps := rep.finish(result)
+	// Outputs are stored and shown on the run page: mask secrets in them.
+	for k, v := range outputs {
+		outputs[k] = rep.maskSecrets(v)
+	}
 	done := protocol.JobComplete{Result: result, Outputs: outputs, Logs: logs, Steps: steps}
 	for attempt := 0; ; attempt++ {
 		err := a.c.complete(parent, req.JobID, done)
@@ -292,7 +298,11 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	}
 
 	jobDir := filepath.Join(a.cfg.WorkDir, "jobs", strconv.FormatInt(req.JobID, 10))
-	defer os.RemoveAll(jobDir)
+	defer func() {
+		if err := os.RemoveAll(jobDir); err != nil {
+			a.log.Warn("remove job directory", "dir", jobDir, "err", err)
+		}
+	}()
 	repoName := unsafeChars.ReplaceAllString(req.Repository[strings.LastIndex(req.Repository, "/")+1:], "_")
 	workspace := filepath.Join(jobDir, repoName)
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
@@ -403,6 +413,29 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	return result, job.Outputs
 }
 
+// actTempDir matches the per-job directories act makes in the action cache
+// (its tmp, RUNNER_TEMP and GITHUB_ENV files); cloned actions are named
+// owner-repo@ref.
+var actTempDir = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// removeLeftovers deletes what jobs that didn't finish (the agent was killed
+// or crashed) left in the work directory: workspaces and act's temporary
+// files, which can hold the jobs' secrets.
+func (a *Agent) removeLeftovers() {
+	dirs := []string{filepath.Join(a.cfg.WorkDir, "jobs")}
+	entries, _ := os.ReadDir(filepath.Join(a.cfg.WorkDir, "actions"))
+	for _, e := range entries {
+		if e.IsDir() && actTempDir.MatchString(e.Name()) {
+			dirs = append(dirs, filepath.Join(a.cfg.WorkDir, "actions", e.Name()))
+		}
+	}
+	for _, d := range dirs {
+		if err := os.RemoveAll(d); err != nil {
+			a.log.Warn("remove leftovers of earlier jobs", "dir", d, "err", err)
+		}
+	}
+}
+
 type loggerFactory struct{ l *logrus.Logger }
 
 func (f loggerFactory) WithJobLogger() *logrus.Logger { return f.l }
@@ -414,11 +447,19 @@ func short(sha string) string {
 	return sha
 }
 
+// extractTarGz unpacks a source archive into dest. It writes through an
+// os.Root, so neither ".." names nor symlinks in the archive (a link to
+// /home followed by a file under it) can put files outside dest.
 func extractTarGz(r io.Reader, dest string) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return err
 	}
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	tr := tar.NewReader(gz)
 	for {
 		h, err := tr.Next()
@@ -428,20 +469,20 @@ func extractTarGz(r io.Reader, dest string) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dest, filepath.Clean("/"+h.Name))
-		if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) {
+		name := strings.TrimPrefix(path.Clean("/"+h.Name), "/")
+		if name == "" {
 			continue
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := root.MkdirAll(name, 0o755); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(path.Dir(name), 0o755); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(h.Mode)&0o777|0o600)
+			f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(h.Mode)&0o777|0o600)
 			if err != nil {
 				return err
 			}
@@ -451,8 +492,8 @@ func extractTarGz(r io.Reader, dest string) error {
 			}
 			f.Close()
 		case tar.TypeSymlink:
-			_ = os.MkdirAll(filepath.Dir(target), 0o755)
-			_ = os.Symlink(h.Linkname, target)
+			_ = root.MkdirAll(path.Dir(name), 0o755)
+			_ = root.Symlink(h.Linkname, name)
 		}
 	}
 }
