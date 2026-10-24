@@ -31,19 +31,20 @@ type Run struct {
 	Conclusion   string         `json:"conclusion"`
 	Error        string         `json:"error"`
 	Cancel       bool           `json:"cancel_requested"`
+	Protected    bool           `json:"protected"` // its ref got secrets; see protectedrefs.go
 	CreatedAt    int64          `json:"created_at"`
 	StartedAt    int64          `json:"started_at"`
 	FinishedAt   int64          `json:"finished_at"`
 }
 
 const runCols = `r.id, r.repo_id, p.name, r.number, r.attempt, r.workflow_file, r.workflow_name, r.workflow_yaml, r.title, r.event, r.event_json,
-	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.created_at, r.started_at, r.finished_at`
+	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.created_at, r.started_at, r.finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	var ev string
 	if err := row.Scan(&r.ID, &r.RepoID, &r.Repo, &r.Number, &r.Attempt, &r.WorkflowFile, &r.WorkflowName, &r.WorkflowYAML, &r.Title, &r.Event, &ev,
-		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(ev), &r.EventJSON)
@@ -154,15 +155,16 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 		finished = nowMS()
 	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
-		status, conclusion, error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		status, conclusion, error, protected, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
-		status, conclusion, errText, nowMS(), finished)
+		status, conclusion, errText, refProtected(spec.repo, spec.ref), nowMS(), finished)
 	s.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}
 	id, _ := res.LastInsertId()
-	s.log.Info("run created", "repo", spec.repo.Name, "run", id, "number", number, "workflow", spec.file, "event", spec.event, "ref", spec.ref)
+	s.log.Info("run created", "repo", spec.repo.Name, "run", id, "number", number, "workflow", spec.file, "event", spec.event, "ref", spec.ref,
+		"secrets", refProtected(spec.repo, spec.ref))
 	if err := s.advance(ctx, id); err != nil {
 		s.log.Error("advance", "run", id, "err", err)
 	}

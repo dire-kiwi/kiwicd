@@ -278,9 +278,15 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		"KIWICD_SERVER_URL":       server,
 		"KIWICD_RUN_URL":          fmt.Sprintf("%s/runs/%d", server, run.ID),
 	}
-	secrets, err := s.secretsFor(run.RepoID)
-	if err != nil {
-		return nil, err
+	secrets := map[string]string{}
+	var notices []string
+	if s.runGetsSecrets(run) {
+		if secrets, err = s.secretsFor(run.RepoID); err != nil {
+			return nil, err
+		}
+	} else {
+		notices = append(notices, fmt.Sprintf("%s is not a protected ref of %s, so this job gets no secrets except KIWICD_TOKEN. "+
+			"Protected refs are set in the repository's Settings.", run.Ref, run.Repo))
 	}
 	token, err := s.issueJobToken(j.ID)
 	if err != nil {
@@ -306,6 +312,7 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		Actor:          run.Actor,
 		Secrets:        secrets,
 		Vars:           s.varsFor(run.RepoID),
+		Notices:        notices,
 		Env:            env,
 		TimeoutMinutes: 360,
 		ServerURL:      server,
