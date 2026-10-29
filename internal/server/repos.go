@@ -4,16 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -453,9 +449,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 	ok := false
 	if sig := r.Header.Get("X-Hub-Signature-256"); sig != "" {
-		mac := hmac.New(sha256.New, []byte(repo.WebhookSecret))
-		mac.Write(body)
-		ok = hmac.Equal([]byte(sig), []byte("sha256="+hex.EncodeToString(mac.Sum(nil))))
+		ok = validSignature(repo.WebhookSecret, body, sig)
 	} else if q := r.URL.Query().Get("secret"); q != "" {
 		ok = hmac.Equal([]byte(q), []byte(repo.WebhookSecret))
 	}
@@ -464,11 +458,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Header.Get("X-GitHub-Event") == "pull_request" {
-		// GitHub sends application/x-www-form-urlencoded webhooks as payload=JSON.
-		if ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); ct == "application/x-www-form-urlencoded" {
-			form, _ := url.ParseQuery(string(body))
-			body = []byte(form.Get("payload"))
-		}
+		body = webhookJSON(r, body)
 		if repo.Kind != "mirror" {
 			httpError(w, 400, "pull request events need a mirror of the repository they come from")
 			return
@@ -841,11 +831,11 @@ func (s *Server) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		"inputs":     inputs,
 		"workflow":   req.Workflow,
 		"repository": repoEventInfo(repo, s.publicURL(r)),
-		"sender":     map[string]any{"login": "admin"},
+		"sender":     map[string]any{"login": requestUser(r)},
 	}
 	commit := readCommit(ctx, path, sha)
 	run, err := s.createRun(ctx, runSpec{repo: repo, file: req.Workflow, yaml: string(src), name: name, event: "workflow_dispatch",
-		payload: event, ref: req.Ref, sha: sha, actor: "admin", title: "Manually run: " + commit.Subject})
+		payload: event, ref: req.Ref, sha: sha, actor: requestUser(r), title: "Manually run: " + commit.Subject})
 	if err != nil {
 		httpError(w, 500, "%v", err)
 		return

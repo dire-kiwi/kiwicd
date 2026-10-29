@@ -171,3 +171,34 @@ export interface Setting {
   value?: string;
   updated_at: number;
 }
+
+export interface GitHubApp {
+  app_id: number;
+  slug: string;
+  name: string;
+  html_url: string;
+  /** The account or organization that owns the app. */
+  owner: string;
+  client_id: string;
+  /** GitHub logins that may sign in. */
+  allowed_users: string[];
+  /** Organizations whose members may sign in (the app must be installed on them). */
+  allowed_orgs: string[];
+  created_at: number;
+  install_url?: string;
+}
+
+export interface GitHubSettings {
+  app: GitHubApp | null;
+  webhook_url: string;
+  callback_url: string;
+  github_url: string;
+}
+
+/** A repository the GitHub App is installed on. */
+export interface GitHubRepo {
+  full_name: string;
+  clone_url: string;
+  private: boolean;
+  default_branch: string;
+}

@@ -146,7 +146,7 @@ func (s *Server) fetchPullRequest(ctx context.Context, repo *Repo, number int64,
 	if _, err := git(ctx, p, "remote", "set-url", "origin", repo.URL); err != nil {
 		return err
 	}
-	env, cleanup, err := s.gitSSHEnv(repo)
+	env, cleanup, err := s.remoteEnv(ctx, repo)
 	if err != nil {
 		return err
 	}

@@ -30,6 +30,10 @@ const (
 	purposeSecret   = "secrets.value"
 	purposeSSHKey   = "repos.ssh_key"
 	purposeKeyCheck = "meta.secret_key_check"
+
+	purposeGitHubClientSecret  = "github_app.client_secret"
+	purposeGitHubPrivateKey    = "github_app.private_key"
+	purposeGitHubWebhookSecret = "github_app.webhook_secret"
 )
 
 // keyCheckName is the meta row holding a sealed known value, which tells a

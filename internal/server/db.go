@@ -129,6 +129,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 	created_at INTEGER NOT NULL,
 	expires_at INTEGER NOT NULL
 );
+-- The GitHub App (see github.go): at most one row.
+CREATE TABLE IF NOT EXISTS github_app (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	app_id INTEGER NOT NULL,
+	slug TEXT NOT NULL DEFAULT '',
+	name TEXT NOT NULL DEFAULT '',
+	html_url TEXT NOT NULL DEFAULT '',
+	owner TEXT NOT NULL DEFAULT '',
+	client_id TEXT NOT NULL,
+	client_secret TEXT NOT NULL,        -- encrypted, as are the next two
+	private_key TEXT NOT NULL,
+	webhook_secret TEXT NOT NULL,
+	allowed_users TEXT NOT NULL DEFAULT '[]', -- GitHub logins that may sign in
+	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- organizations whose members may
+	created_at INTEGER NOT NULL
+);
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -180,6 +196,8 @@ var migrations = []struct{ table, column, sql string }{
 	// (see concurrency.go).
 	{"runs", "concurrency_group", `ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
+	// The GitHub user a session is for; '' for the admin (see githublogin.go).
+	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

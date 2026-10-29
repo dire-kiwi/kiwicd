@@ -52,8 +52,13 @@ type Config struct {
 	// ProtectedLabels are runner labels whose runners take only jobs from
 	// protected refs, see protectedLabels.
 	ProtectedLabels []string
-	Version         string
-	Web             fs.FS
+	// GitHubURL and GitHubAPIURL are where GitHub is, for the GitHub App
+	// and logins (see github.go): https://github.com and
+	// https://api.github.com by default.
+	GitHubURL    string
+	GitHubAPIURL string
+	Version      string
+	Web          fs.FS
 }
 
 type Server struct {
@@ -89,6 +94,9 @@ type Server struct {
 	// Pull request events waiting to be handled (see pullrequest.go).
 	prOnce  sync.Once
 	prQueue chan queuedPullRequest
+
+	// The GitHub App's caches and pending setups (see github.go).
+	gh githubState
 }
 
 func New(cfg Config) (*Server, error) {
@@ -104,6 +112,14 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxLogBytes == 0 {
 		cfg.MaxLogBytes = defaultMaxLogBytes
 	}
+	if cfg.GitHubURL == "" {
+		cfg.GitHubURL = "https://github.com"
+	}
+	if cfg.GitHubAPIURL == "" {
+		cfg.GitHubAPIURL = "https://api.github.com"
+	}
+	cfg.GitHubURL = strings.TrimRight(cfg.GitHubURL, "/")
+	cfg.GitHubAPIURL = strings.TrimRight(cfg.GitHubAPIURL, "/")
 	reserved, err := parseReservedLabels(cfg.ReservedLabels)
 	if err != nil {
 		return nil, err
@@ -148,6 +164,7 @@ func New(cfg Config) (*Server, error) {
 		syncLocks:       map[int64]*sync.Mutex{},
 
 		tipWorkflows: map[int64]cachedWorkflows{},
+		gh:           newGitHubState(),
 	}
 	if err := s.expireSessionsOnPasswordChange(); err != nil {
 		db.Close()
@@ -195,8 +212,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 	mux.HandleFunc("POST /api/logout", s.handleLogout)
 	mux.Handle("GET /api/me", ui(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"user": "admin", "version": s.cfg.Version, "public_url": s.publicURL(r)})
+		writeJSON(w, map[string]any{"user": requestUser(r), "version": s.cfg.Version, "public_url": s.publicURL(r)})
 	}))
+	mux.HandleFunc("GET /api/auth/providers", s.handleAuthProviders)
+	mux.HandleFunc("GET /api/auth/github", s.handleGitHubLogin)
+	mux.HandleFunc("GET /api/auth/github/callback", s.handleGitHubLoginCallback)
+
+	mux.Handle("GET /api/github/app", ui(s.handleGetGitHubApp))
+	mux.Handle("PUT /api/github/app", ui(s.handlePutGitHubApp))
+	mux.Handle("PATCH /api/github/app", ui(s.handleUpdateGitHubApp))
+	mux.Handle("DELETE /api/github/app", ui(s.handleDeleteGitHubApp))
+	mux.Handle("POST /api/github/app/manifest", ui(s.handleGitHubAppManifest))
+	mux.Handle("GET /api/github/app/callback", ui(s.handleGitHubAppCallback))
+	mux.Handle("GET /api/github/repos", ui(s.handleListGitHubRepos))
+	mux.HandleFunc("POST /api/github/webhook", s.handleGitHubWebhook)
 
 	mux.Handle("GET /api/repos", ui(s.handleListRepos))
 	mux.Handle("POST /api/repos", ui(s.handleCreateRepo))
@@ -320,35 +349,57 @@ func requestPassword(r *http.Request) (string, bool) {
 	return strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 }
 
-// authenticated reports whether r has a session cookie or the admin
-// password. The error is errTooManyPasswords if r's client has had too many
-// wrong passwords to try another now.
-func (s *Server) authenticated(r *http.Request) (bool, error) {
+// adminUser is who the admin password and its sessions act as.
+const adminUser = "admin"
+
+// authenticate returns who r is: adminUser for a session made with the
+// admin password or the password itself, a GitHub login for a session made
+// by signing in with GitHub (see githublogin.go), or "" if r isn't
+// authenticated. The error is errTooManyPasswords if r's client has had too
+// many wrong passwords to try another now.
+func (s *Server) authenticate(r *http.Request) (string, error) {
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		var exp int64
-		err := s.db.QueryRow(`SELECT expires_at FROM sessions WHERE token_hash = ?`, hashToken(c.Value)).Scan(&exp)
+		var login string
+		err := s.db.QueryRow(`SELECT expires_at, github_login FROM sessions WHERE token_hash = ?`, hashToken(c.Value)).Scan(&exp, &login)
 		if err == nil && exp > nowMS() {
-			return true, nil
+			if login == "" {
+				login = adminUser
+			}
+			return login, nil
 		}
 	}
 	if p, ok := requestPassword(r); ok && p != "" {
-		return s.tryPassword(r, p)
+		if ok, err := s.tryPassword(r, p); !ok {
+			return "", err
+		}
+		return adminUser, nil
 	}
-	return false, nil
+	return "", nil
+}
+
+type userKey struct{}
+
+// requestUser is who made a request that requireUser let through.
+func requestUser(r *http.Request) string {
+	if u, ok := r.Context().Value(userKey{}).(string); ok {
+		return u
+	}
+	return adminUser
 }
 
 func (s *Server) requireUser(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ok, err := s.authenticated(r)
+		user, err := s.authenticate(r)
 		if err != nil {
 			httpError(w, http.StatusTooManyRequests, "%v", err)
 			return
 		}
-		if !ok {
+		if user == "" {
 			httpError(w, http.StatusUnauthorized, "login required")
 			return
 		}
-		next(w, r)
+		next(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
 	})
 }
 
@@ -368,17 +419,27 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusUnauthorized, "wrong password")
 		return
 	}
-	token := randomToken(32)
-	exp := time.Now().Add(30 * 24 * time.Hour)
-	if _, err := s.db.Exec(`INSERT INTO sessions (token_hash, created_at, expires_at) VALUES (?, ?, ?)`, hashToken(token), nowMS(), exp.UnixMilli()); err != nil {
+	if err := s.startSession(w, r, "", 30*24*time.Hour); err != nil {
 		httpError(w, 500, "%v", err)
 		return
+	}
+	writeJSON(w, map[string]string{"user": adminUser})
+}
+
+// startSession logs r's browser in: as the admin if githubLogin is "", or as
+// that GitHub user.
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request, githubLogin string, d time.Duration) error {
+	token := randomToken(32)
+	exp := time.Now().Add(d)
+	if _, err := s.db.Exec(`INSERT INTO sessions (token_hash, created_at, expires_at, github_login) VALUES (?, ?, ?, ?)`,
+		hashToken(token), nowMS(), exp.UnixMilli(), githubLogin); err != nil {
+		return err
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/", Expires: exp, HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, Secure: strings.HasPrefix(s.publicURL(r), "https://"),
 	})
-	writeJSON(w, map[string]string{"user": "admin"})
+	return nil
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -404,12 +465,12 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	// Jobs can fetch with their KIWICD_TOKEN, but not push. A job token
 	// isn't tried as the admin password, so it doesn't count as a wrong one.
 	if push || !s.jobCanRead(r, name) {
-		ok, err := s.authenticated(r)
+		user, err := s.authenticate(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusTooManyRequests)
 			return
 		}
-		if !ok {
+		if user == "" {
 			w.Header().Set("WWW-Authenticate", `Basic realm="kiwicd"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
@@ -436,7 +497,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		Env: []string{
 			"GIT_PROJECT_ROOT=" + filepath.Join(s.cfg.DataDir, "repos"),
 			"GIT_HTTP_EXPORT_ALL=1",
-			"REMOTE_USER=admin",
+			"REMOTE_USER=" + adminUser,
 		},
 	}
 	h.ServeHTTP(w, r)

@@ -79,7 +79,7 @@ func (s *Server) cloneMirror(ctx context.Context, repo *Repo) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	env, cleanup, err := s.gitSSHEnv(repo)
+	env, cleanup, err := s.remoteEnv(ctx, repo)
 	if err != nil {
 		return err
 	}
@@ -96,7 +96,7 @@ func (s *Server) fetchMirror(ctx context.Context, repo *Repo) error {
 	if _, err := git(ctx, p, "remote", "set-url", "origin", repo.URL); err != nil {
 		return err
 	}
-	env, cleanup, err := s.gitSSHEnv(repo)
+	env, cleanup, err := s.remoteEnv(ctx, repo)
 	if err != nil {
 		return err
 	}
@@ -197,4 +197,15 @@ func archive(ctx context.Context, repo, sha string, w io.Writer) error {
 		return fmt.Errorf("git archive: %v: %s", err, stderr.String())
 	}
 	return nil
+}
+
+// remoteEnv returns the environment git fetches a mirror's origin with: its
+// SSH settings and, for a GitHub repository the GitHub App is installed on,
+// an installation token. Call cleanup when git is done.
+func (s *Server) remoteEnv(ctx context.Context, repo *Repo) (env []string, cleanup func(), err error) {
+	env, cleanup, err = s.gitSSHEnv(repo)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	return append(env, s.githubGitEnv(ctx, repo)...), cleanup, nil
 }

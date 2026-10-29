@@ -15,9 +15,13 @@ import (
 // ---------------------------------------------------------------- headers
 
 // contentSecurityPolicy allows the UI's own scripts, styles and API, and
-// nothing else: no inline scripts, no framing.
-const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-	"img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+// nothing else: no inline scripts, no framing. Forms can also go to GitHub,
+// which creates the GitHub App from a form the UI posts (see github.go).
+func contentSecurityPolicy(githubURL string) string {
+	return "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self' " + githubURL +
+		"; frame-ancestors 'none'"
+}
 
 // secureHeaders sets browser hardening headers on every response and refuses
 // cross-origin state-changing requests from browsers. A session cookie is
@@ -28,12 +32,13 @@ const contentSecurityPolicy = "default-src 'self'; script-src 'self'; style-src 
 func (s *Server) secureHeaders(next http.Handler) http.Handler {
 	cop := http.NewCrossOriginProtection()
 	hsts := strings.HasPrefix(s.cfg.PublicURL, "https://")
+	csp := contentSecurityPolicy(s.cfg.GitHubURL)
 	return cop.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "same-origin")
-		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		h.Set("Content-Security-Policy", csp)
 		if hsts {
 			h.Set("Strict-Transport-Security", "max-age=31536000")
 		}
@@ -171,7 +176,7 @@ const purposePasswordCheck = "meta.admin_password_check"
 
 // expireSessionsOnPasswordChange logs everyone out when the admin password
 // has changed since the last start, so rotating a leaked password also
-// revokes the sessions made with it. The meta row holds the password's hash
+// revokes the sessions made with it. Sessions of GitHub logins stay. The meta row holds the password's hash
 // sealed with the secret key, which can't be checked without that key.
 func (s *Server) expireSessionsOnPasswordChange() error {
 	sum := sha256.Sum256([]byte(s.cfg.AdminPassword))
@@ -186,7 +191,7 @@ func (s *Server) expireSessionsOnPasswordChange() error {
 		if got, err := s.box.open(purposePasswordCheck, stored); err == nil && got == want {
 			return nil
 		}
-		res, err := s.db.Exec(`DELETE FROM sessions`)
+		res, err := s.db.Exec(`DELETE FROM sessions WHERE github_login = ''`)
 		if err != nil {
 			return err
 		}
