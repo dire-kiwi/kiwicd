@@ -180,7 +180,8 @@ function RepoHeader({ repo, onChanged }: { repo: Repo; onChanged: () => void }) 
           <span>Just the push event</span>
         </div>
         <p className="muted small">
-          Services that can't sign payloads can append <code>?secret=&lt;secret&gt;</code> to the payload URL instead.
+          Services that can't sign payloads can append <code>?secret=&lt;secret&gt;</code> to the payload URL instead. A GitHub
+          repository that kiwicd's GitHub App (<em>Settings → GitHub</em>) is installed on needs no webhook: the app sends its events.
         </p>
       </details>
     </section>

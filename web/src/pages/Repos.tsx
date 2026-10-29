@@ -5,7 +5,7 @@ import { StatusIcon } from "../components/StatusIcon";
 import { Empty, ErrorBox, Icon, Modal, Spinner } from "../components/ui";
 import { useDocumentTitle, useFetch } from "../hooks";
 import { isSSHURL, KnownHostsField, SSHKeyField, sshHost, type SSHAuth } from "../components/SSHFields";
-import type { Repo, Run } from "../types";
+import type { GitHubRepo, Repo, Run } from "../types";
 import { absoluteTime, relativeTime, visualState } from "../util";
 
 export function ReposPage() {
@@ -104,6 +104,18 @@ function NewRepoModal({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const validName = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(name.trim().replace(/\.git$/, ""));
+  // Repositories the GitHub App is installed on (an error without the app).
+  const ghRepos = useFetch<GitHubRepo[]>(mode === "mirror" ? "/api/github/repos" : null);
+
+  const pickGitHub = (fullName: string) => {
+    const r = ghRepos.data?.find((r) => r.full_name === fullName);
+    if (!r) return;
+    setUrl(r.clone_url);
+    setName(r.full_name);
+    setBranch(r.default_branch);
+    setAuth("none");
+    setAuthTouched(false);
+  };
 
   // Suggest owner/name from a mirror URL.
   const onUrl = (v: string) => {
@@ -147,6 +159,25 @@ function NewRepoModal({ onClose }: { onClose: () => void }) {
             <span>Follow a remote repository</span>
           </button>
         </div>
+        {mode === "mirror" && ghRepos.data && ghRepos.data.length > 0 && (
+          <label className="field">
+            <span className="label">From the GitHub App</span>
+            <select
+              className="input"
+              value={ghRepos.data.find((r) => r.clone_url === url)?.full_name ?? ""}
+              onChange={(e) => pickGitHub(e.target.value)}
+            >
+              <option value="">Choose a repository the app is installed on…</option>
+              {ghRepos.data.map((r) => (
+                <option key={r.full_name} value={r.full_name}>
+                  {r.full_name}
+                  {r.private ? " (private)" : ""}
+                </option>
+              ))}
+            </select>
+            <span className="hint">Its pushes and pull requests reach kiwicd through the app, which also fetches private ones.</span>
+          </label>
+        )}
         {mode === "mirror" && (
           <label className="field">
             <span className="label">Remote URL</span>
@@ -159,7 +190,8 @@ function NewRepoModal({ onClose }: { onClose: () => void }) {
               autoFocus
             />
             <span className="hint">
-              HTTPS (with credentials in the URL for a private repository) or SSH, like <code>git@github.com:owner/repo.git</code>.
+              HTTPS (with credentials in the URL for a private repository, unless it's on GitHub and the GitHub App is installed on
+              it) or SSH, like <code>git@github.com:owner/repo.git</code>.
             </span>
           </label>
         )}

@@ -24,8 +24,9 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   served from the source archive the agent downloads.
 - **Repositories**: *hosted* (push to `https://SERVER/git/OWNER/NAME.git`, which triggers
   workflows immediately) or *mirror* (a remote URL fetched every minute or on a webhook,
-  `POST /api/hooks/OWNER/NAME` with GitHub's `X-Hub-Signature-256`). A mirror's first fetch
-  only records existing branches and tags; later changes trigger runs.
+  `POST /api/hooks/OWNER/NAME` with GitHub's `X-Hub-Signature-256`, or through the
+  [GitHub App](#github-app)). A mirror's first fetch only records existing branches and tags;
+  later changes trigger runs.
 - **Private mirrors**: credentials in an HTTPS URL, or an SSH URL with a per-mirror key. kiwicd
   can generate an ed25519 deploy key (add the public key on GitHub under *Settings → Deploy
   keys*) or take a pasted private key without a passphrase. Each mirror has its own
@@ -70,6 +71,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
+- **GitHub App**: one app, created from *Settings → GitHub*, sends kiwicd the pushes and pull
+  requests of every repository it's installed on (no webhook per repository), lets mirrors of
+  private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
+  members sign in (see [GitHub App](#github-app)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository).
 
@@ -175,10 +180,12 @@ jobs:
 ```
 
 - **Events come from GitHub's webhook.** The public repository has to be a mirror in kiwicd, and
-  on GitHub it needs a webhook (*Settings → Webhooks*) to the mirror's webhook URL (shown in its
-  **Settings**, `https://SERVER/api/hooks/owner/app`), content type `application/json`, the
-  mirror's webhook secret, and the *Pull requests* event (add *Pushes* too and pushes don't wait
-  for the next poll). kiwicd has to be reachable from GitHub. kiwicd doesn't poll GitHub for pull
+  either the [GitHub App](#github-app) is installed on it, or on GitHub it needs a webhook
+  (*Settings → Webhooks*) to the mirror's webhook URL (shown in its **Settings**,
+  `https://SERVER/api/hooks/owner/app`), content type `application/json`, the mirror's webhook
+  secret, and the *Pull requests* event (add *Pushes* too and pushes don't wait for the next
+  poll). Not both, or each pull request event starts its runs twice. kiwicd has to be reachable
+  from GitHub. kiwicd doesn't poll GitHub for pull
   requests: a git mirror can't tell a fork's pull request from the repository's own, and GitHub
   keeps `refs/pull/N/head` after a pull request closes. If kiwicd misses an event (it was down,
   say), redeliver it from the webhook's *Recent Deliveries* on GitHub.
@@ -204,6 +211,43 @@ jobs:
   a `concurrency` group per pull request as above: a new run waits for the group's running one,
   and `cancel-in-progress` stops it rather than waiting for it to finish. Since a cancelled job can
   stop part way through a deploy, the close's removal should cope with a half-deployed preview.
+
+## GitHub App
+
+kiwicd can have one GitHub App. Create it under **Settings → GitHub**: pick your account or an
+organization, and kiwicd sends you to GitHub with a manifest, where you confirm; GitHub sends you
+back and kiwicd stores the app's credentials (encrypted, like secrets). Set `--public-url` first:
+the app's webhook and sign-in URLs are made from it, and GitHub has to reach the webhook. The app
+is private, so it can only be installed on the account that owns it; create it in the
+organization whose repositories you mirror. An existing app can be entered by hand instead
+(*Use an existing app*), or with `PUT /api/github/app` (`app_id`, `client_id`, `client_secret`,
+`private_key`, `webhook_secret`, `allowed_users`, `allowed_orgs`).
+
+Then **install the app** on the repositories kiwicd mirrors (*Install on repositories*). For
+each of them:
+
+- **Webhooks**: GitHub sends their `push` and `pull_request` events to
+  `https://SERVER/api/github/webhook`, and kiwicd hands each to the mirrors of that repository
+  (mirrors whose URL is it on GitHub, in HTTPS, SSH or `git@github.com:` form), as if it had come
+  to the mirror's own webhook URL: pushes sync the mirror and pull requests start
+  `repository_pull_request` listeners. Remove any webhook you added to the repository for kiwicd,
+  or its pull requests start runs twice. Events for repositories without a mirror are ignored.
+- **Fetching**: a mirror whose URL is `https://github.com/OWNER/NAME.git` (without credentials)
+  fetches with a short-lived installation token, limited to reading that repository, so a private
+  one needs no deploy key. The new-mirror form lists the repositories the app is installed on.
+
+The app asks for read access to contents, pull requests and organization members, and for the
+push and pull request events.
+
+### Sign in with GitHub
+
+Once the app is set up, the sign-in page offers *Sign in with GitHub*, through the app's OAuth
+client. Who may sign in is set under **Settings → GitHub**: GitHub logins, and organizations whose
+members may (checked through the app, which has to be installed on the organization). The app's
+owner is allowed when it's created. Everyone signed in can do what the admin can; runs they start
+by hand show their login. Membership is checked when someone signs in, and GitHub sessions last a
+week. Removing a user or organization from the list signs out everyone signed in with GitHub,
+and so does removing the app. The admin password keeps working, for the API and git too.
 
 ## Layout
 
@@ -292,7 +336,7 @@ keeps them all for protected refs and jobs from other refs don't run at all.
 
 | Flag / variable | |
 |---|---|
-| `KIWICD_ADMIN_PASSWORD` | Required. UI login (user `admin`), git push and API basic auth |
+| `KIWICD_ADMIN_PASSWORD` | Required. UI login (user `admin`), git push and API basic auth. People can also [sign in with GitHub](#sign-in-with-github) |
 | `--data` / `KIWICD_DATA` | Database and repositories |
 | `--public-url` / `KIWICD_PUBLIC_URL` | URL used in clone URLs, `github.server_url` and links |
 | `--retention-days` / `KIWICD_RETENTION_DAYS` | Days to keep completed runs and their logs (default 30, 0 keeps them forever); also passed to jobs as `GITHUB_RETENTION_DAYS` |
@@ -302,11 +346,13 @@ keeps them all for protected refs and jobs from other refs don't run at all.
 | `--protected-label` / `KIWICD_PROTECTED_LABELS` | Runners with this label take only jobs from protected refs, of any repository, whatever labels the jobs ask for; jobs from other refs that ask for it fail at once. Repeatable (the variable holds them separated by spaces). None by default |
 | `--max-log-lines` / `KIWICD_MAX_LOG_LINES` | Most log lines stored per job (default 1000000, `-1` for no limit). Later output is dropped after a notice; the job keeps running |
 | `--max-log-bytes` / `KIWICD_MAX_LOG_BYTES` | Most log bytes stored per job (default 104857600). Lines longer than 64 KiB are cut |
+| `--github-url` / `KIWICD_GITHUB_URL` | GitHub's web URL, for the GitHub App and signing in (default `https://github.com`; GitHub Enterprise: `https://HOST`) |
+| `--github-api-url` / `KIWICD_GITHUB_API_URL` | GitHub's API URL (default `https://api.github.com`; GitHub Enterprise: `https://HOST/api/v3`) |
 | `KIWICD_SECRET_KEY` | Key that encrypts secrets and SSH deploy keys in the database: 32 bytes as base64 or hex (`openssl rand -base64 32`). Default: `<data>/secret.key`, generated on first start |
 
 #### The secret key
 
-Secret values and mirror deploy keys are stored encrypted (AES-256-GCM). The key is
+Secret values, mirror deploy keys and the GitHub App's credentials are stored encrypted (AES-256-GCM). The key is
 `KIWICD_SECRET_KEY` or, if that's unset, `<data>/secret.key` (mode 0600), which the server
 generates on first start. **Back the key up separately from the database**: a backup of the
 database alone doesn't reveal any secrets, and without the key it can't be decrypted.

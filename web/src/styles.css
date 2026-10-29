@@ -967,6 +967,9 @@ textarea.input {
 .login-box {
   padding: 18px;
 }
+.login-github {
+  margin-bottom: 12px;
+}
 
 /* -------------------------------------------------------------- tabs */
 
