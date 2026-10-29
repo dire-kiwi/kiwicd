@@ -32,19 +32,21 @@ type Run struct {
 	Error        string         `json:"error"`
 	Cancel       bool           `json:"cancel_requested"`
 	Protected    bool           `json:"protected"` // its ref got secrets; see protectedrefs.go
-	CreatedAt    int64          `json:"created_at"`
-	StartedAt    int64          `json:"started_at"`
-	FinishedAt   int64          `json:"finished_at"`
+	// Concurrency group; see concurrency.go.
+	ConcurrencyGroup string `json:"concurrency_group,omitempty"`
+	CreatedAt        int64  `json:"created_at"`
+	StartedAt        int64  `json:"started_at"`
+	FinishedAt       int64  `json:"finished_at"`
 }
 
 const runCols = `r.id, r.repo_id, p.name, r.number, r.attempt, r.workflow_file, r.workflow_name, r.workflow_yaml, r.title, r.event, r.event_json,
-	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.created_at, r.started_at, r.finished_at`
+	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.concurrency_group, r.created_at, r.started_at, r.finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	var ev string
 	if err := row.Scan(&r.ID, &r.RepoID, &r.Repo, &r.Number, &r.Attempt, &r.WorkflowFile, &r.WorkflowName, &r.WorkflowYAML, &r.Title, &r.Event, &ev,
-		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.ConcurrencyGroup, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(ev), &r.EventJSON)
@@ -132,6 +134,16 @@ type runSpec struct {
 }
 
 func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
+	title := spec.title
+	if title == "" {
+		title = spec.name
+	}
+	status, conclusion, errText := protocol.StatusQueued, "", ""
+	finished := int64(0)
+	if spec.parseErr != nil {
+		status, conclusion, errText = protocol.StatusCompleted, protocol.ResultFailure, "Invalid workflow file: "+spec.parseErr.Error()
+		finished = nowMS()
+	}
 	s.mu.Lock()
 	number := spec.number
 	if number == 0 {
@@ -144,27 +156,29 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	if attempt == 0 {
 		attempt = 1
 	}
-	title := spec.title
-	if title == "" {
-		title = spec.name
-	}
-	status, conclusion, errText := protocol.StatusQueued, "", ""
-	finished := int64(0)
-	if spec.parseErr != nil {
-		status, conclusion, errText = protocol.StatusCompleted, protocol.ResultFailure, "Invalid workflow file: "+spec.parseErr.Error()
-		finished = nowMS()
-	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
 		status, conclusion, error, protected, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
 		status, conclusion, errText, refProtected(spec.repo, spec.ref), nowMS(), finished)
+	var id int64
+	var conc wf.Concurrency
+	if err == nil {
+		id, _ = res.LastInsertId()
+		// The group can use github.run_id and run_number, so it's evaluated
+		// once the run has them, and set before any run can advance.
+		if spec.parseErr == nil {
+			conc, err = s.setRunConcurrency(id)
+		}
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
 	s.log.Info("run created", "repo", spec.repo.Name, "run", id, "number", number, "workflow", spec.file, "event", spec.event, "ref", spec.ref,
-		"secrets", refProtected(spec.repo, spec.ref))
+		"secrets", refProtected(spec.repo, spec.ref), "concurrency", conc.Group)
+	if conc.Group != "" {
+		s.supersede(ctx, spec.repo.ID, id, conc)
+	}
 	if err := s.advance(ctx, id); err != nil {
 		s.log.Error("advance", "run", id, "err", err)
 	}
@@ -283,7 +297,7 @@ func (s *Server) advance(ctx context.Context, runID int64) error {
 	return s.advanceLocked(ctx, runID)
 }
 
-func (s *Server) advanceLocked(_ context.Context, runID int64) error {
+func (s *Server) advanceLocked(ctx context.Context, runID int64) error {
 	run, err := s.getRun(runID)
 	if err != nil {
 		return err
@@ -297,6 +311,10 @@ func (s *Server) advanceLocked(_ context.Context, runID int64) error {
 			protocol.StatusCompleted, protocol.ResultFailure, "Invalid workflow file: "+err.Error(), nowMS(), runID)
 		s.publishRun(runID)
 		return err
+	}
+	if s.waitingForGroup(run) {
+		s.publishRun(runID)
+		return nil
 	}
 	order, _ := wf.Order(workflow)
 	ghc := s.githubContext(run)
@@ -438,6 +456,9 @@ func (s *Server) advanceLocked(_ context.Context, runID int64) error {
 		_, err = s.db.Exec(`UPDATE runs SET status = ?, conclusion = ?, finished_at = ?, started_at = CASE WHEN started_at = 0 THEN ? ELSE started_at END WHERE id = ?`,
 			protocol.StatusCompleted, conclusion, nowMS(), nowMS(), runID)
 		s.log.Info("run completed", "run", runID, "conclusion", conclusion)
+		if err == nil && run.ConcurrencyGroup != "" {
+			defer s.startNextInGroup(ctx, run)
+		}
 	case anyStarted && run.Status == protocol.StatusQueued:
 		_, err = s.db.Exec(`UPDATE runs SET status = ?, started_at = ? WHERE id = ?`, protocol.StatusInProgress, nowMS(), runID)
 	}

@@ -923,7 +923,8 @@ function ReadersSettings({ repo, onChanged }: { repo: Repo; onChanged: () => voi
         <div>
           <h3>Job access</h3>
           <p className="muted small">
-            Repositories whose <span className="mono">repository_push</span> and manually run jobs can fetch this one with{" "}
+            Repositories whose <span className="mono">repository_push</span>,{" "}
+            <span className="mono">repository_pull_request</span> and manually run jobs can fetch this one with{" "}
             <span className="mono">secrets.KIWICD_TOKEN</span>, when their workflow listens to it and their run is from a protected
             ref. Jobs can always fetch their own repository.
           </p>

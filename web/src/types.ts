@@ -28,7 +28,7 @@ export interface Repo {
   ssh_known_hosts?: string;
   /** Mirrors: host keys in use, as "host type SHA256:fingerprint". */
   ssh_host_keys?: string[];
-  /** Repositories whose repository_push and dispatched jobs may fetch this one with KIWICD_TOKEN. */
+  /** Repositories whose repository_push, repository_pull_request and dispatched jobs may fetch this one with KIWICD_TOKEN. */
   readers?: string[];
   /** Ref patterns besides the default branch whose runs get secrets: "release/*", "refs/tags/v*". */
   protected_refs?: string[];
@@ -83,6 +83,8 @@ export interface Run {
   cancel_requested: boolean;
   /** Its ref was protected, so its jobs get secrets. */
   protected: boolean;
+  /** The workflow's concurrency group, of which one run of the repository runs at a time. */
+  concurrency_group?: string;
   created_at: number;
   started_at: number;
   finished_at: number;

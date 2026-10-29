@@ -17,8 +17,9 @@ import (
 // other refs get only secrets.KIWICD_TOKEN, which then fetches only their own
 // repository (see jobtoken.go).
 //
-// repository_push runs use the listener's default branch, and so do
-// dispatches unless the admin picks another ref, so they keep their secrets.
+// repository_push and repository_pull_request runs use the listener's default
+// branch, and so do dispatches unless the admin picks another ref, so they
+// keep their secrets.
 //
 // A pattern is a branch name like push's branches filter (release/*, where
 // * doesn't match / and ** does), or a full ref (refs/tags/v*).
