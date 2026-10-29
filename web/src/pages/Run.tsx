@@ -65,6 +65,8 @@ export function RunPage() {
   const st = visualState(run.status, run.conclusion, run.cancel_requested);
   const selectedJob = jobId ? jobs.find((j) => String(j.id) === jobId) : undefined;
   const pushed = run.event === "repository_push" ? pushedTo(run.event_payload) : undefined;
+  const pull = run.event === "repository_pull_request" ? pullRequestOf(run.event_payload) : undefined;
+  const waiting = !!run.concurrency_group && run.status === "queued" && !run.cancel_requested && jobs.length === 0;
 
   const cancel = async () => {
     setBusy(true);
@@ -150,6 +152,22 @@ export function RunPage() {
             </span>
           </div>
         )}
+        {pull && (
+          <div className="meta-item">
+            <span className="meta-label">Pull request</span>
+            <span className="meta-value meta-inline">
+              <Link to={`/repos/${pull.repo}`}>{pull.repo}</Link>
+              <span>
+                #{pull.number} {pull.action}
+              </span>
+              <BranchChip name={pull.head} />
+              <span className="mono" title={pull.sha}>
+                <Icon name="commit" size={14} /> {shortSha(pull.sha)}
+              </span>
+              {pull.fork && <span className="muted small">from {pull.headRepo || "a deleted fork"}</span>}
+            </span>
+          </div>
+        )}
         <div className="meta-item">
           <span className="meta-label">Total duration</span>
           <span className="meta-value">{elapsed(run.started_at, run.finished_at, now) || "—"}</span>
@@ -173,6 +191,13 @@ export function RunPage() {
             <span className="mono">{refName(run.ref)}</span> isn't a protected ref of {run.repo}, so this run's jobs get no secrets except{" "}
             <span className="mono">KIWICD_TOKEN</span>, which only fetches {run.repo}. Protected refs are set in the repository's{" "}
             <Link to={`/repos/${run.repo}/settings`}>Settings</Link>.
+          </span>
+        </Flash>
+      )}
+      {waiting && (
+        <Flash>
+          <span>
+            Waiting for an earlier run of the concurrency group <span className="mono">{run.concurrency_group}</span> to finish.
           </span>
         </Flash>
       )}
@@ -315,4 +340,34 @@ function pushedTo(payload: unknown): { repo: string; ref: string; sha: string } 
   const p = payload as { ref?: string; after?: string; repository?: { full_name?: string } } | undefined;
   if (!p?.repository?.full_name || !p.ref || !p.after) return undefined;
   return { repo: p.repository.full_name, ref: p.ref, sha: p.after };
+}
+
+interface PullRequestPayload {
+  action?: string;
+  number?: number;
+  repository?: { full_name?: string };
+  pull_request?: {
+    head?: { ref?: string; sha?: string; repo?: { full_name?: string } | null };
+    base?: { repo?: { full_name?: string } | null };
+  };
+}
+
+// pullRequestOf reads the other repository's pull request from a repository_pull_request run's event.
+function pullRequestOf(
+  payload: unknown,
+): { repo: string; number: number; action: string; head: string; sha: string; headRepo?: string; fork: boolean } | undefined {
+  const p = payload as PullRequestPayload | undefined;
+  const head = p?.pull_request?.head;
+  if (!p?.repository?.full_name || !p.number || !head?.sha) return undefined;
+  const headRepo = head.repo?.full_name;
+  const baseRepo = p.pull_request?.base?.repo?.full_name;
+  return {
+    repo: p.repository.full_name,
+    number: p.number,
+    action: p.action ?? "",
+    head: head.ref ?? "",
+    sha: head.sha,
+    headRepo,
+    fork: !headRepo || !baseRepo || headRepo.toLowerCase() !== baseRepo.toLowerCase(),
+  };
 }

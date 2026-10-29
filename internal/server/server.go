@@ -85,6 +85,10 @@ type Server struct {
 	// repository ID (see defaultBranchWorkflows).
 	tipMu        sync.Mutex
 	tipWorkflows map[int64]cachedWorkflows
+
+	// Pull request events waiting to be handled (see pullrequest.go).
+	prOnce  sync.Once
+	prQueue chan queuedPullRequest
 }
 
 func New(cfg Config) (*Server, error) {

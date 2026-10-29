@@ -140,3 +140,85 @@ jobs:
 		t.Error("string repositories")
 	}
 }
+
+func TestRepositoryPullRequest(t *testing.T) {
+	w, err := Parse([]byte(`
+on:
+  repository_push:
+    repositories: [o/app]
+  repository_pull_request:
+    repositories: [o/app, O/Lib]
+    types: [opened, closed]
+    branches: [main]
+jobs:
+  x: {runs-on: a, steps: [{run: echo}]}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := func(repo, action, base string, fork bool) bool {
+		return MatchesRepositoryPullRequest(w, PullRequest{Repo: repo, Action: action, Base: base, Fork: fork})
+	}
+	if !pr("o/app", "opened", "main", false) || !pr("o/lib", "closed", "main", false) {
+		t.Error("listened pull requests don't match")
+	}
+	if pr("o/other", "opened", "main", false) || pr("o/app", "synchronize", "main", false) || pr("o/app", "opened", "dev", false) {
+		t.Error("repositories, types or branches not checked")
+	}
+	if pr("o/app", "opened", "main", true) {
+		t.Error("a fork's pull request matched without forks: true")
+	}
+	if got := ListenedRepositories(w); len(got) != 2 || got[0] != "o/app" || got[1] != "O/Lib" {
+		t.Errorf("listened repositories: %v", got)
+	}
+
+	w, _ = Parse([]byte(`
+on:
+  repository_pull_request:
+    repositories: o/app
+    branches-ignore: [old]
+    forks: true
+jobs:
+  x: {runs-on: a, steps: [{run: echo}]}
+`))
+	for action, want := range map[string]bool{"opened": true, "synchronize": true, "reopened": true, "closed": false, "labeled": false} {
+		if got := MatchesRepositoryPullRequest(w, PullRequest{Repo: "o/app", Action: action, Base: "main", Fork: true}); got != want {
+			t.Errorf("default types: %s = %v", action, got)
+		}
+	}
+	if MatchesRepositoryPullRequest(w, PullRequest{Repo: "o/app", Action: "opened", Base: "old"}) {
+		t.Error("branches-ignore")
+	}
+}
+
+func TestWorkflowConcurrency(t *testing.T) {
+	env := func(src string) *Env {
+		w, err := Parse([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &Env{Workflow: w, Github: &model.GithubContext{Ref: "refs/heads/main",
+			Event: map[string]any{"number": 7.0, "action": "closed"}}, Vars: map[string]string{"ENV": "prod"}}
+	}
+	for _, tc := range []struct {
+		src  string
+		want Concurrency
+		err  bool
+	}{
+		{src: "", want: Concurrency{}},
+		{src: "concurrency: deploy-${{ vars.ENV }}\n", want: Concurrency{Group: "deploy-prod"}},
+		{src: "concurrency:\n  group: pr-${{ github.event.number }}\n  cancel-in-progress: true\n",
+			want: Concurrency{Group: "pr-7", CancelInProgress: true}},
+		{src: "concurrency:\n  group: x\n  cancel-in-progress: false\n", want: Concurrency{Group: "x"}},
+		{src: "concurrency:\n  group: x\n  cancel-in-progress: ${{ github.event.action != 'closed' }}\n", want: Concurrency{Group: "x"}},
+		{src: "concurrency:\n  group: x\n  cancel-in-progress: ${{ github.event.action == 'closed' }}\n",
+			want: Concurrency{Group: "x", CancelInProgress: true}},
+		{src: "concurrency:\n  cancel-in-progress: true\n", err: true},
+	} {
+		src := "on: push\n" + tc.src + "jobs:\n  x: {runs-on: a, steps: [{run: echo}]}\n"
+		got, err := WorkflowConcurrency([]byte(src), env(src))
+		if (err != nil) != tc.err || got != tc.want {
+			t.Errorf("%q: %+v %v, want %+v", tc.src, got, err, tc.want)
+		}
+	}
+}

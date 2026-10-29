@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -141,6 +142,138 @@ func MatchesRepositoryPush(w *model.Workflow, repo, ref string, changedFiles []s
 		}
 	}
 	return false
+}
+
+// RepositoryPullRequest is kiwicd's event for pull requests on other
+// repositories, from GitHub's pull_request webhook to a mirror:
+//
+//	on:
+//	  repository_pull_request:
+//	    repositories: [owner/app]
+//	    types: [opened, synchronize, reopened, closed]
+//	    branches: [main]
+//
+// types defaults to opened, synchronize and reopened, as for GitHub's
+// pull_request; branches and branches-ignore filter the base branch. Pull
+// requests from forks only trigger it with forks: true.
+const RepositoryPullRequest = "repository_pull_request"
+
+// PullRequest is what repository_pull_request filters look at.
+type PullRequest struct {
+	Repo   string // the kiwicd repository the pull request is on
+	Action string // opened, synchronize, closed, ...
+	Base   string // the base branch
+	Fork   bool   // the head branch is in another repository
+}
+
+var defaultPullRequestTypes = []string{"opened", "synchronize", "reopened"}
+
+// RepositoryPullRequestSources returns the repositories whose pull requests
+// the workflow listens to with repository_pull_request.
+func RepositoryPullRequestSources(w *model.Workflow) []string {
+	cfg, _ := eventConfig(w, RepositoryPullRequest)
+	return stringList(cfg["repositories"])
+}
+
+// MatchesRepositoryPullRequest reports whether a pull request event triggers
+// the workflow's repository_pull_request.
+func MatchesRepositoryPullRequest(w *model.Workflow, pr PullRequest) bool {
+	cfg, ok := eventConfig(w, RepositoryPullRequest)
+	if !ok {
+		return false
+	}
+	listens := false
+	for _, r := range stringList(cfg["repositories"]) {
+		listens = listens || strings.EqualFold(r, pr.Repo)
+	}
+	if !listens {
+		return false
+	}
+	if pr.Fork && cfg["forks"] != true {
+		return false
+	}
+	types := defaultPullRequestTypes
+	if _, ok := cfg["types"]; ok {
+		types = stringList(cfg["types"])
+	}
+	matched := false
+	for _, t := range types {
+		matched = matched || t == pr.Action
+	}
+	if !matched {
+		return false
+	}
+	// Only branch filters apply, to the base branch.
+	branches := map[string]any{}
+	for _, k := range []string{"branches", "branches-ignore"} {
+		if v, ok := cfg[k]; ok {
+			branches[k] = v
+		}
+	}
+	return matchesPushFilters(branches, "refs/heads/"+pr.Base, nil)
+}
+
+// ListenedRepositories returns the repositories the workflow listens to with
+// repository_push or repository_pull_request.
+func ListenedRepositories(w *model.Workflow) []string {
+	var out []string
+	for _, name := range append(RepositoryPushSources(w), RepositoryPullRequestSources(w)...) {
+		if !slices.ContainsFunc(out, func(s string) bool { return strings.EqualFold(s, name) }) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// Concurrency is a workflow's concurrency setting: at most one run of a
+// repository's group runs at a time.
+type Concurrency struct {
+	Group            string
+	CancelInProgress bool
+}
+
+// WorkflowConcurrency evaluates the workflow's top-level concurrency (src is
+// the workflow file, since act's model doesn't keep it). Expressions can use
+// github, inputs and vars. It returns a zero Concurrency if there is none.
+func WorkflowConcurrency(src []byte, e *Env) (Concurrency, error) {
+	var doc struct {
+		Concurrency yaml.Node `yaml:"concurrency"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return Concurrency{}, err
+	}
+	node := doc.Concurrency
+	var out Concurrency
+	switch node.Kind {
+	case 0:
+		return out, nil
+	case yaml.ScalarNode:
+		v, err := e.Interpolate(node.Value)
+		if err != nil {
+			return out, fmt.Errorf("concurrency: %w", err)
+		}
+		out.Group = ToString(v)
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, val := node.Content[i].Value, node.Content[i+1]
+			v, err := e.Interpolate(val.Value)
+			if err != nil {
+				return out, fmt.Errorf("concurrency.%s: %w", key, err)
+			}
+			switch key {
+			case "group":
+				out.Group = ToString(v)
+			case "cancel-in-progress":
+				out.CancelInProgress = exprparser.IsTruthy(v) && ToString(v) != "false"
+			}
+		}
+		if out.Group == "" {
+			return Concurrency{}, fmt.Errorf("concurrency: the group is empty")
+		}
+	default:
+		return out, fmt.Errorf("concurrency must be a group name or a mapping")
+	}
+	return out, nil
 }
 
 func matchesPushFilters(cfg map[string]any, ref string, changedFiles []string) bool {

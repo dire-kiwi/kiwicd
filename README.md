@@ -41,7 +41,14 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   private repository that listens with `repository_push`.
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
-  (see [below](#deploy-a-public-repository-from-a-private-one)).
+  (see [below](#deploy-a-public-repository-from-a-private-one)). One with
+  `on: repository_pull_request` runs on another repository's pull requests, from GitHub's
+  `pull_request` webhook to its mirror, e.g. for preview deployments (see
+  [Pull request previews](#pull-request-previews)).
+- **Concurrency groups**: a workflow's top-level `concurrency` (`group`, `cancel-in-progress`;
+  expressions can use `github`, `inputs` and `vars`) lets one run of a repository's group run at
+  a time, as on GitHub. A new run waits for the group's running one, which it cancels with
+  `cancel-in-progress`, and cancels any other that's waiting. A run's page says when it waits.
 - **Protected refs**: only runs from a repository's protected refs get its secrets and the global
   ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
   collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The
@@ -57,8 +64,9 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   behind that reads a later protected job's secrets. Keep runners for protected refs with the
   server's `--protected-label`, or isolate jobs (see [Isolating jobs](#isolating-jobs)).
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
-  `/git/` while the job runs (and, for `repository_push` and dispatched runs from a protected ref,
-  the repositories its workflow listens to that list it as a reader). It can't push or use the API.
+  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request` and dispatched
+  runs from a protected ref, the repositories its workflow listens to that list it as a reader). It
+  can't push or use the API.
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
@@ -66,7 +74,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   dispatch, runners, secrets and variables (global or per repository).
 
 Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
-artifacts and caches, `concurrency` groups, pull-request events.
+artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
+(only other repositories' `repository_pull_request`), commit statuses on GitHub.
 
 ## Deploy a public repository from a private one
 
@@ -123,6 +132,78 @@ curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/
   and so do dispatches on refs that aren't protected.
 - GitHub doesn't know `repository_push`, so turn off GitHub Actions on the private repository if
   it's on GitHub, or GitHub reports the workflow as invalid.
+
+### Pull request previews
+
+The private repository can also run on the public one's pull requests, to deploy a preview of
+each and remove it when the pull request closes:
+
+```yaml
+# .github/workflows/previews.yml in owner/app-deploy
+name: Previews
+on:
+  repository_pull_request:
+    repositories: [owner/app]
+    types: [opened, synchronize, reopened, closed]   # the default leaves out closed
+    branches: [main]                                 # base branches; branches-ignore works too
+concurrency:
+  group: pr-${{ github.event.number }}
+  cancel-in-progress: true
+jobs:
+  deploy:
+    if: github.event.action != 'closed'
+    runs-on: [self-hosted, deploy]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pull request
+        env:
+          TOKEN: ${{ secrets.KIWICD_TOKEN }}
+          PR: ${{ github.event.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git init --quiet app
+          git -C app -c http.extraHeader="Authorization: Bearer $TOKEN" \
+            fetch --quiet "$GITHUB_SERVER_URL/git/owner/app.git" "refs/pull/$PR/head"
+          git -C app checkout --quiet "$SHA"
+      - run: ./deploy-preview.sh app "pr${{ github.event.number }}"
+  remove:
+    if: github.event.action == 'closed'
+    runs-on: [self-hosted, deploy]
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./remove-preview.sh "pr${{ github.event.number }}"
+```
+
+- **Events come from GitHub's webhook.** The public repository has to be a mirror in kiwicd, and
+  on GitHub it needs a webhook (*Settings → Webhooks*) to the mirror's webhook URL (shown in its
+  **Settings**, `https://SERVER/api/hooks/owner/app`), content type `application/json`, the
+  mirror's webhook secret, and the *Pull requests* event (add *Pushes* too and pushes don't wait
+  for the next poll). kiwicd has to be reachable from GitHub. kiwicd doesn't poll GitHub for pull
+  requests: a git mirror can't tell a fork's pull request from the repository's own, and GitHub
+  keeps `refs/pull/N/head` after a pull request closes. If kiwicd misses an event (it was down,
+  say), redeliver it from the webhook's *Recent Deliveries* on GitHub.
+- For each event the mirror fetches `refs/pull/N/head`, so jobs can fetch it from kiwicd with
+  `KIWICD_TOKEN` (with the same reader opt-in as for pushes), and then starts the listeners from
+  their repositories' default branches, with their secrets, as for `repository_push`. Events are
+  handled one at a time in the order they arrive.
+- `github.event` is GitHub's `pull_request` event: `action`, `number`, `before`/`after` (for
+  `synchronize`), `sender` and `pull_request` (`head.sha`, `head.ref`, `head.repo.full_name`,
+  `base.ref`, `merged`, `title`, ...), except that `repository` is kiwicd's mirror, as for
+  `repository_push`: `repository.full_name` is `owner/app` and `repository.clone_url` is on kiwicd.
+  The run's title is `owner/app #N action: title`, and its page shows the pull request's head.
+- `types` defaults to `opened`, `synchronize` and `reopened`, as GitHub's `pull_request` does;
+  any action GitHub sends can be listed. `paths` filters aren't supported.
+- **Pull requests from forks don't start runs** unless the trigger has `forks: true`. Anyone can
+  open one on a public repository, and the run gets the private repository's secrets: with
+  `forks: true` the workflow decides what to do with the fork's code, and must not build or run
+  it in a job that has secrets or deploy credentials. A pull request is from a fork when its
+  `github.event.pull_request.head.repo.full_name` differs from `base.repo.full_name` (`head.repo`
+  is null once the fork is deleted).
+- **Ordering:** two quick pushes to a pull request, or a push and then a close, start runs that
+  could overlap, and a slow deploy could bring back a preview the close removed. Give the workflow
+  a `concurrency` group per pull request as above: a new run waits for the group's running one,
+  and `cancel-in-progress` stops it rather than waiting for it to finish. Since a cancelled job can
+  stop part way through a deploy, the close's removal should cope with a half-deployed preview.
 
 ## Layout
 

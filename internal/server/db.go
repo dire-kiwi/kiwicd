@@ -176,6 +176,10 @@ var migrations = []struct{ table, column, sql string }{
 	// whether a run's ref was one when it was created (see protectedrefs.go).
 	{"repos", "protected_refs", `ALTER TABLE repos ADD COLUMN protected_refs TEXT NOT NULL DEFAULT '[]'`},
 	{"runs", "protected", `ALTER TABLE runs ADD COLUMN protected INTEGER NOT NULL DEFAULT 1`},
+	// The workflow's concurrency group, evaluated when the run was created
+	// (see concurrency.go).
+	{"runs", "concurrency_group", `ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
+		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

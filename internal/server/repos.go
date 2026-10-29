@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/dire-kiwi/kiwicd/internal/wf"
+	"github.com/nektos/act/pkg/model"
 )
 
 type Repo struct {
@@ -437,8 +440,10 @@ func (s *Server) handleSyncRepo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
-// handleWebhook accepts GitHub-style push webhooks (any event triggers a sync).
-// The secret is checked with X-Hub-Signature-256 or a ?secret= parameter.
+// handleWebhook accepts GitHub-style webhooks. A pull_request event starts
+// repository_pull_request workflows (see pullrequest.go); any other event
+// triggers a sync. The secret is checked with X-Hub-Signature-256 or a
+// ?secret= parameter.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.getRepo(r.PathValue("owner") + "/" + r.PathValue("name"))
 	if err != nil {
@@ -456,6 +461,27 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		httpError(w, 401, "bad webhook signature")
+		return
+	}
+	if r.Header.Get("X-GitHub-Event") == "pull_request" {
+		// GitHub sends application/x-www-form-urlencoded webhooks as payload=JSON.
+		if ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); ct == "application/x-www-form-urlencoded" {
+			form, _ := url.ParseQuery(string(body))
+			body = []byte(form.Get("payload"))
+		}
+		if repo.Kind != "mirror" {
+			httpError(w, 400, "pull request events need a mirror of the repository they come from")
+			return
+		}
+		if _, _, err := parsePullRequestEvent(body); err != nil {
+			httpError(w, 400, "bad pull_request event: %v", err)
+			return
+		}
+		if !s.queuePullRequest(queuedPullRequest{repoID: repo.ID, body: body}) {
+			httpError(w, 503, "too many pull request events waiting; redeliver this one later")
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
 		return
 	}
 	go func() {
@@ -597,6 +623,16 @@ func (s *Server) runPushWorkflows(ctx context.Context, repo *Repo, ref, after st
 // public repository can be deployed by a private one that holds the
 // deployment's details and secrets.
 func (s *Server) triggerRepositoryPush(ctx context.Context, src *Repo, ref string, changed []string, event map[string]any, commit commitInfo) error {
+	return s.triggerListeners(ctx, src, wf.RepositoryPush, event, commit.Author, src.Name+": "+commit.Subject, func(w *model.Workflow) bool {
+		return wf.MatchesRepositoryPush(w, src.Name, ref, changed)
+	})
+}
+
+// triggerListeners starts the workflows of other repositories' default
+// branches that listen to src with event (repository_push or
+// repository_pull_request) and that matches accepts.
+func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, payload map[string]any, actor, title string,
+	matches func(*model.Workflow) bool) error {
 	rows, err := s.db.Query(`SELECT `+repoCols+` FROM repos WHERE id != ? ORDER BY name`, src.ID)
 	if err != nil {
 		return err
@@ -611,7 +647,6 @@ func (s *Server) triggerRepositoryPush(ctx context.Context, src *Repo, ref strin
 		listeners = append(listeners, repo)
 	}
 	rows.Close()
-	title := src.Name + ": " + commit.Subject
 	mentionsSrc := mentionsRepo(src.Name)
 	var firstErr error
 	for _, repo := range listeners {
@@ -629,27 +664,27 @@ func (s *Server) triggerRepositoryPush(ctx context.Context, src *Repo, ref strin
 		}
 		for _, file := range sortedKeys(files) {
 			yaml := files[file]
-			if !bytes.Contains(yaml, []byte(wf.RepositoryPush)) {
+			if !bytes.Contains(yaml, []byte(event)) {
 				continue // only listeners need parsing
 			}
 			w, perr := wf.Parse(yaml)
 			if perr != nil {
 				// Report broken workflows that look like they listen to src.
 				if mentionsSrc.Match(yaml) {
-					_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: file, event: wf.RepositoryPush,
-						payload: event, ref: dstRef, sha: sha, actor: commit.Author, title: title, parseErr: perr})
+					_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: file, event: event,
+						payload: payload, ref: dstRef, sha: sha, actor: actor, title: title, parseErr: perr})
 				}
 				continue
 			}
-			if !wf.MatchesRepositoryPush(w, src.Name, ref, changed) {
+			if !matches(w) {
 				continue
 			}
 			name := w.Name
 			if name == "" {
 				name = file
 			}
-			if _, err := s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: name, event: wf.RepositoryPush,
-				payload: event, ref: dstRef, sha: sha, actor: commit.Author, title: title}); err != nil && firstErr == nil {
+			if _, err := s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: name, event: event,
+				payload: payload, ref: dstRef, sha: sha, actor: actor, title: title}); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
