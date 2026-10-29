@@ -61,6 +61,8 @@ func main() {
 		protected = append(protected, v)
 		return nil
 	})
+	githubURL := flag.String("github-url", env("KIWICD_GITHUB_URL", "https://github.com"), "GitHub's web URL, for the GitHub App and signing in with GitHub (GitHub Enterprise: https://HOST)")
+	githubAPIURL := flag.String("github-api-url", env("KIWICD_GITHUB_API_URL", "https://api.github.com"), "GitHub's API URL (GitHub Enterprise: https://HOST/api/v3)")
 	debug := flag.Bool("debug", os.Getenv("KIWICD_DEBUG") != "", "debug logging")
 	showVersion := flag.Bool("version", false, "print the version")
 	flag.Parse()
@@ -88,6 +90,8 @@ func main() {
 		ReservedLabels:    reserved,
 		ProtectedLabels:   protected,
 		SecretKey:         os.Getenv("KIWICD_SECRET_KEY"),
+		GitHubURL:         *githubURL,
+		GitHubAPIURL:      *githubAPIURL,
 		Version:           version,
 		Web:               web.FS(),
 	})
