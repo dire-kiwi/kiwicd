@@ -22,22 +22,29 @@ import (
 // order: a preview removed on close isn't brought back by a slower deploy of
 // an earlier push.
 
-// runConcurrency evaluates the concurrency of the run spec describes. The
-// string is an error to fail the run with.
-func (s *Server) runConcurrency(spec runSpec) (wf.Concurrency, string) {
-	w, err := wf.Parse([]byte(spec.yaml))
+// setRunConcurrency evaluates a new run's concurrency and stores its group,
+// or fails the run if the concurrency is invalid. s.mu is held.
+func (s *Server) setRunConcurrency(runID int64) (wf.Concurrency, error) {
+	run, err := s.getRun(runID)
 	if err != nil {
-		return wf.Concurrency{}, "" // advance reports it
+		return wf.Concurrency{}, err
 	}
-	run := &Run{Repo: spec.repo.Name, RepoID: spec.repo.ID, Event: spec.event, EventJSON: spec.payload, Ref: spec.ref, Sha: spec.sha,
-		Actor: spec.actor, WorkflowName: spec.name, Number: spec.number, Attempt: spec.attempt}
-	inputs, _ := spec.payload["inputs"].(map[string]any)
-	env := &wf.Env{Workflow: w, Github: s.githubContext(run), Vars: s.varsFor(spec.repo.ID), Inputs: inputs}
-	c, err := wf.WorkflowConcurrency([]byte(spec.yaml), env)
+	w, err := wf.Parse([]byte(run.WorkflowYAML))
 	if err != nil {
-		return wf.Concurrency{}, err.Error()
+		return wf.Concurrency{}, nil // advance reports it
 	}
-	return c, ""
+	inputs, _ := run.EventJSON["inputs"].(map[string]any)
+	env := &wf.Env{Workflow: w, Github: s.githubContext(run), Vars: s.varsFor(run.RepoID), Inputs: inputs}
+	c, cerr := wf.WorkflowConcurrency([]byte(run.WorkflowYAML), env)
+	if cerr != nil {
+		_, err = s.db.Exec(`UPDATE runs SET status = ?, conclusion = ?, error = ?, finished_at = ? WHERE id = ?`,
+			protocol.StatusCompleted, protocol.ResultFailure, "Invalid workflow file: "+cerr.Error(), nowMS(), runID)
+		return wf.Concurrency{}, err
+	}
+	if c.Group != "" {
+		_, err = s.db.Exec(`UPDATE runs SET concurrency_group = ? WHERE id = ?`, c.Group, runID)
+	}
+	return c, err
 }
 
 // supersede cancels the earlier runs of the new run's group that are waiting, and

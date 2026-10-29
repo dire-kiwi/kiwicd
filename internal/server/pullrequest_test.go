@@ -194,6 +194,11 @@ func TestRepositoryPullRequest(t *testing.T) {
 	if opened == nil {
 		t.Fatalf("no preview run: %+v", runs)
 	}
+	// The webhook's worker has handled the event once both runs have jobs.
+	for _, r := range runs {
+		waitFor(t, "the run's jobs", func() bool { jobs, _ := srv.runJobs(r.ID); return len(jobs) > 0 })
+	}
+	opened, _ = srv.getRun(opened.ID)
 	ev := opened.EventJSON
 	pr, _ := ev["pull_request"].(map[string]any)
 	head, _ := pr["head"].(map[string]any)
@@ -205,10 +210,6 @@ func TestRepositoryPullRequest(t *testing.T) {
 	}
 	if got, err := resolveRef(context.Background(), srv.repoPath("t/app"), "refs/pull/1/head"); err != nil || got != sha1 {
 		t.Errorf("mirror's refs/pull/1/head = %q %v, want %s", got, err, sha1)
-	}
-	// The webhook's worker has handled the event once both runs have jobs.
-	for _, r := range runs {
-		waitFor(t, "the run's jobs", func() bool { jobs, _ := srv.runJobs(r.ID); return len(jobs) > 0 })
 	}
 	// Later events are handled directly rather than through the worker, so
 	// that they're done when the checks run.
@@ -356,6 +357,19 @@ func TestConcurrencyQueue(t *testing.T) {
 	// Other groups and runs without one don't wait.
 	if other := start("on: push\njobs:\n  a: {runs-on: x, steps: [{run: echo}]}\n"); len(jobsOf(other)) != 1 {
 		t.Error("a run without a group waited")
+	}
+	// GitHub's usual group gets each push run a group of its own, from its
+	// run ID, so they don't cancel each other.
+	const perRun = "on: push\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}\n" +
+		"  cancel-in-progress: true\njobs:\n  a: {runs-on: x, steps: [{run: echo}]}\n"
+	r1, r2 := start(perRun), start(perRun)
+	if r1, _ = srv.getRun(r1.ID); r1.Cancel || r1.ConcurrencyGroup != fmt.Sprintf("w-%d", r1.ID) || len(jobsOf(r1)) != 1 ||
+		r2.ConcurrencyGroup != fmt.Sprintf("w-%d", r2.ID) || len(jobsOf(r2)) != 1 {
+		t.Errorf("runs grouped by run ID: %+v %+v", r1, r2)
+	}
+	// So does run_number.
+	if r := start("on: push\nconcurrency: n-${{ github.run_number }}\njobs:\n  a: {runs-on: x, steps: [{run: echo}]}\n"); r.ConcurrencyGroup != fmt.Sprintf("n-%d", r.Number) {
+		t.Errorf("group by run number: %q, number %d", r.ConcurrencyGroup, r.Number)
 	}
 	if err := srv.completeJob(ctx, jobsOf(a)[0].ID, protocol.ResultSuccess, "", nil, nil); err != nil {
 		t.Fatal(err)

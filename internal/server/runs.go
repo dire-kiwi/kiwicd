@@ -139,15 +139,10 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 		title = spec.name
 	}
 	status, conclusion, errText := protocol.StatusQueued, "", ""
-	var conc wf.Concurrency
-	if spec.parseErr != nil {
-		errText = "Invalid workflow file: " + spec.parseErr.Error()
-	} else if conc, errText = s.runConcurrency(spec); errText != "" {
-		errText = "Invalid workflow file: " + errText
-	}
 	finished := int64(0)
-	if errText != "" {
-		status, conclusion, finished = protocol.StatusCompleted, protocol.ResultFailure, nowMS()
+	if spec.parseErr != nil {
+		status, conclusion, errText = protocol.StatusCompleted, protocol.ResultFailure, "Invalid workflow file: "+spec.parseErr.Error()
+		finished = nowMS()
 	}
 	s.mu.Lock()
 	number := spec.number
@@ -162,14 +157,23 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 		attempt = 1
 	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
-		status, conclusion, error, protected, concurrency_group, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		status, conclusion, error, protected, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
-		status, conclusion, errText, refProtected(spec.repo, spec.ref), conc.Group, nowMS(), finished)
+		status, conclusion, errText, refProtected(spec.repo, spec.ref), nowMS(), finished)
+	var id int64
+	var conc wf.Concurrency
+	if err == nil {
+		id, _ = res.LastInsertId()
+		// The group can use github.run_id and run_number, so it's evaluated
+		// once the run has them, and set before any run can advance.
+		if spec.parseErr == nil {
+			conc, err = s.setRunConcurrency(id)
+		}
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
 	s.log.Info("run created", "repo", spec.repo.Name, "run", id, "number", number, "workflow", spec.file, "event", spec.event, "ref", spec.ref,
 		"secrets", refProtected(spec.repo, spec.ref), "concurrency", conc.Group)
 	if conc.Group != "" {
