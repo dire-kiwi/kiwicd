@@ -683,6 +683,9 @@ func (s *Server) endGitHubSessions(why string) {
 	if n, _ := res.RowsAffected(); n > 0 {
 		s.log.Info("logged out everyone signed in with GitHub: "+why, "sessions", n)
 	}
+	if err := s.deleteTokens(true, why); err != nil {
+		s.log.Error("revoking GitHub users' API tokens", "err", err)
+	}
 }
 
 var githubLoginRE = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
