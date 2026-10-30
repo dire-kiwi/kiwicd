@@ -78,7 +78,7 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository).
 
-Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
+Not yet (see [docs/github-features.md](docs/github-features.md) for a longer list): reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
 artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
 (only other repositories' `repository_pull_request`), commit statuses on GitHub.
 
