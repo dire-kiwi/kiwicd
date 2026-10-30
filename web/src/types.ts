@@ -172,6 +172,15 @@ export interface Setting {
   updated_at: number;
 }
 
+export interface APIToken {
+  id: number;
+  name: string;
+  user: string;
+  created_at: number;
+  expires_at: number; // 0: never
+  last_used_at: number;
+}
+
 export interface GitHubApp {
   app_id: number;
   slug: string;

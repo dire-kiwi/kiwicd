@@ -76,7 +76,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
   members sign in (see [GitHub App](#github-app)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
-  dispatch, runners, secrets and variables (global or per repository).
+  dispatch, runners, secrets and variables (global or per repository), API tokens.
+- **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
+  and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
+  [Command line](#command-line)).
 
 Not yet (see [docs/github-features.md](docs/github-features.md) for a longer list): reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
 artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
@@ -247,7 +250,53 @@ members may (checked through the app, which has to be installed on the organizat
 owner is allowed when it's created. Everyone signed in can do what the admin can; runs they start
 by hand show their login. Membership is checked when someone signs in, and GitHub sessions last a
 week. Removing a user or organization from the list signs out everyone signed in with GitHub,
-and so does removing the app. The admin password keeps working, for the API and git too.
+and revokes their API tokens; so does removing the app. The admin password keeps working, for
+the API and git too.
+
+## Command line
+
+`kiwicd` (`go build -o bin/ ./cmd/kiwicd`) uses the API with an API token. `kiwicd login` asks
+for the admin password, makes a token with it and saves the server and token in
+`~/.config/kiwicd/cli.json` (mode 0600); the password itself isn't kept. People who sign in
+with GitHub make a token under **Settings → API tokens** and pass it with `--token`.
+`KIWICD_URL` and `KIWICD_API_TOKEN` override the saved ones, e.g. in scripts.
+
+```sh
+kiwicd login --url https://SERVER
+kiwicd run list --repo owner/app             # kiwicd runs, for short
+kiwicd run view 42                           # jobs and steps
+kiwicd run logs 42 --failed                  # or --job build, --follow
+kiwicd run start owner/app deploy.yml --ref main -i target=prod --watch
+kiwicd run cancel 42; kiwicd run rerun 42 --watch
+kiwicd workflow list owner/app
+echo -n "$VALUE" | kiwicd secret set DEPLOY_KEY --repo owner/app   # or type it at the prompt
+kiwicd secret list; kiwicd variable set REGION nz-north --repo owner/app
+kiwicd api GET repos/owner/app               # any other API call
+```
+
+Secrets and variables without `--repo` are the global ones. `--watch` exits non-zero unless the
+run succeeds, and list and view commands take `--json`. `kiwicd help` lists every command.
+
+API tokens act as whoever made them, as a `Bearer` token or a Basic password, for the API and
+git over `/git/`. The admin's can last forever; those of people signed in with GitHub last at
+most 90 days, since organization membership is only checked when they sign in. Changing the
+admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
+revoked under **Settings → API tokens**, or with `kiwicd token list` and `kiwicd token revoke`;
+`kiwicd logout` revokes its own.
+
+### MCP
+
+`kiwicd mcp` is an MCP server on stdio, with the saved login, for agents such as Claude Code:
+
+```sh
+claude mcp add kiwicd -- kiwicd mcp              # or: kiwicd mcp --read-only
+```
+
+Its tools list repositories, workflows, runs and runners, get a run with its jobs and steps,
+read the end of a job's log (or one step's), wait for a run to finish, start, re-run and cancel
+runs, and list, set and delete secrets and variables. Secrets stay write-only: the agent can set
+them but not read them back. `--read-only` leaves out the tools that change anything. Give it
+its own token (`KIWICD_API_TOKEN`) to revoke it separately from yours.
 
 ## Layout
 
@@ -255,6 +304,7 @@ and so does removing the app. The admin password keeps working, for the API and 
 |---|---|
 | `cmd/kiwicd-server`, `internal/server` | HTTP API, git hosting, scheduler, SQLite store |
 | `cmd/kiwicd-agent`, `internal/agent` | Registration, polling, running jobs with act, log reporting |
+| `cmd/kiwicd`, `internal/cli` | Command line client and MCP server |
 | `internal/protocol` | Types shared by server and agent |
 | `internal/wf` | Job-level expression evaluation and trigger filters on top of act |
 | `web/` | React UI (Vite), embedded into the server binary from `web/dist` |

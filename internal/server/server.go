@@ -252,6 +252,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/runners/{id}", ui(s.handleDeleteRunner))
 	mux.Handle("POST /api/runners/registration-token", ui(s.handleRegistrationToken))
 
+	mux.Handle("GET /api/tokens", ui(s.handleListTokens))
+	mux.Handle("POST /api/tokens", ui(s.handleCreateToken))
+	mux.Handle("DELETE /api/tokens/{id}", ui(s.handleDeleteToken))
+
 	mux.Handle("GET /api/secrets", ui(s.handleListSettings("secrets")))
 	mux.Handle("PUT /api/secrets", ui(s.handlePutSetting("secrets")))
 	mux.Handle("DELETE /api/secrets", ui(s.handleDeleteSetting("secrets")))
@@ -354,7 +358,8 @@ const adminUser = "admin"
 
 // authenticate returns who r is: adminUser for a session made with the
 // admin password or the password itself, a GitHub login for a session made
-// by signing in with GitHub (see githublogin.go), or "" if r isn't
+// by signing in with GitHub (see githublogin.go), whoever made the API token
+// it carries (see apitokens.go), or "" if r isn't
 // authenticated. The error is errTooManyPasswords if r's client has had too
 // many wrong passwords to try another now.
 func (s *Server) authenticate(r *http.Request) (string, error) {
@@ -370,6 +375,9 @@ func (s *Server) authenticate(r *http.Request) (string, error) {
 		}
 	}
 	if p, ok := requestPassword(r); ok && p != "" {
+		if user := s.tokenUser(p); user != "" {
+			return user, nil
+		}
 		if ok, err := s.tryPassword(r, p); !ok {
 			return "", err
 		}
@@ -556,6 +564,7 @@ func (s *Server) backgroundLoop(ctx context.Context) {
 		case <-watchdog.C:
 			s.reapLostJobs(ctx)
 			_, _ = s.db.Exec(`DELETE FROM sessions WHERE expires_at < ?`, nowMS())
+			_, _ = s.db.Exec(`DELETE FROM api_tokens WHERE expires_at != 0 AND expires_at < ?`, nowMS())
 			_, _ = s.db.Exec(`DELETE FROM registration_tokens WHERE expires_at < ?`, nowMS())
 		case <-poll.C:
 			s.pollMirrors(ctx)

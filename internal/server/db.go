@@ -129,6 +129,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 	created_at INTEGER NOT NULL,
 	expires_at INTEGER NOT NULL
 );
+-- Tokens for the API (see apitokens.go).
+CREATE TABLE IF NOT EXISTS api_tokens (
+	id INTEGER PRIMARY KEY,
+	name TEXT NOT NULL,
+	token_hash TEXT NOT NULL UNIQUE,
+	github_login TEXT NOT NULL DEFAULT '', -- who made it; '' for the admin
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL DEFAULT 0,  -- 0: never
+	last_used_at INTEGER NOT NULL DEFAULT 0
+);
 -- The GitHub App (see github.go): at most one row.
 CREATE TABLE IF NOT EXISTS github_app (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
