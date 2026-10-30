@@ -23,7 +23,7 @@ deployer; 4–8 are what common third-party workflows need to run unchanged.
 
 Tasks on the board (KIW-27 made them): 1 KIW-31, 2 KIW-32, 3 KIW-33, 6 KIW-34, 7 KIW-35,
 8 KIW-36; other triggers KIW-37; job-level concurrency and other workflow syntax KIW-38; runs and
-logs UI KIW-39; roles, API tokens and an audit log KIW-40.
+logs UI KIW-39; roles, scoped API tokens and an audit log KIW-40.
 
 ## Triggers
 
@@ -33,7 +33,7 @@ logs UI KIW-39; roles, API tokens and an audit log KIW-40.
 | `pull_request_target` | Medium | S (after the above) | Runs the base branch's workflow with secrets. Easy to misuse; maybe leave out or make opt-in. |
 | `schedule` (cron) | High | S–M | Read from the default branch, evaluated in UTC, minimum interval of 5 minutes as on GitHub. Also needed for things like nightly builds and dependency checks. |
 | `workflow_run` | Medium | S | Run after another workflow completes (`types: [completed]`, `workflows:`, `branches:`). Common for deploy-after-CI. |
-| `repository_dispatch` | Medium | S | `POST /api/repos/OWNER/NAME/dispatches` with `event_type` and `client_payload`, authenticated with an API token (see [API tokens](#access-and-api)). |
+| `repository_dispatch` | Medium | S | `POST /api/repos/OWNER/NAME/dispatches` with `event_type` and `client_payload`, authenticated with the existing API tokens (*Settings → API tokens*). |
 | `release`, `create`, `delete` | Low | S | Tag/branch created or deleted; `release` would need releases (see [Repository features](#repository-features)). |
 | `merge_group` | Low | M | Only useful with a merge queue. |
 | `issues`, `issue_comment`, … | Low | M | GitHub App events, e.g. `/deploy` comment commands. Only worth it for ChatOps. |
@@ -91,7 +91,7 @@ logs UI KIW-39; roles, API tokens and an audit log KIW-40.
 | Feature | Value | Effort | Notes |
 |---|---|---|---|
 | Users and roles | Medium | M | Everyone signed in is admin today. Read-only viewers, per-repository maintainers. |
-| Personal API tokens | Medium | S | For scripts and `repository_dispatch`, instead of the admin password. |
+| Scoped API tokens | Medium | S | API tokens exist, but act with all of their maker's rights. Limit one to read-only, a role or some repositories, e.g. for `repository_dispatch` from another system or `kiwicd mcp`. |
 | Public read-only view of public repositories' runs | Medium | S–M | Like GitHub's public Actions logs, with secrets already masked. |
 | Audit log | Low | S | Who changed secrets, protected refs, readers, runners. |
 | Organization-level secrets and variables with repository access lists | Low | S | Between global and per repository. |
