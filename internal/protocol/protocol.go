@@ -36,6 +36,9 @@ type PollRequest struct {
 	Version  string   `json:"version"`
 	Protocol int      `json:"protocol"`
 	Labels   []string `json:"labels"`
+	// Unseal says the agent has a secrets service to open sealed secrets
+	// with. Jobs that have some fail on agents without one.
+	Unseal bool `json:"unseal,omitempty"`
 }
 
 type PollResponse struct {
@@ -71,8 +74,15 @@ type JobRequest struct {
 	Event      map[string]any `json:"event"`
 	Actor      string         `json:"actor"`
 
+	// Environment is the deployment environment the job uses, if any.
+	Environment string `json:"environment,omitempty"`
+
 	Secrets map[string]string `json:"secrets"`
-	Vars    map[string]string `json:"vars"`
+	// SealedSecrets names the job's secrets that are sealed to the secrets
+	// service's public key. The agent gets them from its secrets service
+	// before the job starts (see UnsealRequest), and adds them to Secrets.
+	SealedSecrets []string          `json:"sealed_secrets,omitempty"`
+	Vars          map[string]string `json:"vars"`
 	// Warnings from the server to show in the job's log, such as why it got
 	// no secrets.
 	Notices []string `json:"notices,omitempty"`
@@ -127,4 +137,49 @@ type JobComplete struct {
 	Outputs map[string]string `json:"outputs"`
 	Logs    []LogLine         `json:"logs"`
 	Steps   []StepState       `json:"steps"`
+}
+
+// The secrets service holds the private key that opens sealed secrets (see
+// package sealed and cmd/kiwicd-secrets). An agent whose job has sealed
+// secrets sends it the job's token (secrets.KIWICD_TOKEN) with the agent's
+// own credentials for the service:
+//
+//	POST /v1/unseal
+//	Authorization: Bearer SERVICE-TOKEN
+//	{"job_token": "..."}
+//
+// The service asks the kiwicd server which job the token belongs to and for
+// its sealed secrets (GET /api/secrets-service/job, with the job token as a
+// bearer token), checks that the agent's credentials may open secrets for
+// that repository and environment, and returns them opened.
+type UnsealRequest struct {
+	JobToken string `json:"job_token"`
+}
+
+type UnsealResponse struct {
+	Secrets map[string]string `json:"secrets"`
+}
+
+// SealedJob is the server's answer to the secrets service: the running job
+// a token belongs to and its sealed secrets.
+type SealedJob struct {
+	JobID       int64          `json:"job_id"`
+	RunID       int64          `json:"run_id"`
+	Repository  string         `json:"repository"`
+	Ref         string         `json:"ref"`
+	Environment string         `json:"environment,omitempty"`
+	Workflow    string         `json:"workflow"`
+	Event       string         `json:"event"`
+	Runner      string         `json:"runner"`
+	Secrets     []SealedSecret `json:"secrets"`
+}
+
+// SealedSecret is one sealed value and the scope it was sealed for.
+type SealedSecret struct {
+	Name string `json:"name"`
+	// Repository is empty for global secrets, Environment for global and
+	// repository ones.
+	Repository  string `json:"repository,omitempty"`
+	Environment string `json:"environment,omitempty"`
+	Value       string `json:"value"`
 }

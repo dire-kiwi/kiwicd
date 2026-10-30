@@ -24,8 +24,9 @@ import (
 // A pattern is a branch name like push's branches filter (release/*, where
 // * doesn't match / and ** does), or a full ref (refs/tags/v*).
 
-// cleanProtectedRefs checks a repository's protected ref patterns.
-func cleanProtectedRefs(names []string) ([]string, error) {
+// cleanRefPatterns checks ref patterns: a repository's protected refs, or
+// those an environment is limited to.
+func cleanRefPatterns(names []string) ([]string, error) {
 	out := []string{}
 	for _, name := range names {
 		name = strings.TrimSpace(name)
@@ -33,13 +34,13 @@ func cleanProtectedRefs(names []string) ([]string, error) {
 			continue
 		}
 		if strings.HasPrefix(name, "!") {
-			return nil, fmt.Errorf("protected ref %q: patterns can't be negated", name)
+			return nil, fmt.Errorf("ref pattern %q: patterns can't be negated", name)
 		}
 		if strings.HasPrefix(name, "refs/") && !strings.HasPrefix(name, "refs/heads/") && !strings.HasPrefix(name, "refs/tags/") {
-			return nil, fmt.Errorf("protected ref %q: full refs must start with refs/heads/ or refs/tags/", name)
+			return nil, fmt.Errorf("ref pattern %q: full refs must start with refs/heads/ or refs/tags/", name)
 		}
 		if _, err := workflowpattern.CompilePattern(name); err != nil {
-			return nil, fmt.Errorf("protected ref %q: %v", name, err)
+			return nil, fmt.Errorf("ref pattern %q: %v", name, err)
 		}
 		out = append(out, name)
 	}
@@ -49,10 +50,12 @@ func cleanProtectedRefs(names []string) ([]string, error) {
 
 // refProtected reports whether runs from ref get repo's secrets.
 func refProtected(repo *Repo, ref string) bool {
-	if ref == "refs/heads/"+repo.DefaultBranch {
-		return true
-	}
-	for _, p := range repo.ProtectedRefs {
+	return ref == "refs/heads/"+repo.DefaultBranch || refMatches(repo.ProtectedRefs, ref)
+}
+
+// refMatches reports whether ref matches one of the patterns.
+func refMatches(patterns []string, ref string) bool {
+	for _, p := range patterns {
 		if !strings.HasPrefix(p, "refs/") {
 			p = "refs/heads/" + p
 		}

@@ -34,7 +34,7 @@ func (s *Server) setRunConcurrency(runID int64) (wf.Concurrency, error) {
 		return wf.Concurrency{}, nil // advance reports it
 	}
 	inputs, _ := run.EventJSON["inputs"].(map[string]any)
-	env := &wf.Env{Workflow: w, Github: s.githubContext(run), Vars: s.varsFor(run.RepoID), Inputs: inputs}
+	env := &wf.Env{Workflow: w, Github: s.githubContext(run), Vars: s.varsFor(run.RepoID, nil), Inputs: inputs}
 	c, cerr := wf.WorkflowConcurrency([]byte(run.WorkflowYAML), env)
 	if cerr != nil {
 		_, err = s.db.Exec(`UPDATE runs SET status = ?, conclusion = ?, error = ?, finished_at = ? WHERE id = ?`,

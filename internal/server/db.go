@@ -111,6 +111,30 @@ CREATE TABLE IF NOT EXISTS variables (
 	updated_at INTEGER NOT NULL,
 	PRIMARY KEY (repo_id, name)
 );
+-- Deployment environments of a repository (see environments.go), with
+-- secrets and variables of their own.
+CREATE TABLE IF NOT EXISTS environments (
+	id INTEGER PRIMARY KEY,
+	repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+	name TEXT NOT NULL COLLATE NOCASE,
+	refs TEXT NOT NULL DEFAULT '[]',    -- ref patterns that may use it; [] = any protected ref
+	created_at INTEGER NOT NULL,
+	UNIQUE (repo_id, name)
+);
+CREATE TABLE IF NOT EXISTS environment_secrets (
+	environment_id INTEGER NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+	name TEXT NOT NULL,
+	value TEXT NOT NULL,                -- encrypted, see secretbox.go
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (environment_id, name)
+);
+CREATE TABLE IF NOT EXISTS environment_variables (
+	environment_id INTEGER NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+	name TEXT NOT NULL,
+	value TEXT NOT NULL,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (environment_id, name)
+);
 -- Workflows stored in kiwicd instead of the repository. They apply to every
 -- commit, alongside the repository's own .github/workflows/ files.
 CREATE TABLE IF NOT EXISTS uploaded_workflows (
@@ -198,6 +222,10 @@ var migrations = []struct{ table, column, sql string }{
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
+	// The job's deployment environment, as its workflow names it, and URL
+	// (see environments.go).
+	{"jobs", "environment", `ALTER TABLE jobs ADD COLUMN environment TEXT NOT NULL DEFAULT ''`},
+	{"jobs", "environment_url", `ALTER TABLE jobs ADD COLUMN environment_url TEXT NOT NULL DEFAULT ''`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

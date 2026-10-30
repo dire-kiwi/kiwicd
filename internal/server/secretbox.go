@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/dire-kiwi/kiwicd/internal/sealed"
 )
 
 // Secret values and SSH deploy keys are stored encrypted with AES-256-GCM
@@ -212,7 +214,11 @@ func encryptPlaintext(db *sql.DB, box *secretBox, writeCheck bool) (n int, err e
 				return 0, err
 			}
 			// The key is known to be right, so anything that doesn't open is
-			// plain text (even if it happens to start with "v1:").
+			// plain text (even if it happens to start with "v1:"), except
+			// secrets sealed to the secrets service's public key.
+			if c.table == "secrets" && sealed.Is(v) {
+				continue
+			}
 			if _, err := box.open(c.purpose, v); err != nil {
 				plain[id] = v
 			}

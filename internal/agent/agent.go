@@ -129,6 +129,10 @@ type Config struct {
 	JobBridgePrefix string
 	// ActionsURL is where `uses: owner/repo@ref` actions are cloned from.
 	ActionsURL string
+	// SecretsURL is the secrets service that opens secrets sealed to its
+	// public key, and SecretsToken the agent's token for it.
+	SecretsURL   string
+	SecretsToken string
 }
 
 type Agent struct {
@@ -187,7 +191,7 @@ func New(cfg Config) (*Agent, error) {
 // Run polls for jobs until ctx is cancelled. Running jobs finish first.
 func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("agent started", "name", a.cfg.Creds.Name, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels,
-		"job_image", a.cfg.JobImage, "docker_socket", a.cfg.ContainerDaemonSocket)
+		"job_image", a.cfg.JobImage, "docker_socket", a.cfg.ContainerDaemonSocket, "secrets_service", a.cfg.SecretsURL)
 	if a.cfg.JobImage == "" {
 		a.log.Warn("jobs run on this machine, as the agent's user, and can read its registration; set --job-image to isolate them")
 	}
@@ -211,7 +215,7 @@ func (a *Agent) Run(ctx context.Context) error {
 func (a *Agent) worker(ctx context.Context) error {
 	backoff := time.Second
 	for ctx.Err() == nil {
-		resp, err := a.c.poll(ctx, protocol.PollRequest{Version: a.cfg.Version, Protocol: protocol.Version})
+		resp, err := a.c.poll(ctx, protocol.PollRequest{Version: a.cfg.Version, Protocol: protocol.Version, Unseal: a.cfg.SecretsURL != ""})
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -328,8 +332,26 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	rep.logf(0, "Runner name: %s", a.cfg.Creds.Name)
 	rep.logf(0, "Job: %s (%s, run #%d)", req.DisplayName, req.WorkflowFile, req.RunNumber)
 	rep.logf(0, "Repository: %s @ %s (%s)", req.Repository, short(req.Sha), req.Ref)
+	if req.Environment != "" {
+		rep.logf(0, "Environment: %s", req.Environment)
+	}
 	for _, n := range req.Notices {
 		rep.logf(0, "##[warning]%s", n)
+	}
+	if len(req.SealedSecrets) > 0 {
+		rep.logf(0, "Getting sealed secrets from the secrets service: %s", strings.Join(req.SealedSecrets, ", "))
+		opened, err := a.unseal(ctx, req)
+		if err != nil {
+			rep.logf(0, "##[error]%v", err)
+			return protocol.ResultFailure, nil
+		}
+		rep.addSecrets(opened)
+		if req.Secrets == nil {
+			req.Secrets = map[string]string{}
+		}
+		for k, v := range opened {
+			req.Secrets[k] = v
+		}
 	}
 
 	jobDir := filepath.Join(a.cfg.WorkDir, "jobs", strconv.FormatInt(req.JobID, 10))

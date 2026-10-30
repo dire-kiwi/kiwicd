@@ -18,7 +18,10 @@ import (
 type client struct {
 	base  string
 	token string
-	http  *http.Client
+	// bearer is sent as an Authorization bearer token instead (the
+	// secrets service).
+	bearer string
+	http   *http.Client
 }
 
 func newClient(base, token string) *client {
@@ -48,6 +51,9 @@ func (c *client) do(ctx context.Context, method, path string, in, out any) error
 	req.Header.Set("Content-Type", "application/json")
 	if c.token != "" {
 		req.Header.Set(protocol.RunnerTokenHeader, c.token)
+	}
+	if c.bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+c.bearer)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

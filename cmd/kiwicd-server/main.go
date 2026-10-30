@@ -63,6 +63,7 @@ func main() {
 	})
 	githubURL := flag.String("github-url", env("KIWICD_GITHUB_URL", "https://github.com"), "GitHub's web URL, for the GitHub App and signing in with GitHub (GitHub Enterprise: https://HOST)")
 	githubAPIURL := flag.String("github-api-url", env("KIWICD_GITHUB_API_URL", "https://api.github.com"), "GitHub's API URL (GitHub Enterprise: https://HOST/api/v3)")
+	secretsPublicKey := flag.String("secrets-public-key", env("KIWICD_SECRETS_PUBLIC_KEY", ""), "secrets service's public key (kiwicd-secrets keygen): seal secrets to it, so that only the service can read them")
 	debug := flag.Bool("debug", os.Getenv("KIWICD_DEBUG") != "", "debug logging")
 	showVersion := flag.Bool("version", false, "print the version")
 	flag.Parse()
@@ -90,6 +91,7 @@ func main() {
 		ReservedLabels:    reserved,
 		ProtectedLabels:   protected,
 		SecretKey:         os.Getenv("KIWICD_SECRET_KEY"),
+		SecretsPublicKey:  *secretsPublicKey,
 		GitHubURL:         *githubURL,
 		GitHubAPIURL:      *githubAPIURL,
 		Version:           version,

@@ -128,7 +128,7 @@ func TestSecretMigration(t *testing.T) {
 		if n != 5 {
 			t.Errorf("%d stored values, want 5", n)
 		}
-		got, err := srv.secretsFor(7)
+		got, err := srv.plainSecrets(7)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -138,10 +138,10 @@ func TestSecretMigration(t *testing.T) {
 				t.Errorf("secret %s = %q, want %q", k, got[k], v)
 			}
 		}
-		if got, _ := srv.secretsFor(8); got["GLOBAL"] != "g-value" {
+		if got, _ := srv.plainSecrets(8); got["GLOBAL"] != "g-value" {
 			t.Errorf("global secret = %q", got["GLOBAL"])
 		}
-		if v := srv.varsFor(0)["VAR"]; v != "visible" {
+		if v := srv.varsFor(0, nil)["VAR"]; v != "visible" {
 			t.Errorf("variable changed: %q", v)
 		}
 		repo, _ := srv.getRepoByID(7)
@@ -289,7 +289,13 @@ func TestSecretsAPI(t *testing.T) {
 	if stored != "plain" {
 		t.Errorf("stored variable %q", stored)
 	}
-	if got, err := srv.secretsFor(0); err != nil || got["TOKEN"] != "s3cret" {
+	if got, err := srv.plainSecrets(0); err != nil || got["TOKEN"] != "s3cret" {
 		t.Errorf("secretsFor: %v %v", got, err)
 	}
+}
+
+// plainSecrets returns the secrets the server can read of a repository's jobs.
+func (s *Server) plainSecrets(repoID int64) (map[string]string, error) {
+	plain, _, err := s.jobSecrets(repoID, nil)
+	return plain, err
 }

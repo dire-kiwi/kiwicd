@@ -48,6 +48,7 @@ Usage:
   kiwicd-agent register --url URL --token TOKEN [--name NAME] [--labels a,b:docker://image]
   kiwicd-agent run [--config .runner] [--work-dir _work] [--capacity N]
                    [--job-image IMAGE [--job-options OPTS]] [--docker-socket PATH]
+                   [--secrets-url URL --secrets-token-file FILE]
   kiwicd-agent version
 `, version)
 }
@@ -110,7 +111,20 @@ func run(ctx context.Context, args []string) error {
 	jobOptions := fs.String("job-options", env("KIWICD_JOB_OPTIONS", ""), "docker create options for job containers, e.g. --memory 4g --cpus 2")
 	bridgePrefix := fs.String("job-bridge-prefix", env("KIWICD_JOB_BRIDGE_PREFIX", "kiwicd-"), "start of the network interface names of --job-image jobs' networks")
 	actionsURL := fs.String("actions-url", env("KIWICD_ACTIONS_URL", "https://github.com"), "where uses: owner/repo@ref actions are cloned from")
+	secretsURL := fs.String("secrets-url", env("KIWICD_SECRETS_URL", ""), "secrets service (kiwicd-secrets) that opens secrets sealed to its public key")
+	secretsTokenFile := fs.String("secrets-token-file", env("KIWICD_SECRETS_TOKEN_FILE", ""), "file holding this agent's token for the secrets service (or set KIWICD_SECRETS_TOKEN)")
 	_ = fs.Parse(args)
+	secretsToken := os.Getenv("KIWICD_SECRETS_TOKEN")
+	if *secretsTokenFile != "" {
+		b, err := os.ReadFile(*secretsTokenFile)
+		if err != nil {
+			return fmt.Errorf("secrets token: %w", err)
+		}
+		secretsToken = strings.TrimSpace(string(b))
+	}
+	if *secretsURL != "" && secretsToken == "" {
+		return errors.New("--secrets-url needs a token: --secrets-token-file or KIWICD_SECRETS_TOKEN")
+	}
 
 	creds, err := agent.LoadCredentials(*config)
 	if errors.Is(err, os.ErrNotExist) && os.Getenv("KIWICD_URL") != "" && os.Getenv("KIWICD_REGISTRATION_TOKEN") != "" {
@@ -126,9 +140,11 @@ func run(ctx context.Context, args []string) error {
 	}
 	// Host jobs inherit the agent's environment: don't hand them a
 	// registration token, which could register a runner that takes jobs.
+	// Nor the secrets service's token.
 	os.Unsetenv("KIWICD_REGISTRATION_TOKEN")
+	os.Unsetenv("KIWICD_SECRETS_TOKEN")
 	a, err := agent.New(agent.Config{Creds: creds, WorkDir: *workDir, Capacity: *capacity, Version: version, ContainerDaemonSocket: *socket, ActionsURL: *actionsURL,
-		JobImage: *jobImage, JobOptions: *jobOptions, JobBridgePrefix: *bridgePrefix})
+		JobImage: *jobImage, JobOptions: *jobOptions, JobBridgePrefix: *bridgePrefix, SecretsURL: *secretsURL, SecretsToken: secretsToken})
 	if err != nil {
 		return err
 	}

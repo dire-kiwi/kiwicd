@@ -222,3 +222,58 @@ func TestWorkflowConcurrency(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvironment(t *testing.T) {
+	src := []byte(`
+on: push
+jobs:
+  none:
+    runs-on: x
+    steps: [{run: "true"}]
+  name:
+    runs-on: x
+    environment: prod-${{ matrix.region }}
+    steps: [{run: "true"}]
+  mapping:
+    runs-on: x
+    environment:
+      name: ${{ vars.ENV }}
+      url: https://${{ github.ref_name }}.example.com
+    steps: [{run: "true"}]
+  steps-url:
+    runs-on: x
+    environment:
+      name: prod
+      url: ${{ steps.deploy.outputs.url }}
+    steps: [{run: "true"}]
+  bad-url:
+    runs-on: x
+    environment: {name: prod, url: "javascript:alert(1)"}
+    steps: [{run: "true"}]
+  no-name:
+    runs-on: x
+    environment: {url: "https://x"}
+    steps: [{run: "true"}]
+`)
+	w, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for job, want := range map[string]JobEnvironment{
+		"none":      {},
+		"name":      {Name: "prod-eu"},
+		"mapping":   {Name: "staging", URL: "https://main.example.com"},
+		"steps-url": {Name: "prod"},
+		"bad-url":   {Name: "prod"},
+	} {
+		e := &Env{Workflow: w, JobID: job, Github: &model.GithubContext{RefName: "main"}, Vars: map[string]string{"ENV": "staging"},
+			Matrix: map[string]any{"region": "eu"}}
+		got, err := e.Environment(src)
+		if err != nil || got != want {
+			t.Errorf("%s: %+v, %v; want %+v", job, got, err, want)
+		}
+	}
+	if _, err := (&Env{Workflow: w, JobID: "no-name"}).Environment(src); err == nil {
+		t.Error("an environment without a name was accepted")
+	}
+}
