@@ -6,7 +6,7 @@ import { SettingsTable } from "../components/SettingsTable";
 import { isSSHURL, KnownHostsField, SSHKeyField, sshHost, type SSHAuth } from "../components/SSHFields";
 import { Chip, CodeBlock, CopyField, Empty, ErrorBox, Flash, Icon, Modal, Spinner } from "../components/ui";
 import { useDocumentTitle, useFetch } from "../hooks";
-import type { Repo, UploadedWorkflow, Workflow, WorkflowInput } from "../types";
+import type { Environment, Repo, UploadedWorkflow, Workflow, WorkflowInput } from "../types";
 import { absoluteTime, eventLabel, relativeTime, shortSha } from "../util";
 
 function branchesOf(repo: Repo): string[] {
@@ -61,6 +61,7 @@ export function RepoPage() {
         <NavLink to={`${base}/workflows`}>Workflows</NavLink>
         <NavLink to={`${base}/secrets`}>Secrets</NavLink>
         <NavLink to={`${base}/variables`}>Variables</NavLink>
+        <NavLink to={`${base}/environments`}>Environments</NavLink>
         <NavLink to={`${base}/settings`}>Settings</NavLink>
       </nav>
 
@@ -82,6 +83,8 @@ export function RepoPage() {
         <Route path="workflows" element={<WorkflowsTab repo={r} />} />
         <Route path="secrets" element={<SettingsTable kind="secrets" repo={r.name} />} />
         <Route path="variables" element={<SettingsTable kind="variables" repo={r.name} />} />
+        <Route path="environments" element={<EnvironmentsTab repo={r} />} />
+        <Route path="environments/:env" element={<EnvironmentPage repo={r} />} />
         <Route path="settings" element={<RepoSettingsTab repo={r} onChanged={repo.reload} />} />
         <Route path="*" element={<Empty title="Not found" />} />
       </Routes>
@@ -908,6 +911,185 @@ function ListEditor({
           Add
         </button>
       </form>
+    </div>
+  );
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+function environmentPath(repo: Repo, env: string): string {
+  return `${repoPath(repo.name)}/environments/${encodeURIComponent(env)}`;
+}
+
+/** The repository's deployment environments. */
+function EnvironmentsTab({ repo }: { repo: Repo }) {
+  const envs = useFetch<Environment[]>(`${repoPath(repo.name)}/environments`);
+  const navigate = useNavigate();
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+
+  const create = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(undefined);
+    try {
+      const env = await post<Environment>(`${repoPath(repo.name)}/environments`, { name: name.trim() });
+      navigate(`/repos/${repo.name}/environments/${encodeURIComponent(env.name)}`);
+    } catch (err) {
+      setError(errorMessage(err));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Environments</h3>
+          <p className="muted small">
+            Deployment targets with secrets and variables of their own. A job uses one with{" "}
+            <code>{"environment: production"}</code> (or <code>{"environment: {name: production, url: …}"}</code>) and gets its
+            values over the repository's and the global ones. An environment can be limited to some refs: jobs of runs from others
+            fail.
+          </p>
+        </div>
+        <button className="btn btn-primary" onClick={() => setCreating(true)}>
+          New environment
+        </button>
+      </div>
+      {envs.error && !envs.data && <ErrorBox onRetry={envs.reload}>{envs.error}</ErrorBox>}
+      {!envs.data && envs.loading && <Spinner />}
+      {envs.data && envs.data.length === 0 && (
+        <Empty title="No environments yet">Add one to keep a deployment's secrets apart from the rest of the repository's.</Empty>
+      )}
+      {envs.data && envs.data.length > 0 && (
+        <ul className="list">
+          {envs.data.map((env) => (
+            <li key={env.id} className="list-row setting-row">
+              <div className="setting-main">
+                <Link to={encodeURIComponent(env.name)} className="setting-name">
+                  {env.name}
+                </Link>
+                <span className="muted small">
+                  {env.refs.length ? <>refs {env.refs.join(", ")}</> : "any ref"} · {plural(env.secrets, "secret")} · {plural(env.variables, "variable")}
+                </span>
+              </div>
+              <span className="muted small nowrap" title={absoluteTime(env.created_at)}>
+                Created {relativeTime(env.created_at)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {creating && (
+        <Modal title="New environment" onClose={() => setCreating(false)}>
+          <form className="form" onSubmit={create}>
+            {error && <ErrorBox>{error}</ErrorBox>}
+            <label className="field">
+              <span className="label">Name</span>
+              <input className="input mono" value={name} onChange={(e) => setName(e.target.value)} placeholder="production" autoFocus required />
+            </label>
+            <div className="form-actions">
+              <button type="button" className="btn" onClick={() => setCreating(false)}>
+                Cancel
+              </button>
+              <button type="submit" className="btn btn-primary" disabled={busy || !name.trim()}>
+                {busy ? "Creating…" : "Create environment"}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </section>
+  );
+}
+
+/** One environment: the refs that may use it, its secrets and variables. */
+function EnvironmentPage({ repo }: { repo: Repo }) {
+  const { env: envName = "" } = useParams();
+  const navigate = useNavigate();
+  const env = useFetch<Environment[]>(`${repoPath(repo.name)}/environments`);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const e = env.data?.find((x) => x.name.toLowerCase() === envName.toLowerCase());
+
+  if (env.error && !env.data) return <ErrorBox onRetry={env.reload}>{env.error}</ErrorBox>;
+  if (!env.data) return <Spinner />;
+  if (!e)
+    return (
+      <Empty title="No such environment">
+        <Link to={`/repos/${repo.name}/environments`}>All environments</Link>
+      </Empty>
+    );
+
+  const saveRefs = async (refs: string[]): Promise<boolean> => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(environmentPath(repo, e.name), { refs });
+      env.reload();
+      return true;
+    } catch (err) {
+      setError(errorMessage(err));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async () => {
+    if (!window.confirm(`Delete the environment ${e.name}, with its secrets and variables?`)) return;
+    setBusy(true);
+    try {
+      await del(environmentPath(repo, e.name));
+      navigate(`/repos/${repo.name}/environments`);
+    } catch (err) {
+      setError(errorMessage(err));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="stack">
+      <section className="box">
+        <div className="box-header">
+          <div>
+            <h3>
+              <Link to={`/repos/${repo.name}/environments`} className="muted-link">
+                Environments
+              </Link>{" "}
+              / {e.name}
+            </h3>
+            <p className="muted small">
+              Only runs from these refs may use this environment; with none, any run may. Its secrets go only to runs from protected
+              refs either way. Patterns are branch names, as in a push filter (<span className="mono">release/*</span>), or full refs (
+              <span className="mono">refs/tags/v*</span>).
+            </p>
+          </div>
+          <button className="btn btn-danger-outline" onClick={remove} disabled={busy}>
+            Delete environment
+          </button>
+        </div>
+        {error && <Flash kind="error">{error}</Flash>}
+        <div className="kv kv-pad">
+          <span className="label">Refs</span>
+          <ListEditor
+            id="environment-ref"
+            items={e.refs}
+            empty="Any ref."
+            placeholder="branch, release/* or refs/tags/v*"
+            candidates={branchesOf(repo)}
+            confirmRemove={(r) => `Stop runs from ${r} using ${e.name}?`}
+            busy={busy}
+            save={saveRefs}
+          />
+        </div>
+      </section>
+      <SettingsTable key={`s-${e.name}`} kind="secrets" repo={repo.name} environment={e.name} />
+      <SettingsTable key={`v-${e.name}`} kind="variables" repo={repo.name} environment={e.name} />
     </div>
   );
 }

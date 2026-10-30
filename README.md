@@ -17,7 +17,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `workflow_dispatch` with inputs,
   `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`,
-  `defaults`, `timeout-minutes`, `secrets`, `vars`.
+  `defaults`, `timeout-minutes`, `secrets`, `vars`, `environment` (see
+  [Environments](#environments)).
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
   commands, `::add-mask::`, `hashFiles()`. `actions/checkout` of the workflow's own repository is
@@ -75,8 +76,15 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   requests of every repository it's installed on (no webhook per repository), lets mirrors of
   private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
   members sign in (see [GitHub App](#github-app)).
+- **Environments**: deployment targets with secrets and variables of their own, which a job
+  picks with `environment:` and which can be limited to some refs (see
+  [Environments](#environments)).
+- **Secrets the server can't read**: optionally, secrets are sealed to the public key of a
+  separate secrets service, which opens them for the agents of jobs that get them (see
+  [Secrets service](#secrets-service)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
-  dispatch, runners, secrets and variables (global or per repository).
+  dispatch, runners, secrets and variables (global, per repository or per environment),
+  environments.
 
 Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
 artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
@@ -249,12 +257,118 @@ by hand show their login. Membership is checked when someone signs in, and GitHu
 week. Removing a user or organization from the list signs out everyone signed in with GitHub,
 and so does removing the app. The admin password keeps working, for the API and git too.
 
+## Environments
+
+A repository's environments (its **Environments** tab, or `/api/repos/OWNER/NAME/environments`)
+are deployment targets, as on GitHub. Each has secrets and variables of its own, and a job that
+names it gets them on top of the repository's and the global ones, which they override:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: deploy
+    environment:
+      name: production                       # or just `environment: production`
+      url: https://app.example.com           # shown on the job's page
+    steps:
+      - run: ./deploy.sh --region "${{ vars.REGION }}"
+        env:
+          TOKEN: ${{ secrets.DEPLOY_TOKEN }} # production's, if it has one
+```
+
+The name and url can use `github`, `inputs`, `vars`, `needs` and `matrix` (not `steps`).
+Names ignore case; a job naming an environment that doesn't exist runs without environment
+values, and its log says so.
+
+An environment's **refs** limit which runs may use it, like GitHub's deployment branches: a job
+of a run from any other ref fails, saying why. With no refs any run may use it. Its secrets go
+only to runs from protected refs either way, so refs narrow who gets them: for example, protect
+`release/*` for the repository's own secrets but limit `production` to `main`. Patterns are as
+for protected refs (`main`, `release/*`, `refs/tags/v*`).
+
+```sh
+curl -u admin -d '{"name":"production","refs":["main"]}' https://SERVER/api/repos/OWNER/NAME/environments
+curl -u admin -X PUT -d '{"name":"DEPLOY_TOKEN","value":"..."}' \
+  'https://SERVER/api/secrets?repo=OWNER/NAME&environment=production'
+curl -u admin -X PUT -d '{"name":"REGION","value":"nz"}' \
+  'https://SERVER/api/variables?repo=OWNER/NAME&environment=production'
+```
+
+`PATCH .../environments/NAME` with `{"refs": [...]}` changes the refs; `DELETE` removes the
+environment with its secrets and variables.
+
+## Secrets service
+
+By default the server encrypts secrets with its own key and sends them to agents with their
+jobs, so anyone who gets the server, or its database together with its key, gets every secret.
+Instead, the server can be given only the **public key** of a secrets service that runs
+somewhere else, such as next to the runners on an internal network. Secrets are then sealed to
+that key (HPKE: X25519, HKDF-SHA256, AES-256-GCM) and the server can't read them; the UI seals
+them in the browser, so it never even sees them. Each value is bound to its repository,
+environment and name, so it can't be moved to another and opened there.
+
+When a job starts, its agent asks its secrets service for the job's sealed secrets, sending the
+job's token. The service asks the server which running job the token belongs to and for that
+job's sealed secrets, checks that the agent's client may open secrets of the job's repository and
+environment, opens them and hands them back. Runs that don't get secrets (unprotected refs) get
+none from the service either. The service logs every secret it opens, with the job, run, ref,
+workflow and runner.
+
+```sh
+# Where the service runs: a key pair, and a token for the agents
+kiwicd-secrets keygen --out /etc/kiwicd-secrets/key           # prints KIWICD_SECRETS_PUBLIC_KEY=...
+kiwicd-secrets token runners --allow 'owner/*,owner/app@production' > runners.token
+# ...which also prints the entry for clients.json:
+#   {"clients": [{"name": "runners", "token_sha256": "...", "allow": ["owner/*", "owner/app@production"]}]}
+kiwicd-secrets serve --server https://SERVER --key /etc/kiwicd-secrets/key \
+  --clients /etc/kiwicd-secrets/clients.json --listen :8091 [--tls-cert FILE --tls-key FILE]
+
+# The server: seal to the public key
+KIWICD_SECRETS_PUBLIC_KEY=... kiwicd-server ...
+
+# The agents: where the service is, and their token
+kiwicd-agent run --secrets-url https://secrets.internal:8091 --secrets-token-file runners.token
+```
+
+A client's `allow` patterns say whose secrets it may open: `OWNER/REPO` for jobs without an
+environment and `OWNER/REPO@ENVIRONMENT` for jobs with one (`*` matches within a path segment, so
+`*/*` is every repository and `*/*@*` every environment). Give a deploy runner its own client
+with `owner/app@production`, and keep production out of the general runners' `*/*`: then a
+compromised server can't have production's secrets opened on a runner that isn't meant for them.
+
+Then, under **Settings → Secrets encryption**, seal the secrets stored before the key was set
+(`POST /api/secrets/reseal`); until then the server can still read those, and sends them to
+agents as before. A job with sealed secrets fails on an agent without `--secrets-url`.
+`PUT /api/secrets` still takes `value` and seals it on the server; to keep values off the server
+entirely, seal them first and send `encrypted_value`:
+
+```sh
+printf %s "$TOKEN" | kiwicd-secrets seal --public-key KEY --repo owner/app --environment production DEPLOY_TOKEN |
+  curl -u admin -X PUT -d @- 'https://SERVER/api/secrets?repo=owner/app&environment=production'
+```
+
+**Back up the private key**: secrets sealed to it can't be recovered without it. To rotate, make a
+new key, run the service with `--key NEW,OLD`, start the server with the new public key and
+update the secrets (the settings page counts those still sealed to an older key), then drop the
+old key. The service keeps no state besides its key and clients file; it should reach the
+server over https, and agents should reach it over TLS or a private network.
+
+What this protects against: a stolen database, backup or server disk, and anyone who can read the
+server but not run jobs on it. What it doesn't: the server still decides which workflow runs and
+gets secrets, so someone in control of it could run a workflow that sends secrets elsewhere, on a
+runner whose client may open them. The service's `allow` patterns and its log limit and record
+that. The UI's JavaScript and the public key it seals to come from the server too,
+so for values that must stay safe from a server someone else controls, seal them with
+`kiwicd-secrets seal` and a public key you got from the service (`kiwicd-secrets public-key`).
+
 ## Layout
 
 | Path | |
 |---|---|
 | `cmd/kiwicd-server`, `internal/server` | HTTP API, git hosting, scheduler, SQLite store |
 | `cmd/kiwicd-agent`, `internal/agent` | Registration, polling, running jobs with act, log reporting |
+| `cmd/kiwicd-secrets`, `internal/secretsservice` | The secrets service, which opens sealed secrets for agents |
+| `internal/sealed` | Sealing secrets to a public key (HPKE); `web/src/seal.ts` does the same in the browser |
 | `internal/protocol` | Types shared by server and agent |
 | `internal/wf` | Job-level expression evaluation and trigger filters on top of act |
 | `web/` | React UI (Vite), embedded into the server binary from `web/dist` |
@@ -292,7 +406,9 @@ Tests: `go test ./internal/...`.
 
 `--labels` takes act_runner-style specs: `name` or `name:host` runs jobs on the agent's machine;
 `name:docker://IMAGE` runs them in a container (needs Docker). Remote actions are cloned from
-`https://github.com` (`--actions-url`).
+`https://github.com` (`--actions-url`). With a [secrets service](#secrets-service), give the
+agent `--secrets-url URL` (`KIWICD_SECRETS_URL`) and its token in `KIWICD_SECRETS_TOKEN` or a file
+(`--secrets-token-file`).
 
 ### Isolating jobs
 
@@ -348,11 +464,13 @@ keeps them all for protected refs and jobs from other refs don't run at all.
 | `--max-log-bytes` / `KIWICD_MAX_LOG_BYTES` | Most log bytes stored per job (default 104857600). Lines longer than 64 KiB are cut |
 | `--github-url` / `KIWICD_GITHUB_URL` | GitHub's web URL, for the GitHub App and signing in (default `https://github.com`; GitHub Enterprise: `https://HOST`) |
 | `--github-api-url` / `KIWICD_GITHUB_API_URL` | GitHub's API URL (default `https://api.github.com`; GitHub Enterprise: `https://HOST/api/v3`) |
+| `--secrets-public-key` / `KIWICD_SECRETS_PUBLIC_KEY` | The [secrets service](#secrets-service)'s public key (`kiwicd-secrets keygen`): secrets are sealed to it, so the server can't read them |
 | `KIWICD_SECRET_KEY` | Key that encrypts secrets and SSH deploy keys in the database: 32 bytes as base64 or hex (`openssl rand -base64 32`). Default: `<data>/secret.key`, generated on first start |
 
 #### The secret key
 
-Secret values, mirror deploy keys and the GitHub App's credentials are stored encrypted (AES-256-GCM). The key is
+Secret values (unless they're sealed for a [secrets service](#secrets-service)), mirror deploy
+keys and the GitHub App's credentials are stored encrypted (AES-256-GCM). The key is
 `KIWICD_SECRET_KEY` or, if that's unset, `<data>/secret.key` (mode 0600), which the server
 generates on first start. **Back the key up separately from the database**: a backup of the
 database alone doesn't reveal any secrets, and without the key it can't be decrypted.

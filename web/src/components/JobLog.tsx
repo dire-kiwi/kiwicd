@@ -211,6 +211,19 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
             ))}
           </span>
         )}
+        {job.environment && (
+          <span>
+            <span className="muted">environment</span> <strong>{job.environment}</strong>
+            {job.environment_url && /^https?:\/\//.test(job.environment_url) && (
+              <>
+                {" "}
+                <a href={job.environment_url} target="_blank" rel="noreferrer noopener" className="mono">
+                  {job.environment_url}
+                </a>
+              </>
+            )}
+          </span>
+        )}
         {matrix && (
           <span>
             <span className="muted">matrix</span> <span className="mono">{matrix}</span>

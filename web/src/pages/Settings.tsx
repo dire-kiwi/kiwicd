@@ -1,4 +1,5 @@
 import { GitHubAppSettings } from "../components/GitHubApp";
+import { SecretsKeySettings } from "../components/SecretsKey";
 import { SettingsTable } from "../components/SettingsTable";
 import { useDocumentTitle } from "../hooks";
 
@@ -13,6 +14,7 @@ export function SettingsPage() {
         </div>
       </div>
       <div className="stack">
+        <SecretsKeySettings />
         <SettingsTable kind="secrets" />
         <SettingsTable kind="variables" />
         <GitHubAppSettings />

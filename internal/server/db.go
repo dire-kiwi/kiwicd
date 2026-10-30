@@ -100,7 +100,7 @@ CREATE TABLE IF NOT EXISTS registration_tokens (
 CREATE TABLE IF NOT EXISTS secrets (
 	repo_id INTEGER NOT NULL,           -- 0 = all repositories
 	name TEXT NOT NULL,
-	value TEXT NOT NULL,                -- encrypted, see secretbox.go
+	value TEXT NOT NULL,                -- encrypted, see secrets.go
 	updated_at INTEGER NOT NULL,
 	PRIMARY KEY (repo_id, name)
 );
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS environments (
 CREATE TABLE IF NOT EXISTS environment_secrets (
 	environment_id INTEGER NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
 	name TEXT NOT NULL,
-	value TEXT NOT NULL,                -- encrypted, see secretbox.go
+	value TEXT NOT NULL,                -- encrypted, see secrets.go
 	updated_at INTEGER NOT NULL,
 	PRIMARY KEY (environment_id, name)
 );
