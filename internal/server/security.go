@@ -176,7 +176,8 @@ const purposePasswordCheck = "meta.admin_password_check"
 
 // expireSessionsOnPasswordChange logs everyone out when the admin password
 // has changed since the last start, so rotating a leaked password also
-// revokes the sessions made with it. Sessions of GitHub logins stay. The meta row holds the password's hash
+// revokes the sessions and API tokens made with it. Sessions and tokens of
+// GitHub logins stay. The meta row holds the password's hash
 // sealed with the secret key, which can't be checked without that key.
 func (s *Server) expireSessionsOnPasswordChange() error {
 	sum := sha256.Sum256([]byte(s.cfg.AdminPassword))
@@ -197,6 +198,9 @@ func (s *Server) expireSessionsOnPasswordChange() error {
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
 			s.log.Info("the admin password changed: logged out all sessions", "sessions", n)
+		}
+		if err := s.deleteTokens(false, "the admin password changed"); err != nil {
+			return err
 		}
 	}
 	_, err = s.db.Exec(`INSERT INTO meta (name, value) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value`,
