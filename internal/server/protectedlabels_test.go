@@ -98,7 +98,7 @@ func TestProtectedLabels(t *testing.T) {
 	plain := &Runner{ID: 2, Name: "plain", Labels: normalizeLabels(nil, "linux", "amd64")}
 	assign := func(rn *Runner) int64 {
 		t.Helper()
-		req, err := srv.assignJob(ctx, rn, ts.URL)
+		req, err := srv.assignJob(ctx, rn, ts.URL, false)
 		if err != nil {
 			t.Fatal(err)
 		}

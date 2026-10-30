@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"time"
@@ -338,99 +337,4 @@ func (s *Server) handleRegistrationToken(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, map[string]any{"token": token, "expires_at": exp.UnixMilli(), "url": s.publicURL(r)})
-}
-
-// ---------------------------------------------------------------- secrets / variables
-
-var settingNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-
-func (s *Server) settingRepoID(r *http.Request) (int64, error) {
-	name := r.URL.Query().Get("repo")
-	if name == "" {
-		return 0, nil
-	}
-	repo, err := s.getRepo(name)
-	if err != nil {
-		return 0, fmt.Errorf("no such repository %s", name)
-	}
-	return repo.ID, nil
-}
-
-func (s *Server) handleListSettings(table string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		repoID, err := s.settingRepoID(r)
-		if err != nil {
-			httpError(w, 404, "%v", err)
-			return
-		}
-		rows, err := s.db.Query(`SELECT name, value, updated_at FROM `+table+` WHERE repo_id = ? ORDER BY name`, repoID)
-		if err != nil {
-			httpError(w, 500, "%v", err)
-			return
-		}
-		defer rows.Close()
-		type item struct {
-			Name      string `json:"name"`
-			Value     string `json:"value,omitempty"`
-			UpdatedAt int64  `json:"updated_at"`
-		}
-		out := []item{}
-		for rows.Next() {
-			var it item
-			_ = rows.Scan(&it.Name, &it.Value, &it.UpdatedAt)
-			if table == "secrets" {
-				it.Value = "" // secrets are write-only
-			}
-			out = append(out, it)
-		}
-		writeJSON(w, out)
-	}
-}
-
-func (s *Server) handlePutSetting(table string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		repoID, err := s.settingRepoID(r)
-		if err != nil {
-			httpError(w, 404, "%v", err)
-			return
-		}
-		var req struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
-		}
-		if err := readJSON(r, &req); err != nil {
-			httpError(w, 400, "bad request: %v", err)
-			return
-		}
-		if !settingNameRE.MatchString(req.Name) {
-			httpError(w, 400, "names may contain only letters, digits and underscores, and must not start with a digit")
-			return
-		}
-		value := req.Value
-		if table == "secrets" {
-			value = s.box.seal(purposeSecret, value)
-		}
-		_, err = s.db.Exec(`INSERT INTO `+table+` (repo_id, name, value, updated_at) VALUES (?, ?, ?, ?)
-			ON CONFLICT (repo_id, name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, repoID, req.Name, value, nowMS())
-		if err != nil {
-			httpError(w, 500, "%v", err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-	}
-}
-
-func (s *Server) handleDeleteSetting(table string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		repoID, err := s.settingRepoID(r)
-		if err != nil {
-			httpError(w, 404, "%v", err)
-			return
-		}
-		if _, err := s.db.Exec(`DELETE FROM `+table+` WHERE repo_id = ? AND name = ?`, repoID, r.URL.Query().Get("name")); err != nil {
-			httpError(w, 500, "%v", err)
-			return
-		}
-		writeJSON(w, map[string]bool{"ok": true})
-	}
 }

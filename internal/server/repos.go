@@ -265,7 +265,7 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.ProtectedRefs != nil {
-		if repo.ProtectedRefs, err = cleanProtectedRefs(*req.ProtectedRefs); err != nil {
+		if repo.ProtectedRefs, err = cleanRefPatterns(*req.ProtectedRefs); err != nil {
 			httpError(w, 400, "%v", err)
 			return
 		}

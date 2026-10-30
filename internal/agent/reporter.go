@@ -104,6 +104,17 @@ func sortLongestFirst(masks []string) {
 	sort.SliceStable(masks, func(i, j int) bool { return len(masks[i]) > len(masks[j]) })
 }
 
+// addSecrets masks more secrets, those the agent got from its secrets
+// service. It is called before act starts, so maskSecrets needs no lock.
+func (r *reporter) addSecrets(secrets map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, v := range secrets {
+		r.secrets = append(r.secrets, maskValues(v)...)
+	}
+	sortLongestFirst(r.secrets)
+}
+
 // maskSecrets hides the job's secrets in s.
 func (r *reporter) maskSecrets(s string) string {
 	for _, v := range r.secrets {

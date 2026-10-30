@@ -651,3 +651,64 @@ func ToString(v any) string {
 		return string(b)
 	}
 }
+
+// JobEnvironment is the deployment environment a job names.
+type JobEnvironment struct {
+	Name string
+	URL  string
+}
+
+// Environment evaluates the job's environment (src is the workflow file,
+// since act's model doesn't keep it): a name, or a mapping with name and url.
+// Expressions can use github, inputs, vars, needs and matrix. A url that
+// can't be evaluated, such as one using steps, or isn't http(s) is left out.
+func (e *Env) Environment(src []byte) (JobEnvironment, error) {
+	var doc struct {
+		Jobs map[string]struct {
+			Environment yaml.Node `yaml:"environment"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return JobEnvironment{}, err
+	}
+	node := doc.Jobs[e.JobID].Environment
+	var out JobEnvironment
+	var nameNode, urlNode *yaml.Node
+	switch node.Kind {
+	case 0:
+		return out, nil
+	case yaml.ScalarNode:
+		nameNode = &node
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			switch node.Content[i].Value {
+			case "name":
+				nameNode = node.Content[i+1]
+			case "url":
+				urlNode = node.Content[i+1]
+			}
+		}
+		if nameNode == nil {
+			return out, fmt.Errorf("environment: the name is missing")
+		}
+	default:
+		return out, fmt.Errorf("environment must be a name or a mapping with name and url")
+	}
+	v, err := e.Interpolate(nameNode.Value)
+	if err != nil {
+		return out, fmt.Errorf("environment: %w", err)
+	}
+	out.Name = strings.TrimSpace(ToString(v))
+	if out.Name == "" {
+		return JobEnvironment{}, nil
+	}
+	if urlNode != nil {
+		if v, err := e.Interpolate(urlNode.Value); err == nil {
+			u := strings.TrimSpace(ToString(v))
+			if strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://") {
+				out.URL = u
+			}
+		}
+	}
+	return out, nil
+}

@@ -159,7 +159,7 @@ func TestRepositoryPush(t *testing.T) {
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("jobs: %v %v", jobs, err)
 	}
-	req, err := srv.buildJobRequest(jobs[0], ts.URL)
+	req, err := srv.buildJobRequest(jobs[0], &Runner{Name: "r"}, ts.URL, false)
 	if err != nil {
 		t.Fatal(err)
 	}

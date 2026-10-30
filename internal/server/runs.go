@@ -58,35 +58,38 @@ func (s *Server) getRun(id int64) (*Run, error) {
 }
 
 type Job struct {
-	ID         int64                `json:"id"`
-	RunID      int64                `json:"run_id"`
-	Key        string               `json:"key"`
-	Name       string               `json:"name"`
-	Matrix     map[string]any       `json:"matrix"`
-	RunsOn     []string             `json:"runs_on"`
-	Status     string               `json:"status"`
-	Conclusion string               `json:"conclusion"`
-	Error      string               `json:"error"`
-	RunnerID   int64                `json:"runner_id"`
-	RunnerName string               `json:"runner_name"`
-	Outputs    map[string]string    `json:"outputs"`
-	Steps      []protocol.StepState `json:"steps"`
-	Cancel     bool                 `json:"cancel_requested"`
-	LogSeq     int64                `json:"log_seq"`
-	CreatedAt  int64                `json:"created_at"`
-	StartedAt  int64                `json:"started_at"`
-	FinishedAt int64                `json:"finished_at"`
-	Heartbeat  int64                `json:"-"`
+	ID         int64          `json:"id"`
+	RunID      int64          `json:"run_id"`
+	Key        string         `json:"key"`
+	Name       string         `json:"name"`
+	Matrix     map[string]any `json:"matrix"`
+	RunsOn     []string       `json:"runs_on"`
+	Status     string         `json:"status"`
+	Conclusion string         `json:"conclusion"`
+	Error      string         `json:"error"`
+	RunnerID   int64          `json:"runner_id"`
+	RunnerName string         `json:"runner_name"`
+	// The deployment environment the workflow names, and its URL.
+	Environment    string               `json:"environment,omitempty"`
+	EnvironmentURL string               `json:"environment_url,omitempty"`
+	Outputs        map[string]string    `json:"outputs"`
+	Steps          []protocol.StepState `json:"steps"`
+	Cancel         bool                 `json:"cancel_requested"`
+	LogSeq         int64                `json:"log_seq"`
+	CreatedAt      int64                `json:"created_at"`
+	StartedAt      int64                `json:"started_at"`
+	FinishedAt     int64                `json:"finished_at"`
+	Heartbeat      int64                `json:"-"`
 }
 
 const jobCols = `id, run_id, job_key, name, matrix, runs_on, status, conclusion, error, runner_id, runner_name, outputs, steps,
-	cancel_requested, log_seq, created_at, started_at, finished_at, heartbeat_at`
+	cancel_requested, log_seq, created_at, started_at, finished_at, heartbeat_at, environment, environment_url`
 
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var matrix, runsOn, outputs, steps string
 	if err := row.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &matrix, &runsOn, &j.Status, &j.Conclusion, &j.Error, &j.RunnerID, &j.RunnerName,
-		&outputs, &steps, &j.Cancel, &j.LogSeq, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Heartbeat); err != nil {
+		&outputs, &steps, &j.Cancel, &j.LogSeq, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Heartbeat, &j.Environment, &j.EnvironmentURL); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(matrix), &j.Matrix)
@@ -244,39 +247,11 @@ func aggregate(rows []*Job) (wf.JobResult, bool) {
 	return res, true
 }
 
-func (s *Server) varsFor(repoID int64) map[string]string {
-	return s.settingsMap("variables", repoID)
-}
-
-// secretsFor decrypts the secrets a repository's jobs get.
-func (s *Server) secretsFor(repoID int64) (map[string]string, error) {
-	out := s.settingsMap("secrets", repoID)
-	for k, v := range out {
-		plain, err := s.box.open(purposeSecret, v)
-		if err != nil {
-			return nil, fmt.Errorf("secret %s: %w", k, err)
-		}
-		out[k] = plain
-	}
-	return out, nil
-}
-
-func (s *Server) settingsMap(table string, repoID int64) map[string]string {
-	out := map[string]string{}
-	rows, err := s.db.Query(`SELECT name, value FROM `+table+` WHERE repo_id = 0 OR repo_id = ? ORDER BY repo_id`, repoID)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var k, v string
-		_ = rows.Scan(&k, &v)
-		out[k] = v // repository values override global ones
-	}
-	return out
-}
-
 func (s *Server) insertJob(runID int64, key, name string, matrix map[string]any, runsOn []string, status, conclusion, errText string) error {
+	return s.insertEnvironmentJob(runID, key, name, matrix, runsOn, wf.JobEnvironment{}, status, conclusion, errText)
+}
+
+func (s *Server) insertEnvironmentJob(runID int64, key, name string, matrix map[string]any, runsOn []string, env wf.JobEnvironment, status, conclusion, errText string) error {
 	finished := int64(0)
 	if status == protocol.StatusCompleted {
 		finished = nowMS()
@@ -284,8 +259,8 @@ func (s *Server) insertJob(runID int64, key, name string, matrix map[string]any,
 	if runsOn == nil {
 		runsOn = []string{}
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (run_id, job_key, name, matrix, runs_on, status, conclusion, error, created_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, key, name, mustJSON(matrix), mustJSON(runsOn), status, conclusion, errText, nowMS(), finished)
+	_, err := s.db.Exec(`INSERT INTO jobs (run_id, job_key, name, matrix, runs_on, status, conclusion, error, created_at, finished_at, environment, environment_url)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, key, name, mustJSON(matrix), mustJSON(runsOn), status, conclusion, errText, nowMS(), finished, env.Name, env.URL)
 	return err
 }
 
@@ -318,7 +293,7 @@ func (s *Server) advanceLocked(ctx context.Context, runID int64) error {
 	}
 	order, _ := wf.Order(workflow)
 	ghc := s.githubContext(run)
-	vars := s.varsFor(run.RepoID)
+	vars := s.varsFor(run.RepoID, nil)
 	inputs, _ := run.EventJSON["inputs"].(map[string]any)
 	queued := false
 
@@ -409,7 +384,23 @@ func (s *Server) advanceLocked(ctx context.Context, runID int64) error {
 					}
 					continue
 				}
-				if err := s.insertJob(runID, key, name, combo, labels, protocol.StatusQueued, "", ""); err != nil {
+				deploy, err := env.Environment([]byte(run.WorkflowYAML))
+				msg := ""
+				if err != nil {
+					msg = err.Error()
+				} else if deploy.Name != "" {
+					if e, err := s.getEnvironment(run.RepoID, deploy.Name); err == nil {
+						deploy.Name = e.Name
+						msg = environmentDenied(e, run)
+					}
+				}
+				if msg != "" {
+					if err := s.insertEnvironmentJob(runID, key, name, combo, labels, deploy, protocol.StatusCompleted, protocol.ResultFailure, msg); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := s.insertEnvironmentJob(runID, key, name, combo, labels, deploy, protocol.StatusQueued, "", ""); err != nil {
 					return err
 				}
 				queued = true

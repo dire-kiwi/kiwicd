@@ -110,6 +110,9 @@ export interface Job {
   error: string;
   runner_id: number;
   runner_name: string;
+  /** The deployment environment the job uses, and its URL. */
+  environment?: string;
+  environment_url?: string;
   outputs: Record<string, string> | null;
   steps: Step[] | null;
   cancel_requested: boolean;
@@ -170,6 +173,28 @@ export interface Setting {
   name: string;
   value?: string;
   updated_at: number;
+  /** Secrets: the public key the value is sealed to; absent if the server can read it. */
+  key_id?: string;
+}
+
+/** The secrets service's public key, if the server has one, and how many secrets aren't sealed to it. */
+export interface SecretsKey {
+  public_key?: string;
+  key_id?: string;
+  /** Secrets encrypted with the server's own key, which it can read. */
+  server_sealed: number;
+  /** Secrets sealed to another public key. */
+  other_key: number;
+}
+
+export interface Environment {
+  id: number;
+  name: string;
+  /** Ref patterns that may use it; empty means any. */
+  refs: string[];
+  created_at: number;
+  secrets: number;
+  variables: number;
 }
 
 export interface GitHubApp {

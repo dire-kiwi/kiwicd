@@ -36,13 +36,13 @@ func TestRefProtected(t *testing.T) {
 		t.Error("** doesn't protect every branch")
 	}
 
-	got, err := cleanProtectedRefs([]string{" stable ", "release/*", "stable", "", "refs/tags/v*"})
+	got, err := cleanRefPatterns([]string{" stable ", "release/*", "stable", "", "refs/tags/v*"})
 	if err != nil || strings.Join(got, ",") != "refs/tags/v*,release/*,stable" {
-		t.Errorf("cleanProtectedRefs: %v %v", got, err)
+		t.Errorf("cleanRefPatterns: %v %v", got, err)
 	}
 	for _, bad := range []string{"!main", "refs/pull/*", "["} {
-		if _, err := cleanProtectedRefs([]string{bad}); err == nil {
-			t.Errorf("cleanProtectedRefs accepted %q", bad)
+		if _, err := cleanRefPatterns([]string{bad}); err == nil {
+			t.Errorf("cleanRefPatterns accepted %q", bad)
 		}
 	}
 }
@@ -117,7 +117,7 @@ func TestSecretsOnlyForProtectedRefs(t *testing.T) {
 		if err != nil || len(jobs) == 0 {
 			t.Fatalf("jobs of run %d: %v %v", run.ID, jobs, err)
 		}
-		req, err := srv.buildJobRequest(jobs[0], ts.URL)
+		req, err := srv.buildJobRequest(jobs[0], &Runner{Name: "r"}, ts.URL, false)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -239,7 +239,7 @@ func TestRepositoryPullRequest(t *testing.T) {
 	if len(jobs) != 1 || jobs[0].Status != protocol.StatusQueued {
 		t.Fatalf("jobs of the first preview: %+v", jobs)
 	}
-	jobReq, err := srv.buildJobRequest(jobs[0], ts.URL)
+	jobReq, err := srv.buildJobRequest(jobs[0], &Runner{Name: "r"}, ts.URL, false)
 	if err != nil {
 		t.Fatal(err)
 	}

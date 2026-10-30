@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dire-kiwi/kiwicd/internal/sealed"
 )
 
 type Config struct {
@@ -37,6 +39,10 @@ type Config struct {
 	// SecretKey encrypts secrets and SSH keys in the database (base64 or hex,
 	// 32 bytes). If empty, <data>/secret.key is used, and made if missing.
 	SecretKey string
+	// SecretsPublicKey, if set, is the secrets service's public key (base64
+	// X25519): secrets are sealed to it, so the server can't read them, and
+	// agents get them from the service (see secrets.go).
+	SecretsPublicKey string
 	// ClientIPHeader names the header a reverse proxy puts the client's
 	// address in (X-Forwarded-For, CF-Connecting-IP), for limiting wrong
 	// passwords per client. Only set it when every request comes through
@@ -65,8 +71,10 @@ type Server struct {
 	cfg Config
 	db  *sql.DB
 	box *secretBox
-	log *slog.Logger
-	hub *hub
+	// sealKey is the secrets service's public key, or nil.
+	sealKey *sealed.PublicKey
+	log     *slog.Logger
+	hub     *hub
 
 	limiter      *passwordLimiter
 	proxyWarning sync.Once
@@ -128,6 +136,12 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	var sealKey *sealed.PublicKey
+	if cfg.SecretsPublicKey != "" {
+		if sealKey, err = sealed.ParsePublicKey(cfg.SecretsPublicKey); err != nil {
+			return nil, fmt.Errorf("secrets public key: %w", err)
+		}
+	}
 	// Git commands run in other directories, so relative paths into the data
 	// directory would resolve from the wrong place.
 	dataDir, err := filepath.Abs(cfg.DataDir)
@@ -155,6 +169,7 @@ func New(cfg Config) (*Server, error) {
 		cfg:             cfg,
 		db:              db,
 		box:             box,
+		sealKey:         sealKey,
 		log:             slog.Default(),
 		hub:             newHub(),
 		limiter:         newPasswordLimiter(),
@@ -169,6 +184,14 @@ func New(cfg Config) (*Server, error) {
 	if err := s.expireSessionsOnPasswordChange(); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if sealKey != nil {
+		var n int
+		_ = db.QueryRow(`SELECT (SELECT count(*) FROM secrets WHERE value NOT LIKE 'pk1:%') + (SELECT count(*) FROM environment_secrets WHERE value NOT LIKE 'pk1:%')`).Scan(&n)
+		s.log.Info("sealing secrets to the secrets service's public key", "key", sealKey.ID())
+		if n > 0 {
+			s.log.Warn("some secrets are still encrypted with the server's own key, so the server can read them; reseal them in Settings → Secrets", "count", n)
+		}
 	}
 	return s, nil
 }
@@ -252,6 +275,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/runners/{id}", ui(s.handleDeleteRunner))
 	mux.Handle("POST /api/runners/registration-token", ui(s.handleRegistrationToken))
 
+	mux.Handle("GET /api/repos/{owner}/{name}/environments", ui(s.handleListEnvironments))
+	mux.Handle("POST /api/repos/{owner}/{name}/environments", ui(s.handleCreateEnvironment))
+	mux.Handle("PATCH /api/repos/{owner}/{name}/environments/{env}", ui(s.handleUpdateEnvironment))
+	mux.Handle("DELETE /api/repos/{owner}/{name}/environments/{env}", ui(s.handleDeleteEnvironment))
+
+	mux.Handle("GET /api/secrets/key", ui(s.handleSecretsKey))
+	mux.Handle("POST /api/secrets/reseal", ui(s.handleResealSecrets))
 	mux.Handle("GET /api/secrets", ui(s.handleListSettings("secrets")))
 	mux.Handle("PUT /api/secrets", ui(s.handlePutSetting("secrets")))
 	mux.Handle("DELETE /api/secrets", ui(s.handleDeleteSetting("secrets")))
@@ -266,6 +296,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/runner/jobs/{id}/update", s.handleRunnerUpdate)
 	mux.HandleFunc("POST /api/runner/jobs/{id}/complete", s.handleRunnerComplete)
 	mux.HandleFunc("GET /api/runner/jobs/{id}/source", s.handleRunnerSource)
+	mux.HandleFunc("GET /api/secrets-service/job", s.handleSecretsServiceJob)
 
 	mux.HandleFunc("/git/", s.handleGit)
 	mux.HandleFunc("/", s.handleStatic)

@@ -1,26 +1,38 @@
 import { useState, type FormEvent } from "react";
 import { del, errorMessage, put } from "../api";
 import { useFetch } from "../hooks";
-import type { Setting } from "../types";
+import { seal } from "../seal";
+import type { SecretsKey, Setting } from "../types";
 import { absoluteTime, relativeTime } from "../util";
-import { Empty, ErrorBox, Modal, Spinner } from "./ui";
+import { Chip, Empty, ErrorBox, Modal, Spinner } from "./ui";
 
 type Kind = "secrets" | "variables";
 
-/** CRUD table for secrets or variables, global (no repo) or repo-scoped. */
-export function SettingsTable({ kind, repo }: { kind: Kind; repo?: string }) {
-  const q = repo ? `?repo=${encodeURIComponent(repo)}` : "";
-  const list = useFetch<Setting[]>(`/api/${kind}${q}`);
+/** "?repo=…&environment=…" for a scope, followed by extra parameters. */
+function scopeQuery(repo?: string, environment?: string, extra: Record<string, string> = {}): string {
+  const q = new URLSearchParams();
+  if (repo) q.set("repo", repo);
+  if (environment) q.set("environment", environment);
+  for (const [k, v] of Object.entries(extra)) q.set(k, v);
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+/** CRUD table for secrets or variables: global (no repo), a repository's, or one of its environments'. */
+export function SettingsTable({ kind, repo, environment }: { kind: Kind; repo?: string; environment?: string }) {
+  const list = useFetch<Setting[]>(`/api/${kind}${scopeQuery(repo, environment)}`);
+  const secret = kind === "secrets";
+  const key = useFetch<SecretsKey>(secret ? "/api/secrets/key" : null);
   const [editing, setEditing] = useState<{ name: string; value: string; isNew: boolean } | null>(null);
   const [actionError, setActionError] = useState<string>();
-  const secret = kind === "secrets";
   const noun = secret ? "secret" : "variable";
+  const keyID = key.data?.key_id;
 
   const remove = async (name: string) => {
     if (!window.confirm(`Delete ${noun} ${name}?`)) return;
     setActionError(undefined);
     try {
-      await del(`/api/${kind}?${repo ? `repo=${encodeURIComponent(repo)}&` : ""}name=${encodeURIComponent(name)}`);
+      await del(`/api/${kind}${scopeQuery(repo, environment, { name })}`);
       list.reload();
     } catch (e) {
       setActionError(errorMessage(e));
@@ -36,11 +48,16 @@ export function SettingsTable({ kind, repo }: { kind: Kind; repo?: string }) {
             {secret
               ? <>Encrypted values available to workflows as <code>{"${{ secrets.NAME }}"}</code>. Values are write-only and masked in logs.</>
               : <>Plain-text configuration available to workflows as <code>{"${{ vars.NAME }}"}</code>.</>}
-            {repo ? " Repository values override global ones." : " Global values apply to every repository."}
+            {environment
+              ? " Jobs that deploy to this environment get them, over the repository's and the global ones."
+              : repo
+                ? " Repository values override global ones; an environment's override both."
+                : " Global values apply to every repository."}
             {secret &&
               (repo
                 ? " Only runs from protected refs get them: the default branch and the refs chosen in Settings."
                 : " Only runs from each repository's protected refs get them: its default branch and the refs chosen in its settings.")}
+            {secret && keyID && " They are sealed in your browser to the secrets service's public key, so the server can't read them."}
           </p>
         </div>
         <button className="btn btn-primary" onClick={() => setEditing({ name: "", value: "", isNew: true })}>
@@ -62,6 +79,14 @@ export function SettingsTable({ kind, repo }: { kind: Kind; repo?: string }) {
               <div className="setting-main">
                 <code className="setting-name">{s.name}</code>
                 {!secret && <span className="setting-value mono" title={s.value}>{s.value}</span>}
+                {secret && keyID && !s.key_id && (
+                  <Chip title="Encrypted with the server's own key, so the server can read it. Reseal secrets in Settings, or update it.">
+                    server key
+                  </Chip>
+                )}
+                {secret && keyID && s.key_id && s.key_id !== keyID && (
+                  <Chip title={`Sealed to an older public key (${s.key_id}). Update it to seal it to the current one (${keyID}).`}>old key</Chip>
+                )}
               </div>
               <span className="muted small nowrap" title={absoluteTime(s.updated_at)}>
                 Updated {relativeTime(s.updated_at)}
@@ -82,6 +107,8 @@ export function SettingsTable({ kind, repo }: { kind: Kind; repo?: string }) {
         <SettingEditor
           kind={kind}
           repo={repo}
+          environment={environment}
+          publicKey={key.data?.public_key}
           initial={editing}
           onClose={() => setEditing(null)}
           onSaved={() => {
@@ -97,12 +124,17 @@ export function SettingsTable({ kind, repo }: { kind: Kind; repo?: string }) {
 function SettingEditor({
   kind,
   repo,
+  environment,
+  publicKey,
   initial,
   onClose,
   onSaved,
 }: {
   kind: Kind;
   repo?: string;
+  environment?: string;
+  /** The secrets service's public key to seal secrets to, if the server has one. */
+  publicKey?: string;
   initial: { name: string; value: string; isNew: boolean };
   onClose: () => void;
   onSaved: () => void;
@@ -121,7 +153,12 @@ function SettingEditor({
     setBusy(true);
     setError(undefined);
     try {
-      await put(`/api/${kind}${repo ? `?repo=${encodeURIComponent(repo)}` : ""}`, { name, value });
+      // With a public key, the server only ever sees the sealed value.
+      const body =
+        secret && publicKey
+          ? { name, encrypted_value: await seal(publicKey, { repository: repo, environment, name }, value) }
+          : { name, value };
+      await put(`/api/${kind}${scopeQuery(repo, environment)}`, body);
       onSaved();
     } catch (err) {
       setError(errorMessage(err));

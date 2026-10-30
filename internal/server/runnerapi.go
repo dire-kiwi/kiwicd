@@ -155,7 +155,7 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 	defer deadline.Stop()
 	for {
 		ready := s.jobsReadyChan()
-		job, err := s.assignJob(r.Context(), rn, s.publicURL(r))
+		job, err := s.assignJob(r.Context(), rn, s.publicURL(r), req.Unseal)
 		if err != nil {
 			httpError(w, 500, "%v", err)
 			return
@@ -176,8 +176,9 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // assignJob gives the oldest queued job whose runs-on labels the runner has
-// and whose run may use the runner's reserved and protected labels.
-func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*protocol.JobRequest, error) {
+// and whose run may use the runner's reserved and protected labels. unseal
+// says the agent has a secrets service for sealed secrets.
+func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string, unseal bool) (*protocol.JobRequest, error) {
 	s.mu.Lock()
 	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE status = ? ORDER BY id`, protocol.StatusQueued)
 	if err != nil {
@@ -232,7 +233,7 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 		s.mu.Unlock()
 		return nil, err
 	}
-	req, err := s.buildJobRequest(picked, baseURL)
+	req, err := s.buildJobRequest(picked, rn, baseURL, unseal)
 	s.mu.Unlock()
 	s.failDenied(ctx, denied)
 	if err != nil {
@@ -253,7 +254,7 @@ func (s *Server) failDenied(ctx context.Context, denied map[int64]string) {
 	}
 }
 
-func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, error) {
+func (s *Server) buildJobRequest(j *Job, rn *Runner, baseURL string, unseal bool) (*protocol.JobRequest, error) {
 	run, err := s.getRun(j.RunID)
 	if err != nil {
 		return nil, err
@@ -297,11 +298,27 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		"KIWICD_SERVER_URL":       server,
 		"KIWICD_RUN_URL":          fmt.Sprintf("%s/runs/%d", server, run.ID),
 	}
+	deploy, err := s.jobEnvironment(run, j)
+	if err != nil {
+		return nil, err
+	}
 	secrets := map[string]string{}
-	var notices []string
+	var sealedNames, notices []string
+	if j.Environment != "" && deploy == nil {
+		notices = append(notices, fmt.Sprintf("%s has no environment called %s, so this job gets no environment secrets or variables. "+
+			"Environments are set up in the repository's Environments tab.", run.Repo, j.Environment))
+	}
 	if s.runGetsSecrets(run) {
-		if secrets, err = s.secretsFor(run.RepoID); err != nil {
+		var sealedSecrets []protocol.SealedSecret
+		if secrets, sealedSecrets, err = s.jobSecrets(run.RepoID, deploy); err != nil {
 			return nil, err
+		}
+		for _, sec := range sealedSecrets {
+			sealedNames = append(sealedNames, sec.Name)
+		}
+		if len(sealedNames) > 0 && !unseal {
+			return nil, fmt.Errorf("this job's secrets %s are sealed for a secrets service, but runner %s has none "+
+				"(kiwicd-agent run --secrets-url), or its agent is too old to use one", strings.Join(sealedNames, ", "), rn.Name)
 		}
 	} else {
 		notices = append(notices, fmt.Sprintf("%s is not a protected ref of %s, so this job gets no secrets except KIWICD_TOKEN. "+
@@ -329,8 +346,10 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		EventName:      run.Event,
 		Event:          run.EventJSON,
 		Actor:          run.Actor,
+		Environment:    j.Environment,
 		Secrets:        secrets,
-		Vars:           s.varsFor(run.RepoID),
+		SealedSecrets:  sealedNames,
+		Vars:           s.varsFor(run.RepoID, deploy),
 		Notices:        notices,
 		Env:            env,
 		TimeoutMinutes: 360,
