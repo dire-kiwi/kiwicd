@@ -21,6 +21,10 @@ Each item has a rough **value** (how much it would help running real workflows o
 The first three make kiwicd usable as the CI of a GitHub repository rather than only its
 deployer; 4–8 are what common third-party workflows need to run unchanged.
 
+Tasks on the board (KIW-27 made them): 1 KIW-31, 2 KIW-32, 3 KIW-33, 6 KIW-34, 7 KIW-35,
+8 KIW-36; other triggers KIW-37; job-level concurrency and other workflow syntax KIW-38; runs and
+logs UI KIW-39; roles, API tokens and an audit log KIW-40.
+
 ## Triggers
 
 | Feature | Value | Effort | Notes |
