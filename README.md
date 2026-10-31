@@ -322,7 +322,7 @@ jobs:
   (see [Isolating jobs](#isolating-jobs)).
 - The agent removes a job's service containers, job container and network when the job ends or
   is cancelled, and those of jobs it didn't finish when it starts. They're named
-  `kiwicd-r<runner>-j<job>-...`.
+  `kiwicd-<agent>-j<job>-...` (see [Agents sharing a Docker daemon](#agents-sharing-a-docker-daemon)).
 - On agents that isolate jobs (`--job-image`), services join the job's own network, and the
   restrictions on container options and volumes apply to them as well. Their ports aren't
   published on the machine: jobs reach them by name, and `job.services.<id>.ports[<port>]` is
@@ -769,9 +769,9 @@ the job image. The agent needs Docker; its jobs don't get it. Also:
 
 - Each job has a bridge network of its own, so jobs can't reach each other's containers. Its
   services, `docker://` steps and the builds of its Docker actions use it too. The network's
-  interface is `--job-bridge-prefix` (default `kiwicd-`, at most 7 characters) plus the job ID,
-  so a firewall can match jobs' traffic, e.g. `iptables -I DOCKER-USER -i kiwicd-+ -d
-  10.0.0.0/8 -j DROP`.
+  interface is `--job-bridge-prefix` (default `kiwicd-`, at most 7 characters) plus 8
+  characters unique to the job, so a firewall can match jobs' traffic, e.g. `iptables -I
+  DOCKER-USER -i kiwicd-+ -d 10.0.0.0/8 -j DROP`.
 - Workflows may not give their `container` or `services` options or volumes that reach outside
   the container: host paths, named volumes (they outlive the job), `--privileged`, devices,
   capabilities, other namespaces, `--env-file`. Options such as `--health-cmd`, `--user`,
@@ -782,7 +782,7 @@ the job image. The agent needs Docker; its jobs don't get it. Also:
   step container, after the workflow's own, e.g. `--memory 4g --cpus 2 --pids-limit 4096`.
 - The agent removes each job's containers, volumes, networks and Docker action images when the
   job ends, and those of jobs it didn't finish when it starts. They're named
-  `kiwicd-r<runner>-j<job>-...`.
+  `kiwicd-<agent>-j<job>-...`.
 
 Container jobs don't get the Docker socket unless the agent is given one with `--docker-socket
 /var/run/docker.sock` (`KIWICD_DOCKER_SOCKET`), which hands its jobs the machine. Give it only to
@@ -794,6 +794,18 @@ LABEL` and give those runners the label. Jobs from other refs that ask for the l
 once, saying why; those that don't ask for it wait for another runner, and the job's page says
 which runners won't take it. Every runner has `self-hosted`, so `--protected-label self-hosted`
 keeps them all for protected refs and jobs from other refs don't run at all.
+
+### Agents sharing a Docker daemon
+
+Agents name their jobs' Docker objects `kiwicd-<agent>-j<job>-...`, where `<agent>` is the
+`agent_id` in `.runner`: 8 random hexadecimal digits chosen at registration. Runner and job IDs
+are only unique on their server, so agents of different servers (or test runs) on one Docker
+daemon would otherwise remove each other's containers. Registrations from before agent IDs get
+one on their first start, derived from their token and saved in `.runner`, and that start also
+removes what their unfinished jobs left under the old names (`kiwicd-r<runner>-j<job>-...`).
+Old names can still be shared, so that first start can also remove the running jobs of another
+server's agent with the same runner ID that hasn't been upgraded yet: upgrade agents that share
+a daemon while they're idle.
 
 ### Server configuration
 

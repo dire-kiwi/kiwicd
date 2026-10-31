@@ -2,6 +2,8 @@ package e2e
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +21,7 @@ import (
 )
 
 // serviceImage answers each connection on port 8080 with "hello $GREETING".
+// The workflow names it so; the test builds it with a tag of its own.
 const serviceImage = "kiwicd-e2e-service:test"
 
 const serviceDockerfile = `FROM debian:trixie-slim
@@ -45,7 +48,7 @@ jobs:
         shell: bash
         run: |
           test -n "${{ job.services.web.id }}"
-          case "${{ job.services.web.network }}" in kiwicd-r*) ;; *) exit 1 ;; esac
+          case "${{ job.services.web.network }}" in kiwicd-*-j*) ;; *) exit 1 ;; esac
           exec 3<>"/dev/tcp/127.0.0.1/${{ job.services.web.ports[8080] }}"
           read -r line <&3
           test "$line" = "hello host-1" && echo "host job reached its service"
@@ -87,15 +90,10 @@ func TestServices(t *testing.T) {
 	if out, err := exec.Command("docker", "image", "inspect", "debian:trixie-slim").CombinedOutput(); err != nil {
 		t.Skipf("needs Docker with debian:trixie-slim: %v %s", err, out)
 	}
-	build := exec.Command("docker", "build", "-q", "-t", serviceImage, "-")
-	build.Stdin = strings.NewReader(serviceDockerfile)
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("docker build: %v\n%s", err, out)
-	}
-	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", serviceImage).Run() })
+	image := buildImage(t, "kiwicd-e2e-service", serviceDockerfile)
 
 	e := startE2E(t, "e2e-services")
-	r, logs := e.pushAndWait(t, map[string]string{".github/workflows/ci.yml": servicesWorkflow, "hello.txt": "hi\n"})
+	r, logs := e.pushAndWait(t, map[string]string{".github/workflows/ci.yml": strings.ReplaceAll(servicesWorkflow, serviceImage, image), "hello.txt": "hi\n"})
 	want := map[string]string{"host": "success", "container": "success"}
 	for k, v := range want {
 		if r[k] != v {
@@ -107,7 +105,7 @@ func TestServices(t *testing.T) {
 			t.Errorf("%s job's log lacks %q:\n%s", job, s, logs[job])
 		}
 	}
-	assertNoDockerLeftovers(t, e.runnerID)
+	assertNoDockerLeftovers(t, e.agentID)
 }
 
 const noDockerWorkflow = `
@@ -146,9 +144,9 @@ func TestServicesWithoutDocker(t *testing.T) {
 }
 
 type e2eEnv struct {
-	url      string
-	runnerID int64
-	tmp      string
+	url     string
+	agentID string
+	tmp     string
 }
 
 // startE2E starts a server and an agent that runs jobs on this machine.
@@ -172,7 +170,7 @@ func startE2E(t *testing.T, name string) *e2eEnv {
 		t.Fatal(err)
 	}
 	go func() { _ = a.Run(ctx) }()
-	return &e2eEnv{url: ts.URL, runnerID: creds.RunnerID, tmp: tmp}
+	return &e2eEnv{url: ts.URL, agentID: creds.AgentID, tmp: tmp}
 }
 
 func (e *e2eEnv) api(t *testing.T, method, path, body string, out any) {
@@ -239,11 +237,28 @@ func (e *e2eEnv) pushAndWait(t *testing.T, files map[string]string) (map[string]
 	return got, logs
 }
 
-// assertNoDockerLeftovers checks that a runner's jobs left no containers,
-// volumes, networks or images.
-func assertNoDockerLeftovers(t *testing.T, runnerID int64) {
+// buildImage builds an image from dockerfile and tags it name:<random>, so
+// that tests running at the same time on one Docker daemon (in two
+// checkouts) don't remove each other's.
+func buildImage(t *testing.T, name, dockerfile string) string {
 	t.Helper()
-	prefix := fmt.Sprintf("kiwicd-r%d-j", runnerID)
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	image := name + ":" + hex.EncodeToString(b)
+	build := exec.Command("docker", "build", "-q", "-t", image, "-")
+	build.Stdin = strings.NewReader(dockerfile)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("docker build: %v\n%s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", image).Run() })
+	return image
+}
+
+// assertNoDockerLeftovers checks that an agent's jobs left no containers,
+// volumes, networks or images.
+func assertNoDockerLeftovers(t *testing.T, agentID string) {
+	t.Helper()
+	prefix := "kiwicd-" + agentID + "-j"
 	for _, args := range [][]string{
 		{"ps", "-a", "--format", "{{.Names}}"},
 		{"volume", "ls", "--format", "{{.Name}}"},
