@@ -15,8 +15,11 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 ## What works
 
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
-  `branches`/`tags`/`paths` filters (and their `-ignore` forms), `workflow_dispatch` with inputs,
-  `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`,
+  `branches`/`tags`/`paths` filters (and their `-ignore` forms), `on: pull_request` with `types`,
+  `branches` and `paths` (see [Pull requests](#pull-requests)), `workflow_dispatch` with inputs,
+  `workflow_run`, `repository_dispatch`, `create` and `delete` (see [More events](#more-events)),
+  `types` for the events that have activity types, `needs`, job `if`, `strategy.matrix`
+  (include/exclude, fail-fast), job `outputs`, `env`,
   `defaults`, `timeout-minutes`, `secrets`, `vars`.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
@@ -40,6 +43,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and jobs check out the pushed commit. Runs show them as `kiwicd:deploy.yml`, separate from a
   committed file of the same name. To keep a public repository's deployment out of it, prefer a
   private repository that listens with `repository_push`.
+- **Reusable workflows**: `jobs.<id>.uses` calls a workflow with `on: workflow_call`, from the
+  same repository or another one, with typed `with:` inputs, `secrets:` (or `secrets: inherit`),
+  outputs for `needs.<id>.outputs`, and `strategy.matrix`, `needs` and `if` on the calling job,
+  nested up to four levels (see [Reusable workflows](#reusable-workflows)).
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)). One with
@@ -50,6 +57,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   expressions can use `github`, `inputs` and `vars`) lets one run of a repository's group run at
   a time, as on GitHub. A new run waits for the group's running one, which it cancels with
   `cancel-in-progress`, and cancels any other that's waiting. A run's page says when it waits.
+  `pull_request` runs' groups are apart from other runs': their workflow comes from the pull
+  request, which mustn't cancel or hold up a deploy by naming its group.
 - **Protected refs**: only runs from a repository's protected refs get its secrets and the global
   ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
   collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The
@@ -57,8 +66,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   refs** or with
   `curl -u admin -X PATCH -d '{"protected_refs":["release/*","refs/tags/v*"]}' https://SERVER/api/repos/OWNER/NAME`.
   Patterns are branch names as in a `push` filter (`*` doesn't match `/`, `**` does) or full refs
-  (`refs/tags/v*`). Runs from other refs, including dispatches on them, get only
-  `secrets.KIWICD_TOKEN`, and their page and job logs say so. Whether a run gets secrets is
+  (`refs/tags/v*`). Runs from other refs, including dispatches on them and runs on pull requests,
+  get only `secrets.KIWICD_TOKEN`, and their page and job logs say so. Whether a run gets secrets is
   decided when it's created (a re-run decides again), and a ref unprotected since then stops
   jobs that haven't started yet from getting them. Such runs' jobs can still use any runner
   whose labels match, and on a runner that keeps state between jobs they could leave something
@@ -73,10 +82,16 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
 - **GitHub App**: one app, created from *Settings → GitHub*, sends kiwicd the pushes and pull
   requests of every repository it's installed on (no webhook per repository), lets mirrors of
-  private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
+  private ones fetch without a deploy key, shows their runs on GitHub as check runs (usable in
+  branch protection, re-run from GitHub), and lets GitHub users, organizations' and teams'
   members sign in (see [GitHub App](#github-app)).
+- **Roles and audit log**: admin, maintainer (of all or some repositories) and viewer, given to
+  GitHub logins, organizations and teams; API tokens limited to a role and repositories; a log
+  of who changed secrets, variables, settings, runners, roles and tokens (see
+  [Access](#access)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
-  dispatch, runners, secrets and variables (global or per repository), API tokens.
+  dispatch, runners, secrets and variables (global or per repository), roles, API tokens and the
+  audit log.
 - **Step summaries and annotations**: a run's Summary page shows what each job's steps wrote
   to `$GITHUB_STEP_SUMMARY`, rendered from Markdown, and lists its annotations: `::error`,
   `::warning` and `::notice` workflow commands (with `file`, `line`, `endLine`, `col` and
@@ -91,9 +106,132 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
 
-Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
-artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
-(only other repositories' `repository_pull_request`), commit statuses on GitHub.
+Not yet: job `container:`/`services:` on host labels, artifacts and caches, job-level
+`concurrency`, `pull_request_target` (it runs the base branch's workflow with secrets on a pull
+request's event, which is easy to misuse by checking out the pull request's code), approval
+before a first-time contributor's pull request runs (GitHub's *approve and run*), `merge_group`,
+`issues`, `issue_comment`, `release`.
+
+## Pull requests
+
+A mirror of a GitHub repository runs its own `on: pull_request` workflows, as GitHub does:
+
+```yaml
+# .github/workflows/ci.yml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]   # the default
+    branches: [main]                         # base branches; branches-ignore works too
+    paths: ['src/**']                        # files the pull request changes; paths-ignore too
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+```
+
+- **Events come from GitHub's `pull_request` webhook**, through the [GitHub App](#github-app) or
+  a webhook on the repository to the mirror's webhook URL (set up as for
+  [Pull request previews](#pull-request-previews)). kiwicd doesn't poll for pull requests.
+- **They run on a merge commit**, as on GitHub: for each event kiwicd fetches the pull request's
+  head (`refs/pull/N/head`) and its base branch, merges the head into the base branch's current
+  tip and keeps the commit at `refs/pull/N/merge` in the mirror. `github.sha` (`GITHUB_SHA`) is
+  that merge commit, not the head (which is `github.event.pull_request.head.sha`), and the
+  workflow files that run are the merge commit's. kiwicd makes the commit itself rather than
+  fetching GitHub's `refs/pull/N/merge`, which GitHub updates in the background and may be stale
+  when the event comes. The same head and base give the same commit. As on GitHub, a pull request
+  that doesn't merge cleanly runs nothing until its conflicts are resolved. This needs git 2.38
+  or later on the server.
+- `github.event_name` is `pull_request`, `github.ref` is `refs/pull/N/merge` (`github.ref_name`
+  `N/merge`), `github.head_ref`/`GITHUB_HEAD_REF` and `github.base_ref`/`GITHUB_BASE_REF` are the
+  head and base branches, and `github.event` is GitHub's `pull_request` event, except that
+  `repository` is kiwicd's mirror (as for [previews](#pull-request-previews)). The run's title is
+  `#N action: title`.
+- **No secrets**: anyone who can open a pull request writes its workflow, so its jobs get only
+  `secrets.KIWICD_TOKEN` (which fetches just this repository), whatever the repository's
+  protected refs, and [protected](#server-configuration) and reserved runner labels keep them
+  off those runners: a job that asks for one fails.
+- **Pull requests from forks don't run** unless the repository allows them, in its
+  **Settings → Pull requests** or with
+  `curl -u admin -X PATCH -d '{"fork_pull_requests":true}' https://SERVER/api/repos/OWNER/NAME`.
+  The setting is the repository's, not the workflow's, since the workflow comes from the fork.
+  Allowed fork pull requests run like the repository's own: no secrets, no protected runners,
+  but the fork's code runs on your runners, so use runners that isolate jobs
+  ([Isolating jobs](#isolating-jobs)). There's no approval step for first-time contributors yet.
+- `pull_request_target` isn't supported. For a job that needs secrets on a pull request, such as
+  a preview deployment, use `repository_pull_request` from another repository (below), which
+  runs that repository's default branch.
+
+## Reusable workflows
+
+A job with `uses:` runs the jobs of another workflow, as on GitHub:
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [linux, arm]
+    uses: ./.github/workflows/build.yml           # same repository and commit
+    with:
+      target: ${{ matrix.os }}
+    secrets:
+      token: ${{ secrets.REGISTRY_TOKEN }}         # or: secrets: inherit
+  deploy:
+    needs: build
+    uses: owner/shared/.github/workflows/deploy.yml@v1
+    with:
+      image: ${{ needs.build.outputs.image }}
+```
+
+```yaml
+# .github/workflows/build.yml
+on:
+  workflow_call:
+    inputs:
+      target: { type: string, required: true }
+      push: { type: boolean, default: true }
+    secrets:
+      token: { required: true }
+    outputs:
+      image: { value: "${{ jobs.image.outputs.ref }}" }
+jobs:
+  image:
+    runs-on: self-hosted
+    outputs:
+      ref: ${{ steps.build.outputs.ref }}
+    steps: ...
+```
+
+- **Where workflows come from.** `./.github/workflows/x.yml` is read from the same repository and
+  commit as the workflow calling it. `owner/repo/.github/workflows/x.yml@ref` (a branch, tag or
+  commit) is read from the kiwicd repository `owner/repo`, hosted or mirrored, if it is the run's
+  own repository or lists it as a reader in its **Settings → Job access** (as for
+  `KIWICD_TOKEN`: the repository being read agrees, here to any run of the listed one). A name
+  kiwicd doesn't have is read from GitHub: public repositories without credentials, and private
+  ones the [GitHub App](#github-app) is installed on with its installation token, but only for runs
+  from protected refs, so that a branch anyone can push can't read them through the app. Mirror a
+  repository to use it from runs of other refs.
+- **When.** As on GitHub, a run reads every workflow it calls when it's created, down to four
+  levels (the run's own workflow and three below it), at most 50 calls; a call that can't be
+  read, a loop, an unknown or missing required input or secret fails the run as an invalid
+  workflow. The run's page shows each called workflow and the commit it was read at, and a re-run
+  uses the same ones.
+- **Jobs.** The called workflow's jobs run as part of the run, named `build (linux) / image` as on
+  GitHub, and grouped under the calling job on the run's page. The calling job (one per matrix
+  combination) finishes with their result and the workflow's `outputs`; with several
+  combinations, `needs.build.outputs` has the last one's. `inputs` are converted to their types
+  (`string`, `boolean`, `number`) and take their defaults; `github`, `vars` and `github.event`
+  are the calling run's, and `actions/checkout` checks out the run's repository, as on GitHub.
+  `strategy.fail-fast` and cancelling reach the called jobs.
+- **Secrets.** A called workflow's jobs get only what the calling job passes: the `secrets:`
+  mapping, evaluated with the caller's secrets, or all of them with `secrets: inherit`, and
+  `KIWICD_TOKEN`. Runs from refs that aren't protected still get none, so their mappings are
+  empty.
+- Agents run called jobs from protocol 2 on: upgrade the server first, then the agents. Older
+  agents keep taking other jobs.
 
 ## Deploy a public repository from a private one
 
@@ -225,6 +363,85 @@ jobs:
   and `cancel-in-progress` stops it rather than waiting for it to finish. Since a cancelled job can
   stop part way through a deploy, the close's removal should cope with a half-deployed preview.
 
+## More events
+
+As on GitHub, a workflow can also run after another one, on request, or when a branch or tag is
+created or deleted.
+
+### After another workflow: `workflow_run`
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+on:
+  workflow_run:
+    workflows: [CI]               # names of this repository's workflows (their file without a name)
+    types: [completed]            # requested, in_progress, completed; all by default
+    branches: [main]              # the CI run's branch; branches-ignore works too
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, deploy]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - run: ./deploy.sh
+```
+
+- The workflow runs from the repository's **default branch** (its file there, at the tip), not
+  from the run it follows. `github.event.workflow_run` has the run's `id`, `name`, `run_number`,
+  `run_attempt`, `event`, `status`, `conclusion` (with `completed`: `success`, `failure`,
+  `cancelled`), `head_branch`, `head_sha`, `path` and `html_url`; `github.event.action` is the
+  activity type. For a [pull request](#pull-requests)'s run, `head_branch` is the pull request's
+  head branch, which a fork can call `main` too. Its runs page links to the run it followed.
+- **It gets the default branch's secrets, whatever ref the run it follows was for**, as on
+  GitHub. That's what makes deploy-after-CI work, and also what makes it risky: a CI run on a
+  branch that anyone can push to (a collaborator's, Dependabot's) or on a pull request runs code
+  you haven't reviewed,
+  and anything it leaves behind or reports (job outputs, files on a runner that keeps state,
+  values it pushed somewhere) is under that branch's control. Treat what comes from the run you
+  follow as untrusted input: check `head_branch` and `event`, build from `head_sha` yourself rather
+  than reusing what the run built, and don't pass its values to a shell unquoted. Workflows are
+  matched by name, and a workflow added on any branch can be called `CI`: keep `branches` to the
+  protected ones for anything that deploys.
+- Runs that follow each other stop after three levels, as on GitHub: in A → B → C → D → E, where
+  each follows the one before with `workflow_run`, E doesn't run (the server logs that it
+  didn't). A workflow that follows itself is caught the same way.
+- Every run of the repository counts, whatever started it: pushes, dispatches, re-runs,
+  `repository_push` and the events below.
+
+### On request: `repository_dispatch`
+
+```yaml
+on:
+  repository_dispatch:
+    types: [deploy]               # event types; any by default
+```
+
+```sh
+curl -u admin -X POST -d '{"event_type":"deploy","client_payload":{"env":"prod"}}' \
+  https://SERVER/api/repos/OWNER/NAME/dispatches
+kiwicd repo dispatch OWNER/NAME deploy --payload '{"env":"prod"}'
+```
+
+The request is GitHub's *create a repository dispatch event*, authenticated like the rest of the
+API (an [API token](#command-line) works). It starts the default branch's workflows whose `types`
+include `event_type` (1 to 100 characters) and returns their runs, `{"run_ids": [...]}`, which may
+be none. `github.event.action` is the event type and `github.event.client_payload` the payload
+(a JSON object). The [GitHub App](#github-app) also takes GitHub's `repository_dispatch`
+webhook, for mirrors of the repositories it's installed on: the mirror is fetched first, so the
+run is of its default branch's latest commit. GitHub only sends that webhook to apps, for
+dispatches that a GitHub App made on GitHub (not ones made with a personal token).
+
+### Branches and tags: `create` and `delete`
+
+`on: create` runs when a push or a mirror's fetch creates a branch or tag, from the workflow file
+in its commit and at its ref, like a push to it (so an unprotected branch gets no secrets).
+`on: delete` runs when one is deleted, from the default branch. Neither takes filters, as on
+GitHub; check `github.event.ref_type` (`branch` or `tag`) and `github.event.ref` (the short name)
+in the job's `if`. A mirror's first fetch doesn't create anything.
+
 ## GitHub App
 
 kiwicd can have one GitHub App. Create it under **Settings → GitHub**: pick your account or an
@@ -234,7 +451,7 @@ the app's webhook and sign-in URLs are made from it, and GitHub has to reach the
 is private, so it can only be installed on the account that owns it; create it in the
 organization whose repositories you mirror. An existing app can be entered by hand instead
 (*Use an existing app*), or with `PUT /api/github/app` (`app_id`, `client_id`, `client_secret`,
-`private_key`, `webhook_secret`, `allowed_users`, `allowed_orgs`).
+`private_key`, `webhook_secret`).
 
 Then **install the app** on the repositories kiwicd mirrors (*Install on repositories*). For
 each of them:
@@ -242,26 +459,106 @@ each of them:
 - **Webhooks**: GitHub sends their `push` and `pull_request` events to
   `https://SERVER/api/github/webhook`, and kiwicd hands each to the mirrors of that repository
   (mirrors whose URL is it on GitHub, in HTTPS, SSH or `git@github.com:` form), as if it had come
-  to the mirror's own webhook URL: pushes sync the mirror and pull requests start
-  `repository_pull_request` listeners. Remove any webhook you added to the repository for kiwicd,
+  to the mirror's own webhook URL: pushes sync the mirror and pull requests start its
+  `pull_request` workflows and `repository_pull_request` listeners. `repository_dispatch` events
+  (GitHub sends them for dispatches made by a GitHub App) start the mirror's
+  `repository_dispatch` workflows. Remove any webhook you added to the repository for kiwicd,
   or its pull requests start runs twice. Events for repositories without a mirror are ignored.
 - **Fetching**: a mirror whose URL is `https://github.com/OWNER/NAME.git` (without credentials)
   fetches with a short-lived installation token, limited to reading that repository, so a private
   one needs no deploy key. The new-mirror form lists the repositories the app is installed on.
 
-The app asks for read access to contents, pull requests and organization members, and for the
-push and pull request events.
+- **Check runs**: each job of a mirror's runs shows on the commit (and its pull requests) as a
+  check run named `workflow / job`, with matrix values as in the job's name, e.g.
+  `CI / test (1.23, linux)`. It's created when the job is queued and updated when it starts and
+  finishes, with the conclusion, a short summary (duration, error, steps) and a link to the job
+  in kiwicd (made from `--public-url`). Push and dispatched runs report on their commit, pull
+  request runs on the pull request's head. A workflow file that doesn't parse gets one failed
+  check run. Branch protection can require these checks by name. **Re-run** on GitHub (one
+  check, or all of a commit's) starts a new attempt of the runs they belong to, unless the
+  latest attempt is still going; anyone who can re-run checks there can do that. Talking to
+  GitHub happens in the background and never fails or holds up a run: errors are logged and
+  retried a few times, and a later change of the run catches up.
+
+  Runs of `repository_push` and `repository_pull_request` listeners belong to the listening
+  repository, often a private one holding a public one's deployment, and uploaded workflows are
+  kept out of the repository for the same reason; reporting them would show their workflow and
+  job names and links to kiwicd to everyone who can see the repository on GitHub. So they're
+  reported only if the listening (or, for uploaded workflows, the mirror's) repository's
+  **Settings → GitHub checks** is on (or
+  `curl -u admin -X PATCH -d '{"report_checks":true}' https://SERVER/api/repos/OWNER/NAME`).
+  Listeners' check runs go on the source repository's pushed commit or pull request head, named
+  `OWNER/NAME: workflow / job` after the listener.
+
+The app also lets runs from protected refs call [reusable workflows](#reusable-workflows) in
+private repositories it's installed on.
+
+The app asks for read access to contents, pull requests and organization members, write access
+to checks, and for the push, pull request, check run and check suite events.
+
+**Apps made before kiwicd reported check runs** lack the checks permission; *Settings → GitHub*
+says so, and which installations haven't accepted it. On GitHub, open the app's settings
+(*Settings → Developer settings → GitHub Apps*, the organization's for an organization's app),
+then *Permissions & events*: set *Repository permissions → Checks* to *Read and write*, tick the
+*Check run* and *Check suite* events, and save. GitHub then asks each installation's owner to
+accept the new permissions (*Settings → Applications → Installed GitHub Apps*, or the
+organization's, *Configure*, and *Review request*); until they do, runs there aren't reported
+and kiwicd only logs a warning now and then.
 
 ### Sign in with GitHub
 
 Once the app is set up, the sign-in page offers *Sign in with GitHub*, through the app's OAuth
-client. Who may sign in is set under **Settings → GitHub**: GitHub logins, and organizations whose
-members may (checked through the app, which has to be installed on the organization). The app's
-owner is allowed when it's created. Everyone signed in can do what the admin can; runs they start
-by hand show their login. Membership is checked when someone signs in, and GitHub sessions last a
-week. Removing a user or organization from the list signs out everyone signed in with GitHub,
-and revokes their API tokens; so does removing the app. The admin password keeps working, for
-the API and git too.
+client. People may sign in if they have a [role](#access): their login has one, or an
+organization or team they're a member of does (checked through the app, which has to be
+installed on the organization). The app's owner (the user, or the organization's members) is
+made an admin when the app is created. Runs they start by hand show their login. Membership is
+checked when someone signs in, and GitHub sessions last a week. The admin password keeps
+working, for the API and git too.
+
+## Access
+
+Everyone signed in has a role:
+
+| Role | May |
+| --- | --- |
+| **viewer** | see repositories, workflows, runs and their logs, and runners; fetch repositories over `/git/` |
+| **maintainer** of every repository, or of some (`owner/name` or `owner/*`) | also, for those repositories: secrets and variables, protected refs, readers, mirrors' default branch and SSH settings (not their URL, nor letting forks' pull requests run, which only admins do), uploaded workflows, syncing, starting, re-running and cancelling runs, and pushing to hosted ones |
+| **admin** | everything, including global secrets and variables, adding and removing repositories, runners, the GitHub App, roles, everyone's API tokens and the audit log |
+
+The admin password is always an admin. Roles are given under **Settings → GitHub** (or
+`PUT /api/roles` with `{"kind": "user"|"org"|"team", "name": "LOGIN"|"ORG"|"ORG/TEAM-SLUG",
+"role": ..., "repos": [...]}`, and `DELETE /api/roles?kind=&name=`) to GitHub logins, to an
+organization's members and to a team's; someone matched by several gets the most they give, so
+an organization can be viewers and one team maintainers. Changing a role applies at once, to
+sessions and tokens too; people left without one are signed out and their API tokens revoked.
+Organization and team membership is only checked when someone signs in, so a new organization
+or team role reaches its members when they next sign in. Under it, *People who have signed in*
+shows everyone's role now.
+
+The server enforces roles on every API route and on git: what someone can't use is refused
+(`403`), and repositories a token can't see don't exist (`404`). The UI, `kiwicd` and
+`kiwicd mcp` leave out what the user or token can't use; `GET /api/me` says what that is
+(`access`).
+
+**API tokens** act as whoever made them, limited by their scope: a role no higher than the
+maker's (`viewer` makes a read-only token) and, optionally, some repositories, which are then
+the only ones the token sees and of which it is at most a maintainer, for a system that starts
+runs or an agent's `kiwicd mcp`. A token never has more than its maker has now, so lowering
+someone's role lowers their tokens'. Tokens without a scope, including all made before scopes
+existed, have their maker's full rights. Tokens with a scope can't make or revoke other tokens
+(except themselves, for `kiwicd logout`). Everyone sees and revokes their own tokens; admins
+see everyone's.
+
+**The audit log** (*Audit* in the menu, or `GET /api/audit?repo=&before=&limit=`) records who
+changed secrets and variables (never their values), repositories (created, deleted, protected
+refs, readers, mirror URL, default branch, SSH key and known hosts), uploaded workflows,
+runners (registered, removed, registration tokens made), roles, API tokens and the GitHub App,
+with the API token and client address used. Changes kiwicd makes itself, such as revoking
+tokens after the admin password changes, show as `kiwicd`. Entries are kept for good.
+
+Upgrading from before roles turns the GitHub sign-in allow list into admin roles, as it gave
+everyone the admin's access. People allowed through an organization keep their sessions if
+there was only one organization; otherwise they sign in again.
 
 ## Command line
 
@@ -269,6 +566,8 @@ the API and git too.
 for the admin password, makes a token with it and saves the server and token in
 `~/.config/kiwicd/cli.json` (mode 0600); the password itself isn't kept. People who sign in
 with GitHub make a token under **Settings → API tokens** and pass it with `--token`.
+`--role` and `--repo` (with the password) limit the token login makes; `kiwicd whoami` shows
+your role.
 `KIWICD_URL` and `KIWICD_API_TOKEN` override the saved ones, e.g. in scripts.
 
 ```sh
@@ -279,6 +578,7 @@ kiwicd run logs 42 --failed                  # or --job build, --follow
 kiwicd run start owner/app deploy.yml --ref main -i target=prod --watch
 kiwicd run cancel 42; kiwicd run rerun 42 --watch
 kiwicd workflow list owner/app
+kiwicd repo dispatch owner/app deploy --payload '{"env":"prod"}'   # a repository_dispatch event
 echo -n "$VALUE" | kiwicd secret set DEPLOY_KEY --repo owner/app   # or type it at the prompt
 kiwicd secret list; kiwicd variable set REGION nz-north --repo owner/app
 kiwicd api GET repos/owner/app               # any other API call
@@ -287,12 +587,13 @@ kiwicd api GET repos/owner/app               # any other API call
 Secrets and variables without `--repo` are the global ones. `--watch` exits non-zero unless the
 run succeeds, and list and view commands take `--json`. `kiwicd help` lists every command.
 
-API tokens act as whoever made them, as a `Bearer` token or a Basic password, for the API and
-git over `/git/`. The admin's can last forever; those of people signed in with GitHub last at
+API tokens act as whoever made them, limited by their [scope](#access), as a `Bearer` token or
+a Basic password, for the API and git over `/git/`. The admin's can last forever; those of people signed in with GitHub last at
 most 90 days, since organization membership is only checked when they sign in. Changing the
 admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
 revoked under **Settings → API tokens**, or with `kiwicd token list` and `kiwicd token revoke`;
-`kiwicd logout` revokes its own.
+`kiwicd logout` revokes its own. `kiwicd token create NAME --role viewer --repo owner/app` makes
+a read-only token that sees only `owner/app`.
 
 ### MCP
 
@@ -304,9 +605,11 @@ claude mcp add kiwicd -- kiwicd mcp              # or: kiwicd mcp --read-only
 
 Its tools list repositories, workflows, runs and runners, get a run with its jobs and steps,
 read the end of a job's log (or one step's), wait for a run to finish, start, re-run and cancel
-runs, and list, set and delete secrets and variables. Secrets stay write-only: the agent can set
-them but not read them back. `--read-only` leaves out the tools that change anything. Give it
-its own token (`KIWICD_API_TOKEN`) to revoke it separately from yours.
+runs, send `repository_dispatch` events, and list, set and delete secrets and variables. Secrets
+stay write-only: the agent can set them but not read them back. `--read-only` leaves out the tools that change anything, as does a
+viewer's or read-only token; the server says in its instructions what the token may do. Give it
+its own token (`KIWICD_API_TOKEN`), perhaps limited to a few repositories, to revoke it
+separately from yours.
 
 ## Layout
 
@@ -396,7 +699,7 @@ keeps them all for protected refs and jobs from other refs don't run at all.
 
 | Flag / variable | |
 |---|---|
-| `KIWICD_ADMIN_PASSWORD` | Required. UI login (user `admin`), git push and API basic auth. People can also [sign in with GitHub](#sign-in-with-github) |
+| `KIWICD_ADMIN_PASSWORD` | Required. UI login (user `admin`), git push and API basic auth, as an admin. People can also [sign in with GitHub](#sign-in-with-github), with a [role](#access) |
 | `--data` / `KIWICD_DATA` | Database and repositories |
 | `--public-url` / `KIWICD_PUBLIC_URL` | URL used in clone URLs, `github.server_url` and links |
 | `--retention-days` / `KIWICD_RETENTION_DAYS` | Days to keep completed runs and their logs (default 30, 0 keeps them forever); also passed to jobs as `GITHUB_RETENTION_DAYS` |
@@ -439,3 +742,6 @@ nektos/act. So far:
   options and volumes that reach the host), `ContainerOptions` applied after the workflow's own to
   job and service containers and to `docker://` steps, and a user-defined `ContainerNetworkMode`
   used for services and for building Docker actions too.
+- `Config.WorkflowCallInputs`: the `inputs` of a reusable workflow's job, which the server
+  evaluates from the calling job's `with:`, since kiwicd runs called jobs itself rather than
+  through act's own reusable workflow support.

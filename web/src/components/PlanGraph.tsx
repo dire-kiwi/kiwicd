@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { jobState, matrixLabel, type PlanGroup } from "../runmodel";
+import { jobState, matrixLabel, type CalledItem, type PlanGroup } from "../runmodel";
 import { elapsed } from "../util";
 import { StatusIcon } from "./StatusIcon";
 
@@ -15,7 +15,7 @@ export function PlanGraph({ runId, groups, now }: { runId: number; groups: PlanG
   const columns: PlanGroup[][] = Array.from({ length: maxDepth + 1 }, () => []);
   for (const g of groups) columns[g.depth].push(g);
 
-  const layoutKey = groups.map((g) => `${g.key}:${g.jobs.length}:${g.needs.join(",")}`).join("|");
+  const layoutKey = groups.map((g) => `${g.key}:${g.jobs.length}:${g.items.length}:${g.needs.join(",")}`).join("|");
 
   useLayoutEffect(() => {
     const el = wrap.current;
@@ -70,7 +70,18 @@ export function PlanGraph({ runId, groups, now }: { runId: number; groups: PlanG
                 else cards.current.delete(g.key);
               }}
             >
-              {g.jobs.length === 0 ? (
+              {g.uses ? (
+                <>
+                  <div className="graph-group-title" title={g.uses}>
+                    <StatusIcon state={g.state} size={14} />
+                    <span className="ellipsis">{g.name}</span>
+                    <span className="muted small">workflow</span>
+                  </div>
+                  {g.items.map((item) => (
+                    <CalledJob key={item.key} runId={runId} item={item} now={now} />
+                  ))}
+                </>
+              ) : g.jobs.length === 0 ? (
                 <div className="graph-job graph-job-pending">
                   <StatusIcon state={g.state} size={14} />
                   <span className="ellipsis">{g.name}</span>
@@ -102,5 +113,35 @@ export function PlanGraph({ runId, groups, now }: { runId: number; groups: PlanG
         </div>
       ))}
     </div>
+  );
+}
+
+/** A job of a called workflow in its calling job's card. */
+function CalledJob({ runId, item, now }: { runId: number; item: CalledItem; now: number }) {
+  const indent = { paddingLeft: 10 + item.depth * 14 };
+  const j = item.job;
+  if (!j) {
+    return (
+      <div className={item.caller ? "graph-job graph-job-sub graph-job-caller graph-job-pending" : "graph-job graph-job-sub graph-job-pending"} style={indent}>
+        <StatusIcon state="pending" size={14} />
+        <span className="ellipsis">{item.label}</span>
+      </div>
+    );
+  }
+  if (item.caller) {
+    return (
+      <div className="graph-job graph-job-sub graph-job-caller" style={indent} title={j.uses}>
+        <StatusIcon state={jobState(j)} size={14} />
+        <span className="ellipsis">{item.label}</span>
+        <span className="muted small">{elapsed(j.started_at, j.finished_at, now)}</span>
+      </div>
+    );
+  }
+  return (
+    <Link to={`/runs/${runId}/jobs/${j.id}`} className="graph-job graph-job-sub" style={indent} title={matrixLabel(j) || j.name}>
+      <StatusIcon state={jobState(j)} size={14} />
+      <span className="ellipsis">{item.label}</span>
+      <span className="muted small">{elapsed(j.started_at, j.finished_at, now)}</span>
+    </Link>
   );
 }

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,10 @@ type Repo struct {
 	SSHHostKeys   []string          `json:"ssh_host_keys,omitempty"`
 	Readers       []string          `json:"readers"`        // see jobtoken.go
 	ProtectedRefs []string          `json:"protected_refs"` // see protectedrefs.go
+	ReportChecks  bool              `json:"report_checks"`  // see checks.go
+	// Whether pull requests from forks run pull_request workflows; see
+	// pullrequest.go.
+	ForkPullRequests bool `json:"fork_pull_requests"`
 	// Branches whose runs get secrets, for the UI.
 	ProtectedBranches []string `json:"protected_branches,omitempty"`
 	CloneURL          string   `json:"clone_url,omitempty"`
@@ -46,13 +51,13 @@ type Repo struct {
 }
 
 const repoCols = `id, name, kind, url, default_branch, webhook_secret, refs, last_sync_at, last_sync_error, created_at,
-	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs`
+	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs, report_checks, fork_pull_requests`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
 	var refs, readers, protectedRefs string
 	if err := row.Scan(&r.ID, &r.Name, &r.Kind, &r.URL, &r.DefaultBranch, &r.WebhookSecret, &refs, &r.LastSyncAt, &r.LastSyncError, &r.CreatedAt,
-		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs); err != nil {
+		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs, &r.ReportChecks, &r.ForkPullRequests); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(refs), &r.Refs)
@@ -105,12 +110,16 @@ func (s *Server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
+	p := requestPrincipal(r)
 	repos := []*Repo{}
 	for rows.Next() {
 		repo, err := scanRepo(rows)
 		if err != nil {
 			httpError(w, 500, "%v", err)
 			return
+		}
+		if !p.canView(repo.Name) {
+			continue
 		}
 		s.decorateRepo(r, repo)
 		repo.WebhookSecret = ""
@@ -186,6 +195,7 @@ func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, _ := res.LastInsertId()
+	s.audit(r, "repo.create", req.Name, "", strings.TrimSpace(req.Kind+" "+redactURL(req.URL)))
 	// The first sync clones a mirror and records existing refs as a baseline,
 	// so they don't trigger runs.
 	if err := s.syncRepo(ctx, id, true); err != nil {
@@ -246,18 +256,21 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		URL            *string   `json:"url"`
-		DefaultBranch  *string   `json:"default_branch"`
-		SSHKey         *string   `json:"ssh_key"`
-		GenerateSSHKey bool      `json:"generate_ssh_key"`
-		SSHKnownHosts  *string   `json:"ssh_known_hosts"`
-		Readers        *[]string `json:"readers"`
-		ProtectedRefs  *[]string `json:"protected_refs"`
+		URL              *string   `json:"url"`
+		DefaultBranch    *string   `json:"default_branch"`
+		SSHKey           *string   `json:"ssh_key"`
+		GenerateSSHKey   bool      `json:"generate_ssh_key"`
+		SSHKnownHosts    *string   `json:"ssh_known_hosts"`
+		Readers          *[]string `json:"readers"`
+		ProtectedRefs    *[]string `json:"protected_refs"`
+		ReportChecks     *bool     `json:"report_checks"`
+		ForkPullRequests *bool     `json:"fork_pull_requests"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		httpError(w, 400, "bad request: %v", err)
 		return
 	}
+	before := *repo
 	if req.Readers != nil {
 		if repo.Readers, err = cleanReaders(repo.Name, *req.Readers); err != nil {
 			httpError(w, 400, "%v", err)
@@ -270,13 +283,36 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.ReportChecks != nil {
+		repo.ReportChecks = *req.ReportChecks
+	}
 	if repo.Kind != "mirror" && (req.URL != nil || req.SSHKey != nil || req.GenerateSSHKey || req.SSHKnownHosts != nil) {
 		httpError(w, 400, "only mirrors have a remote URL and SSH settings")
 		return
 	}
+	if req.ForkPullRequests != nil {
+		// Forks' pull requests run anyone's code on the server's runners,
+		// which are the admins'.
+		if *req.ForkPullRequests && !repo.ForkPullRequests && !requestPrincipal(r).admin() {
+			httpError(w, 403, "only an admin can let pull requests from forks run workflows")
+			return
+		}
+		repo.ForkPullRequests = *req.ForkPullRequests
+	}
 	if req.URL != nil {
 		if *req.URL = strings.TrimSpace(*req.URL); *req.URL == "" {
 			httpError(w, 400, "mirror repositories need a url")
+			return
+		}
+		// Pointing a mirror elsewhere can fetch what its maintainers can't
+		// see: other repositories on the server, anything the GitHub App is
+		// installed on, internal addresses. Only admins may.
+		if *req.URL == redactURL(repo.URL) {
+			// The URL as the UI shows it, with credentials hidden: unchanged.
+			*req.URL = repo.URL
+		}
+		if *req.URL != repo.URL && !requestPrincipal(r).admin() {
+			httpError(w, 403, "only an admin can change a mirror's URL")
 			return
 		}
 		if strings.HasPrefix(*req.URL, "-") {
@@ -315,9 +351,9 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 	// Under the sync lock, so a fetch never runs with half-applied settings.
 	lock := s.repoLock(repo.ID)
 	lock.Lock()
-	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ?, protected_refs = ?
-		WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers),
-		mustJSON(repo.ProtectedRefs), repo.ID)
+	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ?, protected_refs = ?,
+		report_checks = ?, fork_pull_requests = ? WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers),
+		mustJSON(repo.ProtectedRefs), repo.ReportChecks, repo.ForkPullRequests, repo.ID)
 	if err == nil && req.SSHKnownHosts != nil && repo.SSHKnownHosts == "" {
 		// Forget pinned host keys: the next connection trusts the host again.
 		err = os.Remove(s.knownHostsPath(repo.ID))
@@ -330,9 +366,52 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.auditRepoChanges(r, &before, repo, req.SSHKey != nil || req.GenerateSSHKey, req.SSHKnownHosts != nil)
 	repo, _ = s.getRepoByID(repo.ID)
 	s.decorateRepo(r, repo)
 	writeJSON(w, repo)
+}
+
+// auditRepoChanges records what an update changed.
+func (s *Server) auditRepoChanges(r *http.Request, old, repo *Repo, sshKey, knownHosts bool) {
+	list := func(l []string) string {
+		if len(l) == 0 {
+			return "none"
+		}
+		return strings.Join(l, ", ")
+	}
+	if !slices.Equal(old.Readers, repo.Readers) {
+		s.audit(r, "repo.readers", repo.Name, "", list(old.Readers)+" → "+list(repo.Readers))
+	}
+	if !slices.Equal(old.ProtectedRefs, repo.ProtectedRefs) {
+		s.audit(r, "repo.protected_refs", repo.Name, "", list(old.ProtectedRefs)+" → "+list(repo.ProtectedRefs))
+	}
+	if old.URL != repo.URL {
+		s.audit(r, "repo.settings", repo.Name, "url", redactURL(old.URL)+" → "+redactURL(repo.URL))
+	}
+	if old.ReportChecks != repo.ReportChecks {
+		s.audit(r, "repo.settings", repo.Name, "report checks", fmt.Sprint(repo.ReportChecks))
+	}
+	if old.ForkPullRequests != repo.ForkPullRequests {
+		s.audit(r, "repo.settings", repo.Name, "fork pull requests", fmt.Sprint(repo.ForkPullRequests))
+	}
+	if old.DefaultBranch != repo.DefaultBranch {
+		s.audit(r, "repo.settings", repo.Name, "default branch", old.DefaultBranch+" → "+repo.DefaultBranch)
+	}
+	if sshKey {
+		detail := "removed"
+		if repo.SSHPublicKey != "" {
+			detail = "set to " + repo.SSHPublicKey
+		}
+		s.audit(r, "repo.settings", repo.Name, "SSH key", detail)
+	}
+	if knownHosts {
+		detail := "trust on first connection"
+		if repo.SSHKnownHosts != "" {
+			detail = "set"
+		}
+		s.audit(r, "repo.settings", repo.Name, "SSH known hosts", detail)
+	}
 }
 
 // cleanReaders checks a repository's readers: owner/name each, without
@@ -369,6 +448,9 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.decorateRepo(r, repo)
+	if !requestPrincipal(r).canMaintain(repo.Name) {
+		repo.WebhookSecret = ""
+	}
 	writeJSON(w, repo)
 }
 
@@ -382,6 +464,7 @@ func (s *Server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.audit(r, "repo.delete", repo.Name, "", "")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -437,7 +520,8 @@ func (s *Server) handleSyncRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleWebhook accepts GitHub-style webhooks. A pull_request event starts
-// repository_pull_request workflows (see pullrequest.go); any other event
+// the mirror's pull_request workflows and other repositories'
+// repository_pull_request ones (see pullrequest.go); any other event
 // triggers a sync. The secret is checked with X-Hub-Signature-256 or a
 // ?secret= parameter.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -516,16 +600,32 @@ func (s *Server) syncRepo(ctx context.Context, id int64, baseline bool) error {
 		return err
 	}
 	if !baseline {
-		var changed []string
+		var changed, deleted []string
 		for ref, sha := range refs {
 			if repo.Refs[ref] != sha {
 				changed = append(changed, ref)
 			}
 		}
+		for ref := range repo.Refs {
+			if _, ok := refs[ref]; !ok {
+				deleted = append(deleted, ref)
+			}
+		}
 		sort.Strings(changed)
+		sort.Strings(deleted)
 		for _, ref := range changed {
 			if err := s.onPush(ctx, repo, ref, repo.Refs[ref], refs[ref]); err != nil {
 				s.log.Error("push trigger", "repo", repo.Name, "ref", ref, "err", err)
+			}
+			if _, existed := repo.Refs[ref]; !existed {
+				if err := s.onCreateRef(ctx, repo, ref, refs[ref]); err != nil {
+					s.log.Error("create trigger", "repo", repo.Name, "ref", ref, "err", err)
+				}
+			}
+		}
+		for _, ref := range deleted {
+			if err := s.onDeleteRef(ctx, repo, ref, repo.Refs[ref]); err != nil {
+				s.log.Error("delete trigger", "repo", repo.Name, "ref", ref, "err", err)
 			}
 		}
 	}
@@ -637,49 +737,62 @@ func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, 
 		listeners = append(listeners, repo)
 	}
 	rows.Close()
-	mentionsSrc := mentionsRepo(src.Name)
+	// Report broken workflows that look like they listen to src.
+	broken := mentionsRepo(src.Name).Match
 	var firstErr error
 	for _, repo := range listeners {
-		dstRef := "refs/heads/" + repo.DefaultBranch
-		sha, err := resolveRef(ctx, s.repoPath(repo.Name), dstRef)
-		if err != nil {
-			continue // no commits on the default branch yet
-		}
-		files, err := s.defaultBranchWorkflows(ctx, repo, sha)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, file := range sortedKeys(files) {
-			yaml := files[file]
-			if !bytes.Contains(yaml, []byte(event)) {
-				continue // only listeners need parsing
-			}
-			w, perr := wf.Parse(yaml)
-			if perr != nil {
-				// Report broken workflows that look like they listen to src.
-				if mentionsSrc.Match(yaml) {
-					_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: file, event: event,
-						payload: payload, ref: dstRef, sha: sha, actor: actor, title: title, parseErr: perr})
-				}
-				continue
-			}
-			if !matches(w) {
-				continue
-			}
-			name := w.Name
-			if name == "" {
-				name = file
-			}
-			if _, err := s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: name, event: event,
-				payload: payload, ref: dstRef, sha: sha, actor: actor, title: title}); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		spec := runSpec{event: event, payload: payload, actor: actor, title: title}
+		if _, err := s.startDefaultBranchRuns(ctx, repo, spec, broken, matches); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+// startDefaultBranchRuns starts the workflows on repo's default branch that
+// listen for spec.event and that matches accepts, at the branch's tip, and
+// returns their runs. Workflows that don't parse get a failed run if broken
+// says they look like listeners (broken may be nil).
+func (s *Server) startDefaultBranchRuns(ctx context.Context, repo *Repo, spec runSpec, broken func([]byte) bool,
+	matches func(*model.Workflow) bool) ([]int64, error) {
+	ref := "refs/heads/" + repo.DefaultBranch
+	sha, err := resolveRef(ctx, s.repoPath(repo.Name), ref)
+	if err != nil {
+		return nil, nil // no commits on the default branch yet
+	}
+	files, err := s.defaultBranchWorkflows(ctx, repo, sha)
+	if err != nil {
+		return nil, err
+	}
+	spec.repo, spec.ref, spec.sha = repo, ref, sha
+	var ids []int64
+	for _, file := range sortedKeys(files) {
+		yaml := files[file]
+		if !bytes.Contains(yaml, []byte(spec.event)) {
+			continue // only listeners need parsing
+		}
+		spec.file, spec.yaml, spec.name, spec.parseErr = file, string(yaml), file, nil
+		w, perr := wf.Parse(yaml)
+		if perr != nil {
+			if broken != nil && broken(yaml) {
+				spec.parseErr = perr
+				_, _ = s.createRun(ctx, spec)
+			}
+			continue
+		}
+		if !matches(w) {
+			continue
+		}
+		if w.Name != "" {
+			spec.name = w.Name
+		}
+		id, err := s.createRun(ctx, spec)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // mentionsRepo matches text that names the repository: name as a whole,
@@ -698,13 +811,15 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 type workflowInfo struct {
-	File     string             `json:"file"`
-	Name     string             `json:"name"`
-	Events   []string           `json:"events"`
-	Dispatch bool               `json:"dispatch"`
-	Inputs   []wf.DispatchInput `json:"inputs"`
-	Error    string             `json:"error,omitempty"`
-	Uploaded bool               `json:"uploaded,omitempty"`
+	File   string   `json:"file"`
+	Name   string   `json:"name"`
+	Events []string `json:"events"`
+	// The events' filters, e.g. workflow_run's workflows, by event.
+	EventDetails map[string]string  `json:"event_details,omitempty"`
+	Dispatch     bool               `json:"dispatch"`
+	Inputs       []wf.DispatchInput `json:"inputs"`
+	Error        string             `json:"error,omitempty"`
+	Uploaded     bool               `json:"uploaded,omitempty"`
 }
 
 func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
@@ -735,6 +850,14 @@ func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
 				info.Name = parsed.Name
 			}
 			info.Events = parsed.On()
+			for _, e := range info.Events {
+				if d := wf.EventDetails(parsed, e); d != "" {
+					if info.EventDetails == nil {
+						info.EventDetails = map[string]string{}
+					}
+					info.EventDetails[e] = d
+				}
+			}
 			info.Dispatch = wf.HasEvent(parsed, "workflow_dispatch")
 			info.Inputs = wf.DispatchInputs(parsed)
 		}

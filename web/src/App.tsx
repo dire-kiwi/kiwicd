@@ -12,6 +12,8 @@ import { RunPage } from "./pages/Run";
 import { RunnersPage } from "./pages/Runners";
 import { SettingsPage } from "./pages/Settings";
 import { JobRedirect } from "./pages/JobRedirect";
+import { AuditPage } from "./pages/Audit";
+import { describeAccess } from "./access";
 
 const MeContext = createContext<Me | null>(null);
 export const useMe = () => useContext(MeContext);
@@ -90,10 +92,12 @@ export function App() {
               </NavLink>
               <NavLink to="/runners">Runners</NavLink>
               <NavLink to="/settings">Settings</NavLink>
+              {me.access.admin && <NavLink to="/audit">Audit</NavLink>}
             </nav>
             <div className="topbar-right">
-              <span className="topbar-user" title={`kiwicd ${me.version}`}>
+              <span className="topbar-user" title={`${me.user}: ${describeAccess(me.access)}`}>
                 {me.user}
+                {!me.access.admin && <> · {me.access.role}</>}
               </span>
               <button className="btn btn-sm btn-ghost-inverse" onClick={logout}>
                 Sign out
@@ -111,6 +115,7 @@ export function App() {
             <Route path="/jobs/:jobId" element={<JobRedirect />} />
             <Route path="/runners" element={<RunnersPage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            {me.access.admin && <Route path="/audit" element={<AuditPage />} />}
             <Route path="/login" element={<Navigate to="/" replace />} />
             <Route path="*" element={<NotFound />} />
           </Routes>

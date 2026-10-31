@@ -62,6 +62,9 @@ func TestAPITokens(t *testing.T) {
 	}
 
 	// GitHub users' tokens expire within maxGitHubTokenDays.
+	if err := srv.saveGrant(RoleGrant{Kind: "user", Name: "octocat", Role: "viewer"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := srv.db.Exec(`INSERT INTO sessions (token_hash, created_at, expires_at, github_login) VALUES (?, 0, ?, 'octocat')`,
 		hashToken("sess"), nowMS()+60_000); err != nil {
 		t.Fatal(err)
@@ -113,7 +116,7 @@ func TestAPITokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.db.Close()
-	if user := srv.tokenUser(created.Token); user != "" {
-		t.Fatalf("token survived a password change: %q", user)
+	if p := srv.tokenPrincipal(created.Token); p != nil {
+		t.Fatalf("token survived a password change: %+v", p)
 	}
 }
