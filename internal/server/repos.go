@@ -191,7 +191,7 @@ func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, _ := res.LastInsertId()
-	s.audit(r, "repo.create", req.Name, "", req.Kind+" "+redactURL(req.URL))
+	s.audit(r, "repo.create", req.Name, "", strings.TrimSpace(req.Kind+" "+redactURL(req.URL)))
 	// The first sync clones a mirror and records existing refs as a baseline,
 	// so they don't trigger runs.
 	if err := s.syncRepo(ctx, id, true); err != nil {

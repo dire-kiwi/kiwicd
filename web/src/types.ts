@@ -1,10 +1,28 @@
 export type Status = "queued" | "in_progress" | "completed" | "pending";
 export type Conclusion = "" | "success" | "failure" | "cancelled" | "skipped";
 
+export type Role = "admin" | "maintainer" | "viewer";
+
+/** What the signed-in user (or the API token used) may do; see the server's access.go. */
+export interface Access {
+  role: Role;
+  admin: boolean;
+  /** Maintainer of every repository. */
+  maintain_all: boolean;
+  /** Otherwise of these: "owner/name" or "owner/*". */
+  maintain: string[];
+  /** The only repositories visible; null for all. */
+  repos: string[] | null;
+  /** Signed in with GitHub. */
+  github: boolean;
+  token?: APIToken;
+}
+
 export interface Me {
   user: string;
   version: string;
   public_url: string;
+  access: Access;
 }
 
 export interface Repo {
@@ -179,6 +197,43 @@ export interface APIToken {
   created_at: number;
   expires_at: number; // 0: never
   last_used_at: number;
+  /** At most this role; "" for its maker's. */
+  role: Role | "";
+  /** Only these repositories; empty for all. */
+  repos: string[];
+}
+
+/** A role given to a GitHub login, an organization's members or a team's ("org/team-slug"). */
+export interface RoleGrant {
+  kind: "user" | "org" | "team";
+  name: string;
+  role: Role;
+  /** Maintainers: "owner/name" or "owner/*"; empty for all repositories. */
+  repos: string[];
+  updated_at: number;
+}
+
+/** Someone who has signed in with GitHub, and the role they have now. */
+export interface GitHubUser {
+  login: string;
+  /** Organizations and teams with roles they were members of when they signed in: "org:NAME", "team:ORG/TEAM". */
+  memberships: string[];
+  signed_in_at: number;
+  role: Role | "";
+  maintain_all: boolean;
+  maintain: string[];
+}
+
+export interface AuditEntry {
+  id: number;
+  at: number;
+  actor: string;
+  token?: string;
+  client?: string;
+  action: string;
+  repo?: string;
+  target?: string;
+  detail?: string;
 }
 
 export interface GitHubApp {
@@ -189,10 +244,6 @@ export interface GitHubApp {
   /** The account or organization that owns the app. */
   owner: string;
   client_id: string;
-  /** GitHub logins that may sign in. */
-  allowed_users: string[];
-  /** Organizations whose members may sign in (the app must be installed on them). */
-  allowed_orgs: string[];
   created_at: number;
   install_url?: string;
 }
