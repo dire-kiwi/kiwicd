@@ -101,6 +101,8 @@ type Server struct {
 
 	// The GitHub App's caches and pending setups (see github.go).
 	gh githubState
+	// Runs waiting to be reported to GitHub as check runs (see checks.go).
+	checks checkReporter
 }
 
 func New(cfg Config) (*Server, error) {
@@ -174,6 +176,10 @@ func New(cfg Config) (*Server, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.migrateAllowList(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("roles: %w", err)
+	}
 	return s, nil
 }
 
@@ -208,77 +214,110 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
+// route is an HTTP route and who may use it.
+type route struct {
+	pattern string
+	// need is the role the route needs (see access.go); roleNone for routes
+	// anyone may use, which check what they need themselves.
+	need role
+	// repo finds the repository the request is about, for routes about one.
+	repo    *repoOf
+	handler http.HandlerFunc
+}
+
+func (s *Server) routes() []route {
+	const (
+		public     = roleNone
+		viewer     = roleViewer
+		maintainer = roleMaintainer
+		admin      = roleAdmin
+	)
+	return []route{
+		{"GET /healthz", public, nil, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) }},
+		{"POST /api/login", public, nil, s.handleLogin},
+		{"POST /api/logout", public, nil, s.handleLogout},
+		{"GET /api/me", viewer, nil, s.handleMe},
+		{"GET /api/auth/providers", public, nil, s.handleAuthProviders},
+		{"GET /api/auth/github", public, nil, s.handleGitHubLogin},
+		{"GET /api/auth/github/callback", public, nil, s.handleGitHubLoginCallback},
+
+		{"GET /api/github/app", admin, nil, s.handleGetGitHubApp},
+		{"PUT /api/github/app", admin, nil, s.handlePutGitHubApp},
+		{"DELETE /api/github/app", admin, nil, s.handleDeleteGitHubApp},
+		{"POST /api/github/app/manifest", admin, nil, s.handleGitHubAppManifest},
+		{"GET /api/github/app/callback", admin, nil, s.handleGitHubAppCallback},
+		{"GET /api/github/repos", admin, nil, s.handleListGitHubRepos},
+		{"POST /api/github/webhook", public, nil, s.handleGitHubWebhook},
+
+		{"GET /api/roles", admin, nil, s.handleListRoles},
+		{"PUT /api/roles", admin, nil, s.handlePutRole},
+		{"DELETE /api/roles", admin, nil, s.handleDeleteRole},
+		{"GET /api/users", admin, nil, s.handleListUsers},
+		{"GET /api/audit", admin, nil, s.handleAuditLog},
+
+		{"GET /api/repos", viewer, nil, s.handleListRepos},
+		{"POST /api/repos", admin, nil, s.handleCreateRepo},
+		{"GET /api/repos/{owner}/{name}", viewer, pathRepo, s.handleGetRepo},
+		{"PATCH /api/repos/{owner}/{name}", maintainer, pathRepo, s.handleUpdateRepo},
+		{"DELETE /api/repos/{owner}/{name}", admin, pathRepo, s.handleDeleteRepo},
+		{"POST /api/repos/{owner}/{name}/sync", maintainer, pathRepo, s.handleSyncRepo},
+		{"GET /api/repos/{owner}/{name}/workflows", viewer, pathRepo, s.handleListWorkflows},
+		{"POST /api/repos/{owner}/{name}/dispatch", maintainer, pathRepo, s.handleDispatch},
+		{"POST /api/repos/{owner}/{name}/dispatches", maintainer, pathRepo, s.handleRepositoryDispatch},
+		{"GET /api/repos/{owner}/{name}/uploaded-workflows/{file}", viewer, pathRepo, s.handleGetUploadedWorkflow},
+		{"PUT /api/repos/{owner}/{name}/uploaded-workflows/{file}", maintainer, pathRepo, s.handlePutUploadedWorkflow},
+		{"DELETE /api/repos/{owner}/{name}/uploaded-workflows/{file}", maintainer, pathRepo, s.handleDeleteUploadedWorkflow},
+
+		{"GET /api/runs", viewer, nil, s.handleListRuns},
+		{"GET /api/runs/{id}", viewer, runRepo, s.handleGetRun},
+		{"POST /api/runs/{id}/cancel", maintainer, runRepo, s.handleCancelRun},
+		{"POST /api/runs/{id}/rerun", maintainer, runRepo, s.handleRerun},
+		{"GET /api/jobs/{id}", viewer, jobRepo, s.handleGetJob},
+		{"GET /api/jobs/{id}/logs", viewer, jobRepo, s.handleJobLogs},
+		{"GET /api/jobs/{id}/events", viewer, jobRepo, s.handleJobEvents},
+		{"GET /api/events", viewer, eventsRepo, s.handleEvents},
+
+		{"GET /api/runners", viewer, nil, s.handleListRunners},
+		{"DELETE /api/runners/{id}", admin, nil, s.handleDeleteRunner},
+		{"POST /api/runners/registration-token", admin, nil, s.handleRegistrationToken},
+
+		// Everyone has their own tokens; the handlers check whose.
+		{"GET /api/tokens", viewer, nil, s.handleListTokens},
+		{"POST /api/tokens", viewer, nil, s.handleCreateToken},
+		{"DELETE /api/tokens/{id}", viewer, nil, s.handleDeleteToken},
+
+		// Without ?repo=, the global ones, which need an admin.
+		{"GET /api/secrets", maintainer, queryRepo, s.handleListSettings("secrets")},
+		{"PUT /api/secrets", maintainer, queryRepo, s.handlePutSetting("secrets")},
+		{"DELETE /api/secrets", maintainer, queryRepo, s.handleDeleteSetting("secrets")},
+		{"GET /api/variables", maintainer, queryRepo, s.handleListSettings("variables")},
+		{"PUT /api/variables", maintainer, queryRepo, s.handlePutSetting("variables")},
+		{"DELETE /api/variables", maintainer, queryRepo, s.handleDeleteSetting("variables")},
+
+		// Webhooks check their secret, agents their runner token, git its
+		// own way (see handleGit).
+		{"POST /api/hooks/{owner}/{name}", public, nil, s.handleWebhook},
+		{"POST /api/runner/register", public, nil, s.handleRunnerRegister},
+		{"POST /api/runner/poll", public, nil, s.handleRunnerPoll},
+		{"POST /api/runner/jobs/{id}/update", public, nil, s.handleRunnerUpdate},
+		{"POST /api/runner/jobs/{id}/complete", public, nil, s.handleRunnerComplete},
+		{"GET /api/runner/jobs/{id}/source", public, nil, s.handleRunnerSource},
+		{"/git/", public, nil, s.handleGit},
+		{"/", public, nil, s.handleStatic},
+	}
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	ui := func(h http.HandlerFunc) http.Handler { return s.requireUser(h) }
-
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
-	mux.HandleFunc("POST /api/login", s.handleLogin)
-	mux.HandleFunc("POST /api/logout", s.handleLogout)
-	mux.Handle("GET /api/me", ui(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"user": requestUser(r), "version": s.cfg.Version, "public_url": s.publicURL(r)})
-	}))
-	mux.HandleFunc("GET /api/auth/providers", s.handleAuthProviders)
-	mux.HandleFunc("GET /api/auth/github", s.handleGitHubLogin)
-	mux.HandleFunc("GET /api/auth/github/callback", s.handleGitHubLoginCallback)
-
-	mux.Handle("GET /api/github/app", ui(s.handleGetGitHubApp))
-	mux.Handle("PUT /api/github/app", ui(s.handlePutGitHubApp))
-	mux.Handle("PATCH /api/github/app", ui(s.handleUpdateGitHubApp))
-	mux.Handle("DELETE /api/github/app", ui(s.handleDeleteGitHubApp))
-	mux.Handle("POST /api/github/app/manifest", ui(s.handleGitHubAppManifest))
-	mux.Handle("GET /api/github/app/callback", ui(s.handleGitHubAppCallback))
-	mux.Handle("GET /api/github/repos", ui(s.handleListGitHubRepos))
-	mux.HandleFunc("POST /api/github/webhook", s.handleGitHubWebhook)
-
-	mux.Handle("GET /api/repos", ui(s.handleListRepos))
-	mux.Handle("POST /api/repos", ui(s.handleCreateRepo))
-	mux.Handle("GET /api/repos/{owner}/{name}", ui(s.handleGetRepo))
-	mux.Handle("PATCH /api/repos/{owner}/{name}", ui(s.handleUpdateRepo))
-	mux.Handle("DELETE /api/repos/{owner}/{name}", ui(s.handleDeleteRepo))
-	mux.Handle("POST /api/repos/{owner}/{name}/sync", ui(s.handleSyncRepo))
-	mux.Handle("GET /api/repos/{owner}/{name}/workflows", ui(s.handleListWorkflows))
-	mux.Handle("POST /api/repos/{owner}/{name}/dispatch", ui(s.handleDispatch))
-	mux.Handle("POST /api/repos/{owner}/{name}/dispatches", ui(s.handleRepositoryDispatch))
-	mux.Handle("GET /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handleGetUploadedWorkflow))
-	mux.Handle("PUT /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handlePutUploadedWorkflow))
-	mux.Handle("DELETE /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handleDeleteUploadedWorkflow))
-
-	mux.Handle("GET /api/runs", ui(s.handleListRuns))
-	mux.Handle("GET /api/runs/{id}", ui(s.handleGetRun))
-	mux.Handle("POST /api/runs/{id}/cancel", ui(s.handleCancelRun))
-	mux.Handle("POST /api/runs/{id}/rerun", ui(s.handleRerun))
-	mux.Handle("GET /api/jobs/{id}", ui(s.handleGetJob))
-	mux.Handle("GET /api/jobs/{id}/logs", ui(s.handleJobLogs))
-	mux.Handle("GET /api/jobs/{id}/events", ui(s.handleJobEvents))
-	mux.Handle("GET /api/events", ui(s.handleEvents))
-
-	mux.Handle("GET /api/runners", ui(s.handleListRunners))
-	mux.Handle("DELETE /api/runners/{id}", ui(s.handleDeleteRunner))
-	mux.Handle("POST /api/runners/registration-token", ui(s.handleRegistrationToken))
-
-	mux.Handle("GET /api/tokens", ui(s.handleListTokens))
-	mux.Handle("POST /api/tokens", ui(s.handleCreateToken))
-	mux.Handle("DELETE /api/tokens/{id}", ui(s.handleDeleteToken))
-
-	mux.Handle("GET /api/secrets", ui(s.handleListSettings("secrets")))
-	mux.Handle("PUT /api/secrets", ui(s.handlePutSetting("secrets")))
-	mux.Handle("DELETE /api/secrets", ui(s.handleDeleteSetting("secrets")))
-	mux.Handle("GET /api/variables", ui(s.handleListSettings("variables")))
-	mux.Handle("PUT /api/variables", ui(s.handlePutSetting("variables")))
-	mux.Handle("DELETE /api/variables", ui(s.handleDeleteSetting("variables")))
-
-	mux.HandleFunc("POST /api/hooks/{owner}/{name}", s.handleWebhook)
-
-	mux.HandleFunc("POST /api/runner/register", s.handleRunnerRegister)
-	mux.HandleFunc("POST /api/runner/poll", s.handleRunnerPoll)
-	mux.HandleFunc("POST /api/runner/jobs/{id}/update", s.handleRunnerUpdate)
-	mux.HandleFunc("POST /api/runner/jobs/{id}/complete", s.handleRunnerComplete)
-	mux.HandleFunc("GET /api/runner/jobs/{id}/source", s.handleRunnerSource)
-
-	mux.HandleFunc("/git/", s.handleGit)
-	mux.HandleFunc("/", s.handleStatic)
+	for _, rt := range s.routes() {
+		mux.Handle(rt.pattern, s.authorize(rt))
+	}
 	return logRequests(s.log, s.secureHeaders(mux))
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{"user": requestUser(r), "version": s.cfg.Version, "public_url": s.publicURL(r),
+		"access": requestPrincipal(r).access()})
 }
 
 func logRequests(log *slog.Logger, next http.Handler) http.Handler {
@@ -361,59 +400,37 @@ func requestPassword(r *http.Request) (string, bool) {
 // adminUser is who the admin password and its sessions act as.
 const adminUser = "admin"
 
-// authenticate returns who r is: adminUser for a session made with the
-// admin password or the password itself, a GitHub login for a session made
-// by signing in with GitHub (see githublogin.go), whoever made the API token
-// it carries (see apitokens.go), or "" if r isn't
-// authenticated. The error is errTooManyPasswords if r's client has had too
-// many wrong passwords to try another now.
-func (s *Server) authenticate(r *http.Request) (string, error) {
+// authenticate returns who r is from (see access.go): the admin for a
+// session made with the admin password or the password itself, a GitHub
+// user with a role for a session made by signing in with GitHub (see
+// githublogin.go), whoever made the API token it carries, limited by the
+// token's scope (see apitokens.go), or nil if r isn't authenticated. The
+// error is errTooManyPasswords if r's client has had too many wrong
+// passwords to try another now.
+func (s *Server) authenticate(r *http.Request) (*principal, error) {
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		var exp int64
 		var login string
 		err := s.db.QueryRow(`SELECT expires_at, github_login FROM sessions WHERE token_hash = ?`, hashToken(c.Value)).Scan(&exp, &login)
 		if err == nil && exp > nowMS() {
 			if login == "" {
-				login = adminUser
+				return adminPrincipal(), nil
 			}
-			return login, nil
+			if p, err := s.githubPrincipal(login); err == nil && p.role != roleNone {
+				return p, nil
+			}
 		}
 	}
 	if p, ok := requestPassword(r); ok && p != "" {
-		if user := s.tokenUser(p); user != "" {
-			return user, nil
+		if strings.HasPrefix(p, apiTokenPrefix) {
+			return s.tokenPrincipal(p), nil
 		}
 		if ok, err := s.tryPassword(r, p); !ok {
-			return "", err
+			return nil, err
 		}
-		return adminUser, nil
+		return adminPrincipal(), nil
 	}
-	return "", nil
-}
-
-type userKey struct{}
-
-// requestUser is who made a request that requireUser let through.
-func requestUser(r *http.Request) string {
-	if u, ok := r.Context().Value(userKey{}).(string); ok {
-		return u
-	}
-	return adminUser
-}
-
-func (s *Server) requireUser(next http.HandlerFunc) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		user, err := s.authenticate(r)
-		if err != nil {
-			httpError(w, http.StatusTooManyRequests, "%v", err)
-			return
-		}
-		if user == "" {
-			httpError(w, http.StatusUnauthorized, "login required")
-			return
-		}
-		next(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
-	})
+	return nil, nil
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -477,13 +494,14 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	push := strings.HasSuffix(r.URL.Path, "/git-receive-pack") || r.URL.Query().Get("service") == "git-receive-pack"
 	// Jobs can fetch with their KIWICD_TOKEN, but not push. A job token
 	// isn't tried as the admin password, so it doesn't count as a wrong one.
+	var p *principal
 	if push || !s.jobCanRead(r, name) {
-		user, err := s.authenticate(r)
-		if err != nil {
+		var err error
+		if p, err = s.authenticate(r); err != nil {
 			http.Error(w, err.Error(), http.StatusTooManyRequests)
 			return
 		}
-		if user == "" {
+		if p == nil {
 			w.Header().Set("WWW-Authenticate", `Basic realm="kiwicd"`)
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
@@ -494,12 +512,20 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo, err := s.getRepo(name)
-	if err != nil {
+	if err != nil || p != nil && !p.canView(repo.Name) {
 		http.NotFound(w, r)
 		return
 	}
+	user := "job"
+	if p != nil {
+		user = p.user
+	}
 	if push && repo.Kind != "hosted" {
 		http.Error(w, "this repository is a mirror; push to its origin instead", http.StatusForbidden)
+		return
+	}
+	if push && !p.canMaintain(repo.Name) {
+		http.Error(w, forbidden(p, roleMaintainer, repo.Name), http.StatusForbidden)
 		return
 	}
 	gitPath, _ := exec.LookPath("git")
@@ -510,7 +536,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 		Env: []string{
 			"GIT_PROJECT_ROOT=" + filepath.Join(s.cfg.DataDir, "repos"),
 			"GIT_HTTP_EXPORT_ALL=1",
-			"REMOTE_USER=" + adminUser,
+			"REMOTE_USER=" + user,
 		},
 	}
 	h.ServeHTTP(w, r)

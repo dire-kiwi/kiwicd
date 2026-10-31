@@ -322,3 +322,20 @@ func TestCreateAndDelete(t *testing.T) {
 		t.Errorf("refs %v", repo.Refs)
 	}
 }
+
+func TestRunBranch(t *testing.T) {
+	for _, c := range []struct {
+		run  Run
+		want string
+	}{
+		{Run{Event: "push", Ref: "refs/heads/release/1"}, "release/1"},
+		{Run{Event: "push", Ref: "refs/tags/v1"}, "v1"},
+		{Run{Event: "pull_request", Ref: "refs/pull/3/merge",
+			EventJSON: map[string]any{"pull_request": map[string]any{"head": map[string]any{"ref": "feature"}}}}, "feature"},
+		{Run{Event: "pull_request", Ref: "refs/pull/3/merge"}, "refs/pull/3/merge"},
+	} {
+		if got := runBranch(&c.run); got != c.want {
+			t.Errorf("%+v: %q, want %q", c.run, got, c.want)
+		}
+	}
+}

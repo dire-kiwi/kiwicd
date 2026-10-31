@@ -24,6 +24,7 @@ const usage = `kiwicd: inspect and start kiwicd runs, and configure secrets and 
 
 Usage:
   kiwicd login [--url URL] [--token TOKEN | --password-stdin] [--name NAME] [--expires DAYS]
+               [--role ROLE] [--repo OWNER/NAME]...
   kiwicd logout
   kiwicd whoami
 
@@ -50,7 +51,7 @@ Usage:
 
   kiwicd runner list
   kiwicd token list
-  kiwicd token create NAME [--expires DAYS]
+  kiwicd token create NAME [--expires DAYS] [--role ROLE] [--repo OWNER/NAME]...
   kiwicd token revoke ID
 
   kiwicd mcp [--read-only]     serve the API to agents over MCP (stdio)
@@ -61,6 +62,13 @@ Without --repo, secrets and variables are the global ones, which every
 repository gets. List and view commands take --json. kiwicd login saves the
 server and an API token in ~/.config/kiwicd/cli.json; KIWICD_URL and
 KIWICD_API_TOKEN override them.
+
+What you may do depends on your role, which kiwicd whoami shows: viewers see
+repositories, runs, logs and runners; maintainers of a repository also start,
+re-run and cancel its runs and set its secrets and variables; admins can do
+everything, including global secrets and variables. A token can be limited
+with --role viewer|maintainer|admin (no higher than yours) and with --repo,
+which it then sees alone.
 `
 
 // App is one invocation of the command.
@@ -269,8 +277,12 @@ func login(ctx context.Context, a *App, args []string) error {
 	host, _ := os.Hostname()
 	name := fs.String("name", "kiwicd CLI on "+orDash(host), "the new token's name")
 	expires := fs.Int("expires", 0, "days until the new token expires (0: never)")
+	role, repos := scopeFlags(fs)
 	if _, err := flags(fs, args, 0, 0); err != nil {
 		return err
+	}
+	if *token != "" && (*role != "" || len(*repos) > 0) {
+		return errors.New("--role and --repo are for the token login makes, not one given with --token")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -300,15 +312,15 @@ func login(ctx context.Context, a *App, args []string) error {
 			return err
 		}
 		c := &Client{URL: cfg.URL, Token: password}
-		t, _, err := c.CreateToken(ctx, *name, *expires)
+		t, _, err := c.CreateToken(ctx, NewToken{Name: *name, ExpiresInDays: *expires, Role: *role, Repos: *repos})
 		if err != nil {
 			return err
 		}
 		*token = t
 	}
 	c := &Client{URL: cfg.URL, Token: *token}
-	var me Me
-	if err := c.Get(ctx, "/api/me", &me); err != nil {
+	me, err := c.Me(ctx)
+	if err != nil {
 		return err
 	}
 	cfg.Token = *token
@@ -316,8 +328,22 @@ func login(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Stdout, "Logged in to %s as %s (server %s); saved to %s\n", cfg.URL, me.User, me.Version, p)
+	fmt.Fprintf(a.Stdout, "Logged in to %s as %s, %s (server %s); saved to %s\n", cfg.URL, me.User, me.Access, me.Version, p)
 	return nil
+}
+
+// repeated is a flag that may be given more than once.
+type repeated []string
+
+func (r *repeated) String() string     { return strings.Join(*r, ",") }
+func (r *repeated) Set(v string) error { *r = append(*r, v); return nil }
+
+// scopeFlags adds --role and --repo, for limiting a new token.
+func scopeFlags(fs *flag.FlagSet) (*string, *[]string) {
+	role := fs.String("role", "", "limit the token to a role: viewer (read-only), maintainer or admin")
+	var repos repeated
+	fs.Var(&repos, "repo", "limit the token to a repository, OWNER/NAME (repeatable); it sees no others")
+	return role, (*[]string)(&repos)
 }
 
 func logout(ctx context.Context, a *App, args []string) error {
@@ -348,11 +374,14 @@ func whoami(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	var me Me
-	if err := c.Get(ctx, "/api/me", &me); err != nil {
+	me, err := c.Me(ctx)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Stdout, "%s on %s (server %s)\n", me.User, c.URL, me.Version)
+	fmt.Fprintf(a.Stdout, "%s on %s (server %s): %s\n", me.User, c.URL, me.Version, me.Access)
+	if t := me.Access.Token; t != nil {
+		fmt.Fprintf(a.Stdout, "with API token %d, %s, scope %s\n", t.ID, t.Name, t.Scope())
+	}
 	return nil
 }
 
@@ -766,12 +795,17 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 }
 
 // selectJobs picks a run's jobs by ID, key or name (sel "" for all), and
-// only failed ones if failed.
+// only failed ones if failed. Jobs that call a reusable workflow have no
+// logs of their own: selecting one selects the jobs of the workflow it calls.
 func selectJobs(jobs []Job, sel string, failed bool) ([]Job, error) {
 	var out []Job
 	id, _ := strconv.ParseInt(sel, 10, 64)
 	for _, j := range jobs {
-		if sel != "" && j.ID != id && j.Key != sel && j.Name != sel && !strings.HasPrefix(j.Name, sel+" (") {
+		if j.Uses != "" {
+			continue
+		}
+		if sel != "" && j.ID != id && j.Key != sel && j.Name != sel && !strings.HasPrefix(j.Name, sel+" (") &&
+			!strings.HasPrefix(j.Name, sel+" / ") && !calledBy(jobs, j.Name, id) {
 			continue
 		}
 		if failed && (j.Status != "completed" || j.Conclusion == "success" || j.Conclusion == "skipped") {
@@ -783,6 +817,17 @@ func selectJobs(jobs []Job, sel string, failed bool) ([]Job, error) {
 		return nil, fmt.Errorf("the run has no job %q", sel)
 	}
 	return out, nil
+}
+
+// calledBy reports whether the job named name is in a workflow the calling
+// job with ID id calls.
+func calledBy(jobs []Job, name string, id int64) bool {
+	for _, c := range jobs {
+		if c.ID == id && c.Uses != "" && strings.HasPrefix(name, c.Name+" / ") {
+			return true
+		}
+	}
+	return false
 }
 
 func runLogs(ctx context.Context, a *App, args []string) error {
@@ -1080,14 +1125,15 @@ func tokenList(ctx context.Context, a *App, args []string) error {
 		if t.ExpiresAt != 0 {
 			exp = timestamp(t.ExpiresAt)
 		}
-		rows = append(rows, []string{strconv.FormatInt(t.ID, 10), t.Name, t.User, timestamp(t.CreatedAt), exp, ago(t.LastUsedAt)})
+		rows = append(rows, []string{strconv.FormatInt(t.ID, 10), t.Name, t.User, t.Scope(), timestamp(t.CreatedAt), exp, ago(t.LastUsedAt)})
 	}
-	return table(a.Stdout, "ID\tNAME\tUSER\tCREATED\tEXPIRES\tLAST USED", rows)
+	return table(a.Stdout, "ID\tNAME\tUSER\tSCOPE\tCREATED\tEXPIRES\tLAST USED", rows)
 }
 
 func tokenCreate(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	expires := fs.Int("expires", 0, "days until it expires (0: never)")
+	role, repos := scopeFlags(fs)
 	pos, err := flags(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -1096,15 +1142,15 @@ func tokenCreate(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	token, info, err := c.CreateToken(ctx, pos[0], *expires)
+	token, info, err := c.CreateToken(ctx, NewToken{Name: pos[0], ExpiresInDays: *expires, Role: *role, Repos: *repos})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintln(a.Stdout, token)
 	if info.ExpiresAt != 0 {
-		fmt.Fprintf(a.Stderr, "Token %d expires %s. It's shown only once.\n", info.ID, timestamp(info.ExpiresAt))
+		fmt.Fprintf(a.Stderr, "Token %d (scope %s) expires %s. It's shown only once.\n", info.ID, info.Scope(), timestamp(info.ExpiresAt))
 	} else {
-		fmt.Fprintf(a.Stderr, "Token %d doesn't expire. It's shown only once.\n", info.ID)
+		fmt.Fprintf(a.Stderr, "Token %d (scope %s) doesn't expire. It's shown only once.\n", info.ID, info.Scope())
 	}
 	return nil
 }

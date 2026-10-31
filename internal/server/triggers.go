@@ -68,7 +68,7 @@ func (s *Server) onWorkflowRun(ctx context.Context, a workflowRunActivity) error
 	if err != nil {
 		return nil
 	}
-	branch := strings.TrimPrefix(strings.TrimPrefix(run.Ref, "refs/heads/"), "refs/tags/")
+	branch := runBranch(run)
 	matches := func(w *model.Workflow) bool {
 		return wf.MatchesWorkflowRun(w, wf.WorkflowRun{Workflow: run.WorkflowName, Action: a.action, Branch: branch})
 	}
@@ -84,6 +84,20 @@ func (s *Server) onWorkflowRun(ctx context.Context, a workflowRunActivity) error
 		title: run.Title, depth: run.TriggerDepth + 1}
 	_, err = s.startDefaultBranchRuns(ctx, repo, spec, nil, matches)
 	return err
+}
+
+// runBranch is a run's head_branch in workflow_run events: its branch or
+// tag name, or for a pull request's run the pull request's head branch, as
+// on GitHub.
+func runBranch(run *Run) string {
+	if run.Event == "pull_request" {
+		pr, _ := run.EventJSON["pull_request"].(map[string]any)
+		head, _ := pr["head"].(map[string]any)
+		if ref, ok := head["ref"].(string); ok {
+			return ref
+		}
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(run.Ref, "refs/heads/"), "refs/tags/")
 }
 
 // matchingDefaultBranchWorkflows returns the files of the workflows on the
@@ -120,7 +134,7 @@ func (s *Server) workflowRunPayload(run *Run, repo *Repo, action string) map[str
 	case "completed":
 		status, conclusion = protocol.StatusCompleted, run.Conclusion
 	}
-	branch := strings.TrimPrefix(strings.TrimPrefix(run.Ref, "refs/heads/"), "refs/tags/")
+	branch := runBranch(run)
 	stamp := func(ms int64) any {
 		if ms == 0 {
 			return nil

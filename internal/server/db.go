@@ -139,6 +139,19 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	expires_at INTEGER NOT NULL DEFAULT 0,  -- 0: never
 	last_used_at INTEGER NOT NULL DEFAULT 0
 );
+-- The reusable workflows a run's jobs call, read when it was created (see
+-- called.go).
+CREATE TABLE IF NOT EXISTS run_workflows (
+	run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	path TEXT NOT NULL,                 -- the calling jobs' keys from the run's workflow down: build/deploy
+	uses TEXT NOT NULL,                 -- as the calling job has it
+	source TEXT NOT NULL,               -- kiwicd | github
+	repo TEXT NOT NULL,                 -- owner/name there
+	file TEXT NOT NULL,                 -- .github/workflows/x.yml
+	sha TEXT NOT NULL,
+	yaml TEXT NOT NULL,
+	PRIMARY KEY (run_id, path)
+);
 -- The GitHub App (see github.go): at most one row.
 CREATE TABLE IF NOT EXISTS github_app (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -151,10 +164,54 @@ CREATE TABLE IF NOT EXISTS github_app (
 	client_secret TEXT NOT NULL,        -- encrypted, as are the next two
 	private_key TEXT NOT NULL,
 	webhook_secret TEXT NOT NULL,
-	allowed_users TEXT NOT NULL DEFAULT '[]', -- GitHub logins that may sign in
-	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- organizations whose members may
+	allowed_users TEXT NOT NULL DEFAULT '[]', -- before roles: GitHub logins that
+	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- may sign in, and organizations
 	created_at INTEGER NOT NULL
 );
+-- Roles given to GitHub logins, organizations' and teams' members (see
+-- access.go).
+CREATE TABLE IF NOT EXISTS role_grants (
+	kind TEXT NOT NULL,                 -- user | org | team
+	name TEXT NOT NULL COLLATE NOCASE,  -- login, organization or ORG/TEAM
+	role TEXT NOT NULL,                 -- admin | maintainer | viewer
+	repos TEXT NOT NULL DEFAULT '[]',   -- maintainers' OWNER/NAME or OWNER/*; [] for all
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (kind, name)
+);
+-- People who have signed in with GitHub, and the organizations and teams
+-- with roles they were members of then.
+CREATE TABLE IF NOT EXISTS github_users (
+	login TEXT PRIMARY KEY COLLATE NOCASE,
+	memberships TEXT NOT NULL DEFAULT '[]', -- org:NAME, team:ORG/TEAM
+	signed_in_at INTEGER NOT NULL
+);
+-- Who changed access and settings (see audit.go).
+CREATE TABLE IF NOT EXISTS audit_log (
+	id INTEGER PRIMARY KEY,
+	at INTEGER NOT NULL,
+	actor TEXT NOT NULL,                -- admin, a GitHub login, or kiwicd itself
+	token TEXT NOT NULL DEFAULT '',     -- the API token used, if any
+	client TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL,               -- secret.set, role.delete, ...
+	repo TEXT NOT NULL DEFAULT '',
+	target TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS audit_repo ON audit_log(repo, id) WHERE repo != '';
+-- Check runs on GitHub for runs' jobs (see checks.go): job_id 0 is a run
+-- that failed before it had jobs.
+CREATE TABLE IF NOT EXISTS github_checks (
+	run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	job_id INTEGER NOT NULL,
+	repo TEXT NOT NULL,                 -- owner/name on GitHub
+	check_run_id INTEGER NOT NULL,
+	check_suite_id INTEGER NOT NULL DEFAULT 0,
+	state TEXT NOT NULL,                -- what was last reported: status/conclusion
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (run_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS github_checks_run ON github_checks(check_run_id);
+CREATE INDEX IF NOT EXISTS github_checks_suite ON github_checks(check_suite_id);
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -208,6 +265,22 @@ var migrations = []struct{ table, column, sql string }{
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
+	// An API token's scope (see access.go): '' and [] for its maker's full
+	// rights.
+	{"api_tokens", "role", `ALTER TABLE api_tokens ADD COLUMN role TEXT NOT NULL DEFAULT ''`},
+	{"api_tokens", "repos", `ALTER TABLE api_tokens ADD COLUMN repos TEXT NOT NULL DEFAULT '[]'`},
+	// Jobs of reusable workflows (see called.go): the calling job's row, and
+	// for a calling job what it calls and the inputs it gives.
+	{"jobs", "parent_id", `ALTER TABLE jobs ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0`},
+	{"jobs", "uses", `ALTER TABLE jobs ADD COLUMN uses TEXT NOT NULL DEFAULT ''`},
+	{"jobs", "inputs", `ALTER TABLE jobs ADD COLUMN inputs TEXT NOT NULL DEFAULT 'null'`},
+	// Whether runs of workflows that aren't the GitHub repository's own
+	// (repository_push and repository_pull_request listeners, uploaded
+	// workflows) are reported to it as check runs (see checks.go).
+	{"repos", "report_checks", `ALTER TABLE repos ADD COLUMN report_checks INTEGER NOT NULL DEFAULT 0`},
+	// Whether pull requests from forks run the repository's pull_request
+	// workflows (see pullrequest.go).
+	{"repos", "fork_pull_requests", `ALTER TABLE repos ADD COLUMN fork_pull_requests INTEGER NOT NULL DEFAULT 0`},
 	// How many workflow_run events led to a run: 0 for others (see triggers.go).
 	{"runs", "trigger_depth", `ALTER TABLE runs ADD COLUMN trigger_depth INTEGER NOT NULL DEFAULT 0`},
 }

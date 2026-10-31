@@ -158,12 +158,16 @@ func MatchesRepositoryPush(w *model.Workflow, repo, ref string, changedFiles []s
 // requests from forks only trigger it with forks: true.
 const RepositoryPullRequest = "repository_pull_request"
 
-// PullRequest is what repository_pull_request filters look at.
+// PullRequest is what pull_request and repository_pull_request filters look
+// at.
 type PullRequest struct {
 	Repo   string // the kiwicd repository the pull request is on
 	Action string // opened, synchronize, closed, ...
 	Base   string // the base branch
 	Fork   bool   // the head branch is in another repository
+	// The files the pull request changes, for paths filters; nil when
+	// unknown, which passes them.
+	ChangedFiles []string
 }
 
 var defaultPullRequestTypes = []string{"opened", "synchronize", "reopened"}
@@ -192,17 +196,40 @@ func MatchesRepositoryPullRequest(w *model.Workflow, pr PullRequest) bool {
 	if pr.Fork && cfg["forks"] != true {
 		return false
 	}
+	return matchesPullRequestFilters(cfg, pr, false)
+}
+
+// MatchesPullRequest reports whether an event of a pull request on the
+// workflow's own repository triggers its pull_request: types (default
+// opened, synchronize and reopened), branches and branches-ignore (the base
+// branch), and paths and paths-ignore (the files the pull request changes).
+// Whether pull requests from forks run isn't up to the workflow, which comes
+// from the pull request, so pr.Fork is the caller's business.
+func MatchesPullRequest(w *model.Workflow, pr PullRequest) bool {
+	cfg, ok := eventConfig(w, "pull_request")
+	return ok && matchesPullRequestFilters(cfg, pr, true)
+}
+
+func matchesPullRequestFilters(cfg map[string]any, pr PullRequest, paths bool) bool {
 	if !matchesTypes(cfg, pr.Action, defaultPullRequestTypes) {
 		return false
 	}
-	// Only branch filters apply, to the base branch.
-	branches := map[string]any{}
-	for _, k := range []string{"branches", "branches-ignore"} {
+	// The branch filters apply to the base branch; tags filters don't apply.
+	filters := map[string]any{}
+	keys := []string{"branches", "branches-ignore"}
+	if paths {
+		keys = append(keys, "paths", "paths-ignore")
+	}
+	for _, k := range keys {
 		if v, ok := cfg[k]; ok {
-			branches[k] = v
+			filters[k] = v
 		}
 	}
-	return matchesPushFilters(branches, "refs/heads/"+pr.Base, nil)
+	var changed []string
+	if paths {
+		changed = pr.ChangedFiles
+	}
+	return matchesPushFilters(filters, "refs/heads/"+pr.Base, changed)
 }
 
 // matchesTypes reports whether an event's activity type is in the event's
@@ -462,6 +489,11 @@ type Env struct {
 	Matrix   map[string]any
 	// Results of finished jobs, by job ID.
 	Results map[string]JobResult
+	// Secrets is the secrets context, for a calling job's secrets: mapping.
+	Secrets map[string]string
+	// Jobs is the jobs context: the results of a reusable workflow's jobs,
+	// for its outputs.
+	Jobs map[string]JobResult
 }
 
 type JobResult struct {
@@ -488,6 +520,10 @@ func (e *Env) interpreter() exprparser.Interpreter {
 	if vars == nil {
 		vars = map[string]string{}
 	}
+	secrets := e.Secrets
+	if secrets == nil {
+		secrets = map[string]string{}
+	}
 	return exprparser.NewInterpeter(&exprparser.EvaluationEnvironment{
 		Github:   e.Github,
 		Env:      map[string]string{},
@@ -498,7 +534,8 @@ func (e *Env) interpreter() exprparser.Interpreter {
 		Strategy: map[string]any{},
 		Job:      &model.JobContext{Status: "success"},
 		Runner:   map[string]any{},
-		Secrets:  map[string]string{},
+		Secrets:  secrets,
+		Jobs:     jobsContext(e.Jobs),
 	}, exprparser.Config{Run: &model.Run{Workflow: e.Workflow, JobID: e.JobID}, Context: "job"})
 }
 

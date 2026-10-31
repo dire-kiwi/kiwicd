@@ -1,4 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
+import { useMe } from "../App";
+import { canMaintain } from "../access";
 import { Link, NavLink, useNavigate, useParams } from "react-router-dom";
 import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
@@ -6,13 +8,14 @@ import { PlanGraph } from "../components/PlanGraph";
 import { StatusIcon } from "../components/StatusIcon";
 import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../components/ui";
 import { useDocumentTitle, useEventSource, useFetch, useNow } from "../hooks";
-import { buildGroups, jobState, type PlanGroup } from "../runmodel";
-import type { Job, Run, RunDetail } from "../types";
+import { buildGroups, groupJobs, jobState, type CalledItem, type PlanGroup } from "../runmodel";
+import type { CalledWorkflow, Job, Run, RunDetail } from "../types";
 import { absoluteTime, classes, elapsed, eventLabel, refName, relativeTime, shortSha, stateLabel, visualState } from "../util";
 
 export function RunPage() {
   const { id = "", jobId } = useParams();
   const navigate = useNavigate();
+  const me = useMe();
   const detail = useFetch<RunDetail>(`/api/runs/${id}`);
   const { setData, reload } = detail;
   const [actionError, setActionError] = useState<string>();
@@ -65,7 +68,8 @@ export function RunPage() {
   const st = visualState(run.status, run.conclusion, run.cancel_requested);
   const selectedJob = jobId ? jobs.find((j) => String(j.id) === jobId) : undefined;
   const pushed = run.event === "repository_push" ? pushedTo(run.event_payload) : undefined;
-  const pull = run.event === "repository_pull_request" ? pullRequestOf(run.event_payload) : undefined;
+  const pull =
+    run.event === "repository_pull_request" || run.event === "pull_request" ? pullRequestOf(run.event_payload) : undefined;
   const after = run.event === "workflow_run" ? workflowRunOf(run.event_payload) : undefined;
   const dispatched = run.event === "repository_dispatch" ? dispatchOf(run.event_payload) : undefined;
   const changedRef = run.event === "create" || run.event === "delete" ? refOf(run.event_payload) : undefined;
@@ -112,7 +116,7 @@ export function RunPage() {
           </h1>
         </div>
         <div className="run-actions">
-          {run.status !== "completed" ? (
+          {!canMaintain(me?.access, run.repo) ? null : run.status !== "completed" ? (
             <button className="btn btn-danger-outline" onClick={cancel} disabled={busy || run.cancel_requested}>
               {run.cancel_requested ? "Cancelling…" : "Cancel run"}
             </button>
@@ -218,7 +222,15 @@ export function RunPage() {
           <span className="pre-wrap">{run.error}</span>
         </ErrorBox>
       )}
-      {!run.protected && !run.error && (
+      {!run.protected && !run.error && run.event === "pull_request" && (
+        <Flash kind="warn">
+          <span>
+            This run is on a pull request, whose workflow comes from the pull request, so its jobs get no secrets except{" "}
+            <span className="mono">KIWICD_TOKEN</span>, which only fetches {run.repo}.
+          </span>
+        </Flash>
+      )}
+      {!run.protected && !run.error && run.event !== "pull_request" && (
         <Flash kind="warn">
           <span>
             <span className="mono">{refName(run.ref)}</span> isn't a protected ref of {run.repo}, so this run's jobs get no secrets except{" "}
@@ -254,7 +266,7 @@ export function RunPage() {
               </ErrorBox>
             )
           ) : (
-            <RunSummary run={run} groups={groups} now={now} />
+            <RunSummary run={run} groups={groups} workflows={detail.data?.workflows ?? []} now={now} />
           )}
         </section>
       </div>
@@ -266,7 +278,19 @@ function JobNav({ runId, groups, now }: { runId: number; groups: PlanGroup[]; no
   return (
     <ul className="side-jobs">
       {groups.map((g) =>
-        g.jobs.length === 0 ? (
+        g.uses && g.items.length > 0 ? (
+          <li key={g.key} className="side-group">
+            <div className="side-group-title" title={g.uses}>
+              <StatusIcon state={g.state} size={14} />
+              <span className="ellipsis">{g.name}</span>
+            </div>
+            <ul>
+              {g.items.map((item) => (
+                <CalledNavItem key={item.key} runId={runId} item={item} now={now} />
+              ))}
+            </ul>
+          </li>
+        ) : g.jobs.length === 0 ? (
           <li key={g.key}>
             <div className="side-link side-disabled" title={g.state === "pending" ? "Waiting for dependencies" : undefined}>
               <StatusIcon state={g.state} size={14} />
@@ -294,6 +318,29 @@ function JobNav({ runId, groups, now }: { runId: number; groups: PlanGroup[]; no
   );
 }
 
+function CalledNavItem({ runId, item, now }: { runId: number; item: CalledItem; now: number }) {
+  const indent = { paddingLeft: 8 + item.depth * 14 };
+  if (!item.job || item.caller) {
+    return (
+      <li>
+        <div className={classes("side-link", !item.job && "side-disabled", item.caller && "side-caller")} style={indent} title={item.job?.uses}>
+          <StatusIcon state={item.job ? jobState(item.job) : "pending"} size={14} />
+          <span className="ellipsis">{item.label}</span>
+        </div>
+      </li>
+    );
+  }
+  return (
+    <li>
+      <NavLink to={`/runs/${runId}/jobs/${item.job.id}`} className="side-link" style={indent}>
+        <StatusIcon state={jobState(item.job)} size={14} />
+        <span className="ellipsis">{item.label}</span>
+        <span className="muted small side-dur">{elapsed(item.job.started_at, item.job.finished_at, now)}</span>
+      </NavLink>
+    </li>
+  );
+}
+
 function JobNavItem({ runId, job, now }: { runId: number; job: Job; now: number }) {
   return (
     <li>
@@ -306,8 +353,8 @@ function JobNavItem({ runId, job, now }: { runId: number; job: Job; now: number 
   );
 }
 
-function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: number }) {
-  const outputs = groups.flatMap((g) => g.jobs).filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
+function RunSummary({ run, groups, workflows, now }: { run: Run; groups: PlanGroup[]; workflows: CalledWorkflow[]; now: number }) {
+  const outputs = groups.flatMap(groupJobs).filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
   return (
     <div className="stack">
       <section className="box">
@@ -364,6 +411,18 @@ function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: 
           <CodeBlock code={run.workflow_yaml} />
         </details>
       )}
+      {workflows.map((w) => (
+        <details className="box disclosure-box" key={w.path}>
+          <summary>
+            Called by <span className="mono">{w.path.split("/").join(" / ")}</span>{" "}
+            <span className="mono muted small" title={w.sha}>
+              {w.source === "github" ? "github.com/" : ""}
+              {w.repo}/{w.file}@{shortSha(w.sha)}
+            </span>
+          </summary>
+          <CodeBlock code={w.yaml} />
+        </details>
+      ))}
     </div>
   );
 }
@@ -385,7 +444,7 @@ interface PullRequestPayload {
   };
 }
 
-// pullRequestOf reads the other repository's pull request from a repository_pull_request run's event.
+// pullRequestOf reads the pull request from a pull_request or repository_pull_request run's event.
 function pullRequestOf(
   payload: unknown,
 ): { repo: string; number: number; action: string; head: string; sha: string; headRepo?: string; fork: boolean } | undefined {
