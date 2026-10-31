@@ -52,6 +52,8 @@ export interface Repo {
   protected_refs?: string[];
   /** Status badges can be fetched without signing in. */
   public_badges?: boolean;
+  /** Whether its own .github/workflows/ files run; off for mirrors whose workflows run on GitHub Actions. Uploaded ones always do. */
+  repo_workflows?: boolean;
   /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
   protected_branches?: string[];
   /** Whether runs of its repository_push/repository_pull_request listeners and uploaded workflows are reported to GitHub as check runs. */
