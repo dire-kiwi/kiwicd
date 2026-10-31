@@ -634,7 +634,7 @@ function useMirrorUpdate(repo: Repo, onChanged: () => void) {
   return { busy, error, notice, save };
 }
 
-function MirrorSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+function MirrorSettings({ repo, admin, onChanged }: { repo: Repo; admin: boolean; onChanged: () => void }) {
   const { busy, error, notice, save } = useMirrorUpdate(repo, onChanged);
   const [url, setUrl] = useState(repo.url ?? "");
   const [keyModal, setKeyModal] = useState(false);
@@ -661,11 +661,19 @@ function MirrorSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void
             void save({ url: url.trim() }, "URL changed.");
           }}
         >
-          <input className="input mono" value={url} onChange={(e) => setUrl(e.target.value)} required />
-          <button type="submit" className="btn btn-sm" disabled={busy || !url.trim() || url === (repo.url ?? "")}>
-            Save
-          </button>
+          <input className="input mono" value={url} onChange={(e) => setUrl(e.target.value)} readOnly={!admin} required />
+          {admin && (
+            <button type="submit" className="btn btn-sm" disabled={busy || !url.trim() || url === (repo.url ?? "")}>
+              Save
+            </button>
+          )}
         </form>
+        {!admin && (
+          <>
+            <span />
+            <span className="hint">Only an admin can change the URL.</span>
+          </>
+        )}
         {(repo.url ?? "").includes("***@") && (
           <>
             <span />
@@ -1069,7 +1077,7 @@ function RepoSettingsTab({ repo, admin, onChanged }: { repo: Repo; admin: boolea
           <span title={absoluteTime(repo.created_at)}>{relativeTime(repo.created_at)}</span>
         </div>
       </section>
-      {repo.kind === "mirror" && <MirrorSettings repo={repo} onChanged={onChanged} />}
+      {repo.kind === "mirror" && <MirrorSettings repo={repo} admin={admin} onChanged={onChanged} />}
       <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />
       {admin && (

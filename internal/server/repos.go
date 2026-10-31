@@ -286,6 +286,17 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 			httpError(w, 400, "mirror repositories need a url")
 			return
 		}
+		// Pointing a mirror elsewhere can fetch what its maintainers can't
+		// see: other repositories on the server, anything the GitHub App is
+		// installed on, internal addresses. Only admins may.
+		if *req.URL == redactURL(repo.URL) {
+			// The URL as the UI shows it, with credentials hidden: unchanged.
+			*req.URL = repo.URL
+		}
+		if *req.URL != repo.URL && !requestPrincipal(r).admin() {
+			httpError(w, 403, "only an admin can change a mirror's URL")
+			return
+		}
 		if strings.HasPrefix(*req.URL, "-") {
 			httpError(w, 400, "invalid url")
 			return

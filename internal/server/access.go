@@ -19,7 +19,8 @@ import (
 //     global secrets and variables, the GitHub App, adding and removing
 //     repositories, roles, everyone's API tokens and the audit log.
 //   - maintainer, of every repository or of some (OWNER/NAME or OWNER/*):
-//     their secrets, variables, protected refs, readers, mirror settings and
+//     their secrets, variables, protected refs, readers, mirror settings
+//     (but not a mirror's URL, which could fetch anything) and
 //     uploaded workflows; starting, re-running and cancelling their runs;
 //     pushing to them if they're hosted.
 //   - viewer: repositories, runs and their logs, and runners.

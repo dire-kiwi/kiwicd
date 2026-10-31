@@ -342,6 +342,33 @@ func TestAccessHandlers(t *testing.T) {
 		t.Errorf("runners for a viewer: %+v", runners)
 	}
 
+	// Only admins point a mirror elsewhere: it could fetch what a
+	// maintainer can't see. Its other settings are the maintainers'.
+	if _, err := a.srv.db.Exec(`INSERT INTO repos (name, kind, url, webhook_secret, created_at)
+		VALUES ('t/m', 'mirror', 'https://u:p@git.example/m.git', 'hook', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	tokenM := a.token("pw", `{"name":"m","repos":["t/m"]}`)
+	for _, c := range []struct {
+		auth, body string
+		want       int
+	}{
+		{"session-owner", `{"url":"/srv/kiwicd/repos/t/b.git"}`, 403},
+		{tokenM, `{"url":"https://github.com/private/repo.git"}`, 403},
+		{"session-owner", `{"url":"https://***@git.example/m.git","default_branch":"dev"}`, 200},
+		{"session-owner", `{"url":" https://u:p@git.example/m.git "}`, 200},
+		{"pw", `{"url":"https://git.example/other.git"}`, 200},
+	} {
+		if code, b := a.do(c.auth, "PATCH", "/api/repos/t/m", c.body, nil); code != c.want {
+			t.Errorf("PATCH t/m %s as %.20s: %d, want %d: %s", c.body, c.auth, code, c.want, b)
+		}
+		if c.want == 200 && c.auth != "pw" {
+			if m, _ := a.srv.getRepo("t/m"); m.URL != "https://u:p@git.example/m.git" {
+				t.Errorf("t/m's URL after %s: %s", c.body, m.URL)
+			}
+		}
+	}
+
 	// /api/me says what one may do.
 	var me struct {
 		User   string
@@ -390,7 +417,7 @@ func TestAccessHandlers(t *testing.T) {
 		t.Errorf("a maintainer's tokens: %+v", list)
 	}
 	var all []APIToken
-	if a.do("session-boss", "GET", "/api/tokens", "", &all); len(all) != 4 {
+	if a.do("session-boss", "GET", "/api/tokens", "", &all); len(all) != 5 {
 		t.Errorf("an admin sees %d tokens", len(all))
 	}
 	if code, _ := a.do("session-maint", "DELETE", "/api/tokens/"+itoa(all[0].ID), "", nil); code != 404 {

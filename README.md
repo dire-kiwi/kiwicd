@@ -264,7 +264,7 @@ Everyone signed in has a role:
 | Role | May |
 | --- | --- |
 | **viewer** | see repositories, workflows, runs and their logs, and runners; fetch repositories over `/git/` |
-| **maintainer** of every repository, or of some (`owner/name` or `owner/*`) | also, for those repositories: secrets and variables, protected refs, readers, mirror settings, uploaded workflows, syncing, starting, re-running and cancelling runs, and pushing to hosted ones |
+| **maintainer** of every repository, or of some (`owner/name` or `owner/*`) | also, for those repositories: secrets and variables, protected refs, readers, mirrors' default branch and SSH settings (not their URL, which only admins change), uploaded workflows, syncing, starting, re-running and cancelling runs, and pushing to hosted ones |
 | **admin** | everything, including global secrets and variables, adding and removing repositories, runners, the GitHub App, roles, everyone's API tokens and the audit log |
 
 The admin password is always an admin. Roles are given under **Settings → GitHub** (or
