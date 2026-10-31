@@ -1,8 +1,9 @@
 import { useCallback, useMemo, useState } from "react";
-import { Link, NavLink, useNavigate, useParams } from "react-router-dom";
+import { Link, NavLink, useParams } from "react-router-dom";
 import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
 import { PlanGraph } from "../components/PlanGraph";
+import { RerunModal, type RerunWhat } from "../components/RerunModal";
 import { StatusIcon } from "../components/StatusIcon";
 import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../components/ui";
 import { useDocumentTitle, useEventSource, useFetch, useNow } from "../hooks";
@@ -12,11 +13,11 @@ import { absoluteTime, classes, elapsed, eventLabel, refName, relativeTime, shor
 
 export function RunPage() {
   const { id = "", jobId } = useParams();
-  const navigate = useNavigate();
   const detail = useFetch<RunDetail>(`/api/runs/${id}`);
   const { setData, reload } = detail;
   const [actionError, setActionError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [rerun, setRerun] = useState<RerunWhat>();
 
   const onRun = useCallback(
     (data: unknown) => {
@@ -80,18 +81,7 @@ export function RunPage() {
       setBusy(false);
     }
   };
-  const rerun = async () => {
-    setBusy(true);
-    setActionError(undefined);
-    try {
-      const res = await post<{ run_id: number }>(`/api/runs/${run.id}/rerun`);
-      navigate(`/runs/${res.run_id}`);
-    } catch (e) {
-      setActionError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const anyFailed = jobs.some((j) => j.conclusion === "failure" || j.conclusion === "cancelled");
 
   return (
     <div className="page page-wide">
@@ -119,9 +109,16 @@ export function RunPage() {
               {run.cancel_requested ? "Cancelling…" : "Cancel run"}
             </button>
           ) : (
-            <button className="btn" onClick={rerun} disabled={busy}>
-              Re-run all jobs
-            </button>
+            <>
+              {anyFailed && (
+                <button className="btn" onClick={() => setRerun({ kind: "failed" })}>
+                  Re-run failed jobs
+                </button>
+              )}
+              <button className="btn" onClick={() => setRerun({ kind: "all" })}>
+                Re-run all jobs
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -219,7 +216,13 @@ export function RunPage() {
         <section className="run-content">
           {jobId ? (
             selectedJob ? (
-              <JobLog key={selectedJob.id} job={selectedJob} onJob={upsertJob} withheld={detail.data?.protected_labels ?? []} />
+              <JobLog
+                key={selectedJob.id}
+                job={selectedJob}
+                onJob={upsertJob}
+                withheld={detail.data?.protected_labels ?? []}
+                onRerun={run.status === "completed" ? () => setRerun({ kind: "job", job: selectedJob }) : undefined}
+              />
             ) : (
               <ErrorBox>
                 Job {jobId} is not part of this run. <Link to={`/runs/${run.id}`}>Back to summary</Link>
@@ -230,6 +233,7 @@ export function RunPage() {
           )}
         </section>
       </div>
+      {rerun && <RerunModal run={run} what={rerun} onClose={() => setRerun(undefined)} />}
     </div>
   );
 }

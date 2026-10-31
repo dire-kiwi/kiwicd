@@ -326,11 +326,18 @@ func (c *Client) Dispatch(ctx context.Context, repo, workflow, ref string, input
 	return out.RunID, err
 }
 
-func (c *Client) Rerun(ctx context.Context, id int64) (int64, error) {
+// RerunOptions picks what a re-run runs again: every job by default, the
+// failed ones, or one job (each with the jobs that need them).
+type RerunOptions struct {
+	Failed bool  `json:"failed,omitempty"`
+	JobID  int64 `json:"job_id,omitempty"`
+}
+
+func (c *Client) Rerun(ctx context.Context, id int64, opts RerunOptions) (int64, error) {
 	var out struct {
 		RunID int64 `json:"run_id"`
 	}
-	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/rerun", id), struct{}{}, &out)
+	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/rerun", id), opts, &out)
 	return out.RunID, err
 }
 

@@ -2,7 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -109,7 +111,19 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+// handleRerun starts a new attempt of a run. By default it runs every job
+// again; {"failed": true} re-runs the jobs that failed or were cancelled and
+// {"job_id": ID} that job, each with the jobs that need them, keeping the
+// other jobs' results (see rerun.go).
 func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Failed bool  `json:"failed"`
+		JobID  int64 `json:"job_id"`
+	}
+	if err := readJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		httpError(w, 400, "bad request: %v", err)
+		return
+	}
 	run, err := s.getRun(pathID(r))
 	if err != nil {
 		httpError(w, 404, "no such run")
@@ -120,11 +134,27 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 404, "repository is gone")
 		return
 	}
+	var reuse *reusePlan
+	if req.Failed || req.JobID != 0 {
+		if run.Status != protocol.StatusCompleted {
+			httpError(w, 409, "the run hasn't finished; re-run some of its jobs once it has")
+			return
+		}
+		jobs, err := s.runJobs(run.ID)
+		if err != nil {
+			httpError(w, 500, "%v", err)
+			return
+		}
+		if reuse, err = rerunPlan(run, jobs, req.Failed, req.JobID); err != nil {
+			httpError(w, 400, "%v", err)
+			return
+		}
+	}
 	var attempt int64
 	_ = s.db.QueryRow(`SELECT MAX(attempt) FROM runs WHERE repo_id = ? AND number = ?`, run.RepoID, run.Number).Scan(&attempt)
 	id, err := s.createRun(r.Context(), runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1})
+		number: run.Number, attempt: attempt + 1, reuse: reuse})
 	if err != nil {
 		httpError(w, 500, "%v", err)
 		return

@@ -206,6 +206,11 @@ var migrations = []struct{ table, column, sql string }{
 	// (see concurrency.go).
 	{"runs", "concurrency_group", `ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
+	// Re-runs of some jobs: what a run keeps from its earlier attempt, and
+	// where a kept job came from (see rerun.go).
+	{"runs", "reuse_jobs", `ALTER TABLE runs ADD COLUMN reuse_jobs TEXT NOT NULL DEFAULT ''`},
+	{"jobs", "copied_from", `ALTER TABLE jobs ADD COLUMN copied_from INTEGER NOT NULL DEFAULT 0`},
+	{"jobs", "copied_attempt", `ALTER TABLE jobs ADD COLUMN copied_attempt INTEGER NOT NULL DEFAULT 0`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
 }

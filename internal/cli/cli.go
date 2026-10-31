@@ -38,7 +38,7 @@ Usage:
   kiwicd run watch RUN
   kiwicd run logs RUN [--job JOB] [--failed] [--follow] [--timestamps]
   kiwicd run cancel RUN
-  kiwicd run rerun RUN [--watch]
+  kiwicd run rerun RUN [--failed | --job JOB] [--watch]
 
   kiwicd secret list [--repo OWNER/NAME]
   kiwicd secret set NAME [--repo OWNER/NAME] [--value VALUE | --from-file PATH]
@@ -709,6 +709,8 @@ func runCancel(ctx context.Context, a *App, args []string) error {
 func runRerun(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("run rerun", flag.ContinueOnError)
 	watch := fs.Bool("watch", false, "wait for the new run to finish, and fail if it does")
+	failed := fs.Bool("failed", false, "re-run only the jobs that failed or were cancelled, and the jobs that need them")
+	job := fs.String("job", "", "re-run only this job (its ID, key or name) and the jobs that need it")
 	pos, err := flags(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -717,11 +719,29 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *failed && *job != "" {
+		return errors.New("--failed and --job don't go together")
+	}
 	c, err := a.api()
 	if err != nil {
 		return err
 	}
-	newID, err := c.Rerun(ctx, id)
+	opts := RerunOptions{Failed: *failed}
+	if *job != "" {
+		d, err := c.Run(ctx, id)
+		if err != nil {
+			return err
+		}
+		jobs, err := selectJobs(d.Jobs, *job, false)
+		if err != nil {
+			return err
+		}
+		if len(jobs) > 1 {
+			return fmt.Errorf("%q is %d jobs (a matrix?); pick one by its ID or full name", *job, len(jobs))
+		}
+		opts.JobID = jobs[0].ID
+	}
+	newID, err := c.Rerun(ctx, id, opts)
 	if err != nil {
 		return err
 	}

@@ -1,12 +1,12 @@
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { ansiToSegments, stripAnsi, type Segment } from "../ansi";
 import { useNow } from "../hooks";
 import { jobState, matrixLabel } from "../runmodel";
 import type { Job, LogLine, Step } from "../types";
 import { absoluteTime, classes, elapsed, relativeTime, visualState } from "../util";
 import { StatusIcon } from "./StatusIcon";
-import { Chip, ErrorBox, Icon } from "./ui";
+import { Chip, ErrorBox, Flash, Icon } from "./ui";
 
 interface LogState {
   byStep: Record<number, LogLine[]>;
@@ -22,8 +22,19 @@ function stepState(s: Step) {
 /**
  * Live log view for one job: collapsible steps streamed over SSE. Runners
  * with the withheld labels won't take it, as its run's ref isn't protected.
+ * onRerun, if set, re-runs the job.
  */
-export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unknown) => void; withheld?: string[] }) {
+export function JobLog({
+  job,
+  onJob,
+  withheld = [],
+  onRerun,
+}: {
+  job: Job;
+  onJob: (j: unknown) => void;
+  withheld?: string[];
+  onRerun?: () => void;
+}) {
   const [logs, setLogs] = useState<LogState>({ byStep: {}, count: 0 });
   const [streamError, setStreamError] = useState(false);
   const [overrides, setOverrides] = useState<Record<number, boolean>>({});
@@ -301,6 +312,11 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
           <a className="btn btn-sm" href={`/api/jobs/${job.id}/logs?format=text&download=1`} download title="Download this job's log">
             <Icon name="download" size={14} /> Download
           </a>
+          {onRerun && (
+            <button className="btn btn-sm" onClick={onRerun}>
+              Re-run this job
+            </button>
+          )}
         </div>
       </div>
       <div className="job-info small">
@@ -326,6 +342,14 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
           </span>
         )}
       </div>
+      {job.copied_from ? (
+        <Flash>
+          <span>
+            This job ran in attempt {job.copied_attempt}; this attempt kept its result.{" "}
+            <Link to={`/jobs/${job.copied_from}`}>See it in attempt {job.copied_attempt}</Link>
+          </span>
+        </Flash>
+      ) : null}
       {job.error && (
         <ErrorBox>
           <span className="pre-wrap">{job.error}</span>

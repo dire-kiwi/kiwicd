@@ -114,6 +114,9 @@ export interface Job {
   steps: Step[] | null;
   cancel_requested: boolean;
   log_seq: number;
+  /** Kept by a re-run from an earlier attempt: the job that ran, and its attempt. */
+  copied_from?: number;
+  copied_attempt?: number;
   created_at: number;
   started_at: number;
   finished_at: number;

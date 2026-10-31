@@ -268,6 +268,7 @@ kiwicd run view 42                           # jobs and steps
 kiwicd run logs 42 --failed                  # or --job build, --follow
 kiwicd run start owner/app deploy.yml --ref main -i target=prod --watch
 kiwicd run cancel 42; kiwicd run rerun 42 --watch
+kiwicd run rerun 42 --failed                 # or --job build: keeps the other jobs' results
 kiwicd workflow list owner/app
 echo -n "$VALUE" | kiwicd secret set DEPLOY_KEY --repo owner/app   # or type it at the prompt
 kiwicd secret list; kiwicd variable set REGION nz-north --repo owner/app

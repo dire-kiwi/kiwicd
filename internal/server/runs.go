@@ -73,20 +73,24 @@ type Job struct {
 	Steps      []protocol.StepState `json:"steps"`
 	Cancel     bool                 `json:"cancel_requested"`
 	LogSeq     int64                `json:"log_seq"`
-	CreatedAt  int64                `json:"created_at"`
-	StartedAt  int64                `json:"started_at"`
-	FinishedAt int64                `json:"finished_at"`
-	Heartbeat  int64                `json:"-"`
+	// A job a re-run kept from an earlier attempt: the job that ran, and
+	// the attempt it ran in (see rerun.go).
+	CopiedFrom    int64 `json:"copied_from,omitempty"`
+	CopiedAttempt int64 `json:"copied_attempt,omitempty"`
+	CreatedAt     int64 `json:"created_at"`
+	StartedAt     int64 `json:"started_at"`
+	FinishedAt    int64 `json:"finished_at"`
+	Heartbeat     int64 `json:"-"`
 }
 
 const jobCols = `id, run_id, job_key, name, matrix, runs_on, status, conclusion, error, runner_id, runner_name, outputs, steps,
-	cancel_requested, log_seq, created_at, started_at, finished_at, heartbeat_at`
+	cancel_requested, log_seq, copied_from, copied_attempt, created_at, started_at, finished_at, heartbeat_at`
 
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var matrix, runsOn, outputs, steps string
 	if err := row.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &matrix, &runsOn, &j.Status, &j.Conclusion, &j.Error, &j.RunnerID, &j.RunnerName,
-		&outputs, &steps, &j.Cancel, &j.LogSeq, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Heartbeat); err != nil {
+		&outputs, &steps, &j.Cancel, &j.LogSeq, &j.CopiedFrom, &j.CopiedAttempt, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Heartbeat); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(matrix), &j.Matrix)
@@ -131,6 +135,8 @@ type runSpec struct {
 	ref, sha, actor, title string
 	parseErr               error
 	number, attempt        int64
+	// For re-runs of some jobs: what to keep from the earlier attempt.
+	reuse *reusePlan
 }
 
 func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
@@ -156,10 +162,14 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	if attempt == 0 {
 		attempt = 1
 	}
+	reuse := ""
+	if spec.reuse != nil {
+		reuse = mustJSON(spec.reuse)
+	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
-		status, conclusion, error, protected, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		status, conclusion, error, protected, reuse_jobs, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
-		status, conclusion, errText, refProtected(spec.repo, spec.ref), nowMS(), finished)
+		status, conclusion, errText, refProtected(spec.repo, spec.ref), reuse, nowMS(), finished)
 	var id int64
 	var conc wf.Concurrency
 	if err == nil {
@@ -316,11 +326,24 @@ func (s *Server) advanceLocked(ctx context.Context, runID int64) error {
 		s.publishRun(runID)
 		return nil
 	}
+	queued := false
+	if !run.Cancel {
+		// A re-run of some jobs starts with the ones it keeps.
+		var reuse string
+		var started bool
+		if err := s.db.QueryRow(`SELECT reuse_jobs, EXISTS (SELECT 1 FROM jobs WHERE run_id = ?) FROM runs WHERE id = ?`, runID, runID).Scan(&reuse, &started); err != nil {
+			return err
+		}
+		if reuse != "" && !started {
+			if queued, err = s.reuseJobs(run, reuse); err != nil {
+				return err
+			}
+		}
+	}
 	order, _ := wf.Order(workflow)
 	ghc := s.githubContext(run)
 	vars := s.varsFor(run.RepoID)
 	inputs, _ := run.EventJSON["inputs"].(map[string]any)
-	queued := false
 
 	for changed := true; changed; {
 		changed = false
