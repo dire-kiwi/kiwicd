@@ -323,6 +323,9 @@ var migrations = []struct{ table, column, sql string }{
 	{"repos", "fork_pull_requests", `ALTER TABLE repos ADD COLUMN fork_pull_requests INTEGER NOT NULL DEFAULT 0`},
 	// How many workflow_run events led to a run: 0 for others (see triggers.go).
 	{"runs", "trigger_depth", `ALTER TABLE runs ADD COLUMN trigger_depth INTEGER NOT NULL DEFAULT 0`},
+	// Whether the repository's own .github/workflows/ files run (see
+	// workflowsAt); off for mirrors whose workflows run on GitHub Actions.
+	{"repos", "repo_workflows", `ALTER TABLE repos ADD COLUMN repo_workflows INTEGER NOT NULL DEFAULT 1`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

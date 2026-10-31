@@ -1185,6 +1185,46 @@ function PullRequestSettings({ repo, onChanged }: { repo: Repo; onChanged: () =>
   );
 }
 
+/** Whether the repository's own .github/workflows/ files run here. */
+function RepoWorkflowsSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const set = async (on: boolean) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { repo_workflows: on });
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Workflows</h3>
+          <p className="muted small">
+            Turn this off for a mirror whose <span className="mono">.github/workflows/</span> run on GitHub Actions: their jobs ask
+            for runners like <span className="mono">ubuntu-latest</span> that kiwicd doesn't have, and would wait forever. Uploaded
+            workflows still run, and other repositories can still listen to this one and call its reusable workflows.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv-pad">
+        <label className="check">
+          <input type="checkbox" checked={repo.repo_workflows ?? true} disabled={busy} onChange={(e) => void set(e.target.checked)} />
+          Run this repository's workflows
+        </label>
+      </div>
+    </section>
+  );
+}
+
 /** Whether runs of workflows that aren't the GitHub repository's own are reported to it. */
 function ChecksSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
@@ -1271,6 +1311,7 @@ function RepoSettingsTab({ repo, admin, onChanged }: { repo: Repo; admin: boolea
       </section>
       {repo.kind === "mirror" && <MirrorSettings repo={repo} admin={admin} onChanged={onChanged} />}
       {repo.kind === "mirror" && admin && <PullRequestSettings repo={repo} onChanged={onChanged} />}
+      <RepoWorkflowsSettings repo={repo} onChanged={onChanged} />
       <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />
       <BadgeSettings repo={repo} onChanged={onChanged} />

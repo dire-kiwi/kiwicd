@@ -57,6 +57,12 @@ job with [act](https://github.com/nektos/act), through our fork
   and jobs check out the pushed commit. Runs show them as `kiwicd:deploy.yml`, separate from a
   committed file of the same name. To keep a public repository's deployment out of it, prefer a
   private repository that listens with `repository_push`.
+- **Repositories whose workflows run elsewhere**: a mirror whose `.github/workflows/` are GitHub
+  Actions' (`runs-on: ubuntu-latest` and the like, which no kiwicd runner has, so their jobs
+  would wait forever) can turn off *Run this repository's workflows* (*Settings* tab, or
+  `curl -u admin -X PATCH -d '{"repo_workflows":false}' https://SERVER/api/repos/OWNER/NAME`).
+  kiwicd then ignores its committed workflows, listeners included; its uploaded workflows still
+  run, and other repositories can still listen to it and call its reusable workflows.
 - **Reusable workflows**: `jobs.<id>.uses` calls a workflow with `on: workflow_call`, from the
   same repository or another one, with typed `with:` inputs, `secrets:` (or `secrets: inherit`),
   outputs for `needs.<id>.outputs`, and `strategy.matrix`, `needs` and `if` on the calling job,

@@ -45,10 +45,11 @@ func (s *Server) uploadedWorkflows(repoID int64) ([]uploadedWorkflow, error) {
 }
 
 // workflowsAt returns the workflows that apply to a commit: the repository's
-// own files at sha (none if sha is empty) and the uploaded ones.
+// own files at sha (none if sha is empty or the repository's repo_workflows
+// setting is off) and the uploaded ones.
 func (s *Server) workflowsAt(ctx context.Context, repo *Repo, sha string) (map[string][]byte, error) {
 	files := map[string][]byte{}
-	if sha != "" {
+	if sha != "" && repo.RepoWorkflows {
 		var err error
 		if files, err = workflowFiles(ctx, s.repoPath(repo.Name), sha); err != nil {
 			return nil, err
@@ -62,6 +63,9 @@ func (s *Server) workflowsAt(ctx context.Context, repo *Repo, sha string) (map[s
 // there in every repository, so the committed files are kept for each
 // repository's latest tip: a commit's files never change.
 func (s *Server) defaultBranchWorkflows(ctx context.Context, repo *Repo, sha string) (map[string][]byte, error) {
+	if !repo.RepoWorkflows {
+		return s.addUploadedWorkflows(repo, map[string][]byte{})
+	}
 	s.tipMu.Lock()
 	tip, ok := s.tipWorkflows[repo.ID]
 	s.tipMu.Unlock()
