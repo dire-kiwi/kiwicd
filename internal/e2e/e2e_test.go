@@ -592,13 +592,7 @@ func TestIsolatedJobs(t *testing.T) {
 	if out, err := exec.Command("docker", "image", "inspect", "debian:trixie-slim").CombinedOutput(); err != nil {
 		t.Skipf("needs Docker with debian:trixie-slim: %v %s", err, out)
 	}
-	const image = "kiwicd-e2e-job:test"
-	build := exec.Command("docker", "build", "-q", "-t", image, "-")
-	build.Stdin = strings.NewReader("FROM debian:trixie-slim\nRUN useradd -m -u 1000 runner\nUSER runner\nCMD [\"sleep\", \"infinity\"]\n")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("docker build: %v\n%s", err, out)
-	}
-	t.Cleanup(func() { _ = exec.Command("docker", "image", "rm", image).Run() })
+	image := buildImage(t, "kiwicd-e2e-job", "FROM debian:trixie-slim\nRUN useradd -m -u 1000 runner\nUSER runner\nCMD [\"sleep\", \"infinity\"]\n")
 
 	tmp := t.TempDir()
 	srv, err := server.New(server.Config{DataDir: filepath.Join(tmp, "data"), AdminPassword: "pw", RegistrationToken: "reg", Version: "test"})
@@ -642,7 +636,7 @@ func TestIsolatedJobs(t *testing.T) {
 	api("POST", "/api/repos", `{"name":"t/repo"}`, nil)
 	src := filepath.Join(tmp, "src")
 	files := map[string]string{
-		".github/workflows/ci.yml": isolatedWorkflow,
+		".github/workflows/ci.yml": strings.ReplaceAll(isolatedWorkflow, "kiwicd-e2e-job:test", image),
 		"hello.txt":                "hi\n",
 		"action/action.yml":        dockerAction,
 		// The action is built on the job's network: its RUN resolves the job
@@ -718,7 +712,7 @@ func TestIsolatedJobs(t *testing.T) {
 
 	// The jobs' containers (and the process left running in one), volumes,
 	// networks and action images are gone.
-	assertNoDockerLeftovers(t, creds.RunnerID)
+	assertNoDockerLeftovers(t, creds.AgentID)
 }
 
 const callerWorkflow = `

@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
@@ -14,24 +16,33 @@ import (
 
 // What act creates for a job (containers, their volumes, the images of
 // Docker actions) is named with the job's prefix, and so is the network an
-// isolated job runs on. Names look like kiwicd-r3-j1234-CI-build-<hash>.
-func jobPrefix(runnerID, jobID int64) string {
-	return fmt.Sprintf("%s%d-", runnerPrefix(runnerID), jobID)
+// isolated job runs on. Names look like kiwicd-1a2b3c4d-j1234-CI-build-<hash>,
+// with the registration's agent ID: runner and job IDs come from the
+// server's database, so agents of different servers that share a Docker
+// daemon have the same ones.
+func jobPrefix(agentID string, jobID int64) string {
+	return fmt.Sprintf("%s%d-", agentPrefix(agentID), jobID)
 }
 
-func runnerPrefix(runnerID int64) string {
+func agentPrefix(agentID string) string {
+	return fmt.Sprintf("kiwicd-%s-j", agentID)
+}
+
+// oldAgentPrefix is how agents named their jobs' Docker objects before
+// registrations had agent IDs.
+func oldAgentPrefix(runnerID int64) string {
 	return fmt.Sprintf("kiwicd-r%d-j", runnerID)
 }
 
-// bridgeName is the network interface of a job's network: bridgePrefix and
-// the job ID in base 36, so a firewall can match the agent's jobs (as in
-// iptables -i kiwicd-+). Linux allows 15 characters.
-func bridgeName(bridgePrefix string, jobID int64) (string, error) {
-	name := bridgePrefix + strconv.FormatInt(jobID, 36)
-	if len(name) > 15 {
-		return "", fmt.Errorf("network interface name %q is longer than 15 characters; use a shorter --job-bridge-prefix", name)
-	}
-	return name, nil
+// bridgeName is the network interface of a job's network: bridgePrefix, so
+// a firewall can match the agent's jobs (as in iptables -i kiwicd-+), and 8
+// base-36 digits of a hash of the network's name, which is the job's alone.
+// Linux allows 15 characters.
+func bridgeName(bridgePrefix, network string) string {
+	h := sha256.Sum256([]byte(network))
+	const digits = 2821109907456 // 36^8
+	s := strconv.FormatUint(binary.BigEndian.Uint64(h[:8])%digits, 36)
+	return bridgePrefix + strings.Repeat("0", 8-len(s)) + s
 }
 
 // createJobNetwork creates the bridge network an isolated job's containers
