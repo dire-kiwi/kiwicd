@@ -240,6 +240,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handleDeleteUploadedWorkflow))
 
 	mux.Handle("GET /api/runs", ui(s.handleListRuns))
+	mux.Handle("GET /api/runs/filters", ui(s.handleRunFilters))
 	mux.Handle("GET /api/runs/{id}", ui(s.handleGetRun))
 	mux.Handle("POST /api/runs/{id}/cancel", ui(s.handleCancelRun))
 	mux.Handle("POST /api/runs/{id}/rerun", ui(s.handleRerun))

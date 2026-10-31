@@ -272,6 +272,7 @@ with GitHub make a token under **Settings → API tokens** and pass it with `--t
 ```sh
 kiwicd login --url https://SERVER
 kiwicd run list --repo owner/app             # kiwicd runs, for short
+kiwicd run list --workflow ci.yml --branch main --status failure
 kiwicd run view 42                           # jobs and steps
 kiwicd run logs 42 --failed                  # or --job build, --follow
 kiwicd run start owner/app deploy.yml --ref main -i target=prod --watch

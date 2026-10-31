@@ -259,10 +259,19 @@ type Token struct {
 
 // ---------------------------------------------------------------- calls
 
-func (c *Client) Runs(ctx context.Context, repo string, limit int) ([]Run, error) {
+// RunFilter narrows a list of runs; empty fields don't. Workflow is a
+// workflow's file (or its name in .github/workflows), Branch a branch name or
+// full ref, Status queued, in_progress, completed or a conclusion.
+type RunFilter struct {
+	Repo, Workflow, Branch, Event, Status, Actor string
+}
+
+func (c *Client) Runs(ctx context.Context, f RunFilter, limit int) ([]Run, error) {
 	q := url.Values{}
-	if repo != "" {
-		q.Set("repo", repo)
+	for k, v := range map[string]string{"repo": f.Repo, "workflow": f.Workflow, "branch": f.Branch, "event": f.Event, "status": f.Status, "actor": f.Actor} {
+		if v != "" {
+			q.Set(k, v)
+		}
 	}
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))

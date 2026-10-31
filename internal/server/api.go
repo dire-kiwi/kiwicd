@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dire-kiwi/kiwicd/internal/protocol"
@@ -23,12 +25,16 @@ func pathID(r *http.Request) int64 {
 	return id
 }
 
+// handleListRuns lists the latest runs, newest first. These narrow it:
+// ?repo=OWNER/NAME, ?workflow= (its file, or the file name in
+// .github/workflows), ?branch= (a branch name or a full ref), ?event=,
+// ?actor= and ?status= (queued, in_progress or completed, or a conclusion:
+// success, failure, cancelled or skipped).
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	q := `SELECT ` + runCols + ` FROM runs r JOIN repos p ON p.id = r.repo_id`
-	var args []any
-	if repo := r.URL.Query().Get("repo"); repo != "" {
-		q += ` WHERE p.name = ?`
-		args = append(args, repo)
+	where, args := runFilters(r.URL.Query())
+	if len(where) > 0 {
+		q += ` WHERE ` + strings.Join(where, ` AND `)
 	}
 	limit := 50
 	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 500 {
@@ -53,6 +59,91 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		runs = append(runs, run)
 	}
 	writeJSON(w, runs)
+}
+
+// runFilters turns handleListRuns' query parameters into SQL conditions on
+// runs r joined with repos p.
+func runFilters(v url.Values) (where []string, args []any) {
+	if repo := v.Get("repo"); repo != "" {
+		where, args = append(where, `p.name = ?`), append(args, repo)
+	}
+	if file := v.Get("workflow"); file != "" {
+		where, args = append(where, `(r.workflow_file = ? OR r.workflow_file = '.github/workflows/' || ?)`), append(args, file, file)
+	}
+	if branch := v.Get("branch"); branch != "" {
+		where, args = append(where, `(r.ref = ? OR r.ref = 'refs/heads/' || ?)`), append(args, branch, branch)
+	}
+	if event := v.Get("event"); event != "" {
+		where, args = append(where, `r.event = ?`), append(args, event)
+	}
+	if actor := v.Get("actor"); actor != "" {
+		where, args = append(where, `r.actor = ?`), append(args, actor)
+	}
+	switch status := v.Get("status"); status {
+	case "":
+	case protocol.StatusQueued, protocol.StatusInProgress, protocol.StatusCompleted, protocol.StatusPending:
+		where, args = append(where, `r.status = ?`), append(args, status)
+	default:
+		where, args = append(where, `r.status = ? AND r.conclusion = ?`), append(args, protocol.StatusCompleted, status)
+	}
+	return where, args
+}
+
+// handleRunFilters lists the values the runs list can be filtered by, from
+// the latest runs (of ?repo=, if given): workflows, refs, events and actors.
+func (s *Server) handleRunFilters(w http.ResponseWriter, r *http.Request) {
+	recent := `SELECT r.* FROM runs r JOIN repos p ON p.id = r.repo_id`
+	var args []any
+	if repo := r.URL.Query().Get("repo"); repo != "" {
+		recent += ` WHERE p.name = ?`
+		args = append(args, repo)
+	}
+	recent += ` ORDER BY r.id DESC LIMIT 5000`
+	type workflow struct {
+		File string `json:"file"`
+		Name string `json:"name"`
+	}
+	out := struct {
+		Workflows []workflow `json:"workflows"`
+		Refs      []string   `json:"refs"`
+		Events    []string   `json:"events"`
+		Actors    []string   `json:"actors"`
+	}{[]workflow{}, []string{}, []string{}, []string{}}
+	// Each file with its latest name: SQLite takes a bare column from the
+	// row with the MAX.
+	rows, err := s.db.Query(`SELECT workflow_file, workflow_name, MAX(id) FROM (`+recent+`) GROUP BY workflow_file ORDER BY workflow_name, workflow_file`, args...)
+	if err != nil {
+		httpError(w, 500, "%v", err)
+		return
+	}
+	for rows.Next() {
+		var f workflow
+		var id int64
+		if err := rows.Scan(&f.File, &f.Name, &id); err != nil {
+			rows.Close()
+			httpError(w, 500, "%v", err)
+			return
+		}
+		out.Workflows = append(out.Workflows, f)
+	}
+	rows.Close()
+	for _, f := range []struct {
+		col string
+		to  *[]string
+	}{{"ref", &out.Refs}, {"event", &out.Events}, {"actor", &out.Actors}} {
+		rows, err := s.db.Query(`SELECT DISTINCT `+f.col+` FROM (`+recent+`) WHERE `+f.col+` != '' ORDER BY `+f.col, args...)
+		if err != nil {
+			httpError(w, 500, "%v", err)
+			return
+		}
+		for rows.Next() {
+			var v string
+			_ = rows.Scan(&v)
+			*f.to = append(*f.to, v)
+		}
+		rows.Close()
+	}
+	writeJSON(w, out)
 }
 
 type plannedJob struct {

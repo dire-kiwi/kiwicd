@@ -92,6 +92,14 @@ export interface Run {
   finished_at: number;
 }
 
+/** Values the runs list can be filtered by, from the latest runs. */
+export interface RunFilterValues {
+  workflows: { file: string; name: string }[];
+  refs: string[];
+  events: string[];
+  actors: string[];
+}
+
 export interface Step {
   name: string;
   status: "pending" | "in_progress" | "completed";

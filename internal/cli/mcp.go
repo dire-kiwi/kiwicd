@@ -190,19 +190,28 @@ func mcpTools() []*mcpTool {
 		},
 		{
 			Name: "list_runs", Title: "List runs", readOnly: true,
-			Description: "List recent runs, newest first, optionally for one repository.",
+			Description: "List recent runs, newest first, optionally only some: of a repository, workflow, branch, event, status or actor.",
 			InputSchema: schema(map[string]any{"repo": prop("string", "Only this repository's runs, OWNER/NAME"),
-				"limit": prop("integer", "How many (default 20, at most 500)")}),
+				"workflow": prop("string", "Only this workflow's runs: its file, e.g. ci.yml"),
+				"branch":   prop("string", "Only runs of this branch (or full ref)"),
+				"event":    prop("string", "Only runs started by this event, e.g. push or workflow_dispatch"),
+				"status":   prop("string", "queued, in_progress or completed, or a conclusion: success, failure, cancelled or skipped"),
+				"actor":    prop("string", "Only runs started by this user"),
+				"limit":    prop("integer", "How many (default 20, at most 500)")}),
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
-				repo, err := argString(args, "repo", false)
-				if err != nil {
-					return nil, err
+				var f RunFilter
+				for name, to := range map[string]*string{"repo": &f.Repo, "workflow": &f.Workflow, "branch": &f.Branch, "event": &f.Event, "status": &f.Status, "actor": &f.Actor} {
+					v, err := argString(args, name, false)
+					if err != nil {
+						return nil, err
+					}
+					*to = v
 				}
 				limit, err := argInt(args, "limit", false, 20)
 				if err != nil {
 					return nil, err
 				}
-				runs, err := c.Runs(ctx, repo, int(limit))
+				runs, err := c.Runs(ctx, f, int(limit))
 				if err != nil {
 					return nil, err
 				}

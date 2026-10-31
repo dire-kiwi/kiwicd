@@ -32,7 +32,7 @@ Usage:
   kiwicd repo sync OWNER/NAME
   kiwicd workflow list OWNER/NAME [--ref REF]
 
-  kiwicd run list [--repo OWNER/NAME] [--limit N]
+  kiwicd run list [--repo OWNER/NAME] [--workflow FILE] [--branch B] [--event E] [--status S] [--actor A] [--limit N]
   kiwicd run view RUN
   kiwicd run start OWNER/NAME WORKFLOW [--ref REF] [-i NAME=VALUE]... [--watch]
   kiwicd run watch RUN
@@ -490,7 +490,13 @@ func workflowList(ctx context.Context, a *App, args []string) error {
 
 func runList(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("run list", flag.ContinueOnError)
-	repo := fs.String("repo", "", "only this repository's runs (OWNER/NAME)")
+	var f RunFilter
+	fs.StringVar(&f.Repo, "repo", "", "only this repository's runs (OWNER/NAME)")
+	fs.StringVar(&f.Workflow, "workflow", "", "only this workflow's runs (its file, e.g. ci.yml)")
+	fs.StringVar(&f.Branch, "branch", "", "only runs of this branch (or full ref)")
+	fs.StringVar(&f.Event, "event", "", "only runs started by this event (push, workflow_dispatch, ...)")
+	fs.StringVar(&f.Status, "status", "", "only runs that are queued, in_progress or completed, or ended in success, failure, cancelled or skipped")
+	fs.StringVar(&f.Actor, "actor", "", "only runs started by this user")
 	limit := fs.Int("limit", 20, "how many runs, newest first (at most 500)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if _, err := flags(fs, args, 0, 0); err != nil {
@@ -500,7 +506,7 @@ func runList(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	runs, err := c.Runs(ctx, *repo, *limit)
+	runs, err := c.Runs(ctx, f, *limit)
 	if err != nil {
 		return err
 	}
