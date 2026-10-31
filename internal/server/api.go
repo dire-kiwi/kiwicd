@@ -1,7 +1,10 @@
 package server
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -139,31 +142,38 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 404, "no such run")
 		return
 	}
-	repo, err := s.getRepoByID(run.RepoID)
-	if err != nil {
+	id, err := s.rerun(r.Context(), run)
+	if errors.Is(err, sql.ErrNoRows) {
 		httpError(w, 404, "repository is gone")
 		return
+	}
+	if err != nil {
+		httpError(w, 500, "%v", err)
+		return
+	}
+	writeJSON(w, map[string]int64{"run_id": id})
+}
+
+// rerun starts the next attempt of run.
+func (s *Server) rerun(ctx context.Context, run *Run) (int64, error) {
+	repo, err := s.getRepoByID(run.RepoID)
+	if err != nil {
+		return 0, err
 	}
 	var attempt int64
 	_ = s.db.QueryRow(`SELECT MAX(attempt) FROM runs WHERE repo_id = ? AND number = ?`, run.RepoID, run.Number).Scan(&attempt)
 	// It calls the same reusable workflows, unless reading them failed.
 	called, err := s.calledWorkflows(run.ID)
 	if err != nil {
-		httpError(w, 500, "%v", err)
-		return
+		return 0, err
 	}
 	var list []*calledWorkflow
 	for _, path := range sortedKeys(called) {
 		list = append(list, called[path])
 	}
-	id, err := s.createRun(r.Context(), runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
+	return s.createRun(ctx, runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
 		number: run.Number, attempt: attempt + 1, called: list})
-	if err != nil {
-		httpError(w, 500, "%v", err)
-		return
-	}
-	writeJSON(w, map[string]int64{"run_id": id})
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {

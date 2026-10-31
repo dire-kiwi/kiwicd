@@ -168,6 +168,20 @@ CREATE TABLE IF NOT EXISTS github_app (
 	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- organizations whose members may
 	created_at INTEGER NOT NULL
 );
+-- Check runs on GitHub for runs' jobs (see checks.go): job_id 0 is a run
+-- that failed before it had jobs.
+CREATE TABLE IF NOT EXISTS github_checks (
+	run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	job_id INTEGER NOT NULL,
+	repo TEXT NOT NULL,                 -- owner/name on GitHub
+	check_run_id INTEGER NOT NULL,
+	check_suite_id INTEGER NOT NULL DEFAULT 0,
+	state TEXT NOT NULL,                -- what was last reported: status/conclusion
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (run_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS github_checks_run ON github_checks(check_run_id);
+CREATE INDEX IF NOT EXISTS github_checks_suite ON github_checks(check_suite_id);
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -226,6 +240,10 @@ var migrations = []struct{ table, column, sql string }{
 	{"jobs", "parent_id", `ALTER TABLE jobs ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0`},
 	{"jobs", "uses", `ALTER TABLE jobs ADD COLUMN uses TEXT NOT NULL DEFAULT ''`},
 	{"jobs", "inputs", `ALTER TABLE jobs ADD COLUMN inputs TEXT NOT NULL DEFAULT 'null'`},
+	// Whether runs of workflows that aren't the GitHub repository's own
+	// (repository_push and repository_pull_request listeners, uploaded
+	// workflows) are reported to it as check runs (see checks.go).
+	{"repos", "report_checks", `ALTER TABLE repos ADD COLUMN report_checks INTEGER NOT NULL DEFAULT 0`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

@@ -34,6 +34,8 @@ export interface Repo {
   protected_refs?: string[];
   /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
   protected_branches?: string[];
+  /** Whether runs of its repository_push/repository_pull_request listeners and uploaded workflows are reported to GitHub as check runs. */
+  report_checks?: boolean;
 }
 
 export interface WorkflowInput {
@@ -216,6 +218,18 @@ export interface GitHubApp {
   allowed_orgs: string[];
   created_at: number;
   install_url?: string;
+  /** What the app and its installations lack for reporting check runs, from GitHub. */
+  access?: GitHubAccess;
+  /** Why GitHub couldn't be asked for access. */
+  access_error?: string;
+}
+
+export interface GitHubAccess {
+  /** The app's permissions page on GitHub. */
+  permissions_url: string;
+  /** "checks: write" and events the app isn't subscribed to. */
+  missing: string[];
+  installations: { account: string; html_url: string; checks: boolean }[];
 }
 
 export interface GitHubSettings {
