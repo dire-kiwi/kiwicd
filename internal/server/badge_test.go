@@ -89,3 +89,26 @@ func TestBadge(t *testing.T) {
 		t.Errorf("missing repository without signing in: %d", code)
 	}
 }
+
+// TestBadgeAccess: someone who may not see a repository gets the answer for
+// one that doesn't exist, unless its badges are public.
+func TestBadgeAccess(t *testing.T) {
+	a := newAccessTest(t, nil)
+	onlyB := a.token("pw", `{"name":"b","role":"viewer","repos":["t/b"]}`)
+	for _, c := range []struct {
+		auth string
+		code int
+	}{{"", 401}, {"session-nobody", 401}, {"session-view", 200}, {onlyB, 404}, {"pw", 200}} {
+		if code, body := a.do(c.auth, "GET", "/api/repos/t/a/badge/ci.yml.svg", "", nil); code != c.code {
+			t.Errorf("t/a's badge as %q: %d %s, want %d", c.auth, code, body, c.code)
+		}
+	}
+	if code, _ := a.do("pw", "PATCH", "/api/repos/t/a", `{"public_badges":true}`, nil); code != 200 {
+		t.Fatalf("make t/a's badges public: %d", code)
+	}
+	for _, auth := range []string{"", onlyB} {
+		if code, body := a.do(auth, "GET", "/api/repos/t/a/badge/ci.yml.svg", "", nil); code != 200 || !strings.Contains(body, "<svg") {
+			t.Errorf("t/a's public badge as %q: %d %s", auth, code, body)
+		}
+	}
+}

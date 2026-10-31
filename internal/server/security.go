@@ -202,6 +202,7 @@ func (s *Server) expireSessionsOnPasswordChange() error {
 		if err := s.deleteTokens(false, "the admin password changed"); err != nil {
 			return err
 		}
+		s.audit(nil, "admin_password.change", "", "", "the admin's sessions and API tokens were revoked")
 	}
 	_, err = s.db.Exec(`INSERT INTO meta (name, value) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = excluded.value`,
 		passwordCheckName, s.box.seal(purposePasswordCheck, want))

@@ -9,8 +9,16 @@
 // sends one matrix combination per job. The agent runs the job with act.
 package protocol
 
-// Version is bumped on incompatible protocol changes.
-const Version = 1
+// Version is bumped on protocol changes. The server takes agents speaking
+// MinVersion to Version.
+const (
+	Version    = 2
+	MinVersion = 1
+)
+
+// CalledJobsVersion is the first version whose agents run jobs of reusable
+// workflows (JobRequest.Inputs); older agents don't get them.
+const CalledJobsVersion = 2
 
 // Header carrying the runner token on every agent request.
 const RunnerTokenHeader = "X-Kiwicd-Runner-Token"
@@ -61,8 +69,11 @@ type JobRequest struct {
 	WorkflowYAML string `json:"workflow_yaml"`
 	// Matrix is the single combination this job runs, or nil.
 	Matrix map[string]any `json:"matrix,omitempty"`
-	// Results of the run's other finished jobs, keyed by job ID.
+	// Results of the workflow's other finished jobs, keyed by job ID.
 	JobResults map[string]JobResult `json:"job_results"`
+	// Inputs is the inputs context of a job in a reusable workflow, as its
+	// caller's with: gave them; nil for the run's own workflow.
+	Inputs map[string]any `json:"inputs"`
 
 	Repository string         `json:"repository"`
 	Sha        string         `json:"sha"`

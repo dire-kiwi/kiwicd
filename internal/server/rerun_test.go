@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -94,7 +96,7 @@ func TestRerunSomeJobs(t *testing.T) {
 		t.Helper()
 		got := map[string]*protocol.JobRequest{}
 		for {
-			req, err := srv.assignJob(ctx, rn, ts.URL)
+			req, err := srv.assignJob(ctx, rn, protocol.Version, ts.URL)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -238,7 +240,7 @@ func TestDebugLogging(t *testing.T) {
 	rn := &Runner{ID: 1, Name: "r", Labels: normalizeLabels(nil, "linux", "amd64")}
 	runOne := func(id int64) *protocol.JobRequest {
 		t.Helper()
-		req, err := srv.assignJob(ctx, rn, ts.URL)
+		req, err := srv.assignJob(ctx, rn, protocol.Version, ts.URL)
 		if err != nil || req == nil {
 			t.Fatalf("assign: %v %v", req, err)
 		}
@@ -278,5 +280,138 @@ func TestDebugLogging(t *testing.T) {
 	}
 	if req := runOne(res.RunID); !req.StepDebug || req.RunnerDebug || req.Env["RUNNER_DEBUG"] != "1" {
 		t.Errorf("with ACTIONS_STEP_DEBUG: %v %v %q", req.StepDebug, req.RunnerDebug, req.Env["RUNNER_DEBUG"])
+	}
+}
+
+// TestRerunWithReusableWorkflow: a job that calls a reusable workflow is
+// kept with its called jobs, or runs again whole, also when one of its
+// called jobs is picked.
+func TestRerunWithReusableWorkflow(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	srv, ts, api := newRerunServer(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+			"GIT_TERMINAL_PROMPT=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	files := map[string]string{
+		".github/workflows/ci.yml": `on: push
+jobs:
+  call:
+    uses: ./.github/workflows/lib.yml
+  flaky:
+    runs-on: self-hosted
+    steps:
+      - run: echo
+  after:
+    needs: call
+    runs-on: self-hosted
+    steps:
+      - run: echo
+`,
+		".github/workflows/lib.yml": `on: workflow_call
+jobs:
+  hello:
+    runs-on: self-hosted
+    steps:
+      - run: echo
+`,
+	}
+	git("init", "-q", "-b", "main")
+	for name, content := range files {
+		_ = os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("add", "-A")
+	git("commit", "-q", "-m", "ci")
+	git("push", "-q", strings.Replace(ts.URL, "http://", "http://admin:pw@", 1)+"/git/t/app.git", "HEAD:refs/heads/main")
+	api("POST", "/api/repos/t/app/sync", "", nil)
+	var runs []*Run
+	api("GET", "/api/runs?repo=t/app", "", &runs)
+	if len(runs) != 1 {
+		t.Fatalf("runs: %d", len(runs))
+	}
+	first := runs[0].ID
+
+	rn := &Runner{ID: 1, Name: "r", Labels: normalizeLabels(nil, "linux", "amd64")}
+	work := func(fail string) []string {
+		t.Helper()
+		var ran []string
+		for {
+			req, err := srv.assignJob(ctx, rn, protocol.Version, ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req == nil {
+				sort.Strings(ran)
+				return ran
+			}
+			ran = append(ran, req.JobKey)
+			result := protocol.ResultSuccess
+			if req.JobKey == fail {
+				result = protocol.ResultFailure
+			}
+			if err := srv.completeJob(ctx, req.JobID, result, "", nil, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	jobs := func(runID int64) map[string]*Job {
+		t.Helper()
+		all, err := srv.runJobs(runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]*Job{}
+		for _, j := range all {
+			out[j.Key] = j
+		}
+		return out
+	}
+	rerun := func(id int64, body string) int64 {
+		t.Helper()
+		var res struct {
+			RunID int64 `json:"run_id"`
+		}
+		if code := api("POST", fmt.Sprintf("/api/runs/%d/rerun", id), body, &res); code != 200 {
+			t.Fatalf("re-run %d with %s: %d", id, body, code)
+		}
+		return res.RunID
+	}
+
+	if ran := strings.Join(work("flaky"), ","); ran != "after,flaky,hello" {
+		t.Fatalf("first attempt ran %s", ran)
+	}
+	second := rerun(first, `{"failed":true}`)
+	if ran := strings.Join(work(""), ","); ran != "flaky" {
+		t.Errorf("re-running failed jobs ran %s", ran)
+	}
+	got := jobs(second)
+	if call, hello := got["call"], got["hello"]; call == nil || hello == nil || call.CopiedFrom == 0 || hello.CopiedFrom != jobs(first)["hello"].ID ||
+		hello.ParentID != call.ID || call.Uses == "" {
+		t.Errorf("kept call and hello: %+v %+v", call, hello)
+	}
+	if run, _ := srv.getRun(second); run.Conclusion != protocol.ResultSuccess {
+		t.Errorf("second attempt: %s %s", run.Status, run.Conclusion)
+	}
+
+	// Picking the called job re-runs the job that calls it, and after.
+	third := rerun(second, fmt.Sprintf(`{"job_id":%d}`, got["hello"].ID))
+	if ran := strings.Join(work(""), ","); ran != "after,hello" {
+		t.Errorf("re-running hello ran %s", ran)
+	}
+	if got := jobs(third); got["flaky"].CopiedFrom == 0 || got["call"].CopiedFrom != 0 {
+		t.Errorf("third attempt: flaky %+v, call %+v", got["flaky"], got["call"])
 	}
 }

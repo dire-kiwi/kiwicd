@@ -19,21 +19,21 @@ import (
 //
 // Badges of repositories with public_badges need no sign-in, so a README
 // elsewhere can show them; that shows the workflow's name and how its runs
-// end to anyone. Others need it, and answer the same whether the
-// repository exists or not.
+// end to anyone. Others need it, and to anyone who may not see the
+// repository answer as if it didn't exist.
 func (s *Server) handleBadge(w http.ResponseWriter, r *http.Request) {
 	repo, err := s.getRepo(r.PathValue("owner") + "/" + r.PathValue("name"))
 	if err != nil || !repo.PublicBadges {
-		user, aerr := s.authenticate(r)
+		p, aerr := s.authenticate(r)
 		if aerr != nil {
 			httpError(w, http.StatusTooManyRequests, "%v", aerr)
 			return
 		}
-		if user == "" {
+		if p == nil {
 			httpError(w, http.StatusUnauthorized, "login required")
 			return
 		}
-		if err != nil {
+		if err != nil || !p.canView(repo.Name) {
 			httpError(w, http.StatusNotFound, "no such repository")
 			return
 		}

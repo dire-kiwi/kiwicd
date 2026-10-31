@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { jobState, type PlanGroup } from "../runmodel";
+import { groupJobs, jobState, type PlanGroup } from "../runmodel";
 import type { Job, Run, Step } from "../types";
 import { absoluteTime, classes, formatDuration, visualState } from "../util";
 import { StatusIcon } from "./StatusIcon";
@@ -24,7 +24,7 @@ function ranFor(start: number, end: number, now: number): string {
  */
 export function RunTiming({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: number }) {
   const [open, setOpen] = useState<Record<number, boolean>>({});
-  const jobs = groups.flatMap((g) => g.jobs);
+  const jobs = groups.flatMap(groupJobs);
   const here = jobs.filter((j) => !j.copied_from);
   if (jobs.length === 0) return null;
   const start = Math.min(run.created_at, ...here.map((j) => j.created_at));

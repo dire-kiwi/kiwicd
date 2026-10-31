@@ -1408,6 +1408,9 @@ textarea.input {
 .side-group-title {
   font-weight: 500;
 }
+.side-caller {
+  font-weight: 500;
+}
 .side-group-title > .muted,
 .side-dur {
   margin-left: auto;
@@ -1497,6 +1500,9 @@ a.graph-job:hover {
 }
 .graph-job-pending {
   color: var(--muted);
+}
+.graph-job-caller {
+  font-weight: 500;
 }
 
 /* job view */

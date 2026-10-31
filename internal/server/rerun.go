@@ -32,7 +32,9 @@ var errNothingToRerun = errors.New("no job of this run failed or was cancelled")
 // failedOnly it re-runs the jobs that failed or were cancelled; otherwise the
 // job jobID. Either way the jobs that need them, directly or not, run again
 // too, as on GitHub. A matrix job runs again only in the combinations that
-// failed (or the one picked) unless the jobs it needs run again as well.
+// failed (or the one picked) unless the jobs it needs run again as well. A
+// job that calls a reusable workflow is kept or runs again whole, with its
+// called workflow's jobs; picking one of those picks the job that calls it.
 func rerunPlan(run *Run, jobs []*Job, failedOnly bool, jobID int64) (*reusePlan, error) {
 	workflow, err := wf.Parse([]byte(run.WorkflowYAML))
 	if err != nil {
@@ -42,9 +44,21 @@ func rerunPlan(run *Run, jobs []*Job, failedOnly bool, jobID int64) (*reusePlan,
 	if err != nil {
 		return nil, err
 	}
+	byID := map[int64]*Job{}
+	for _, j := range jobs {
+		byID[j.ID] = j
+	}
+	if j := byID[jobID]; j != nil {
+		for j.ParentID != 0 && byID[j.ParentID] != nil {
+			j = byID[j.ParentID]
+		}
+		jobID = j.ID
+	}
 	byKey := map[string][]*Job{}
 	for _, j := range jobs {
-		byKey[j.Key] = append(byKey[j.Key], j)
+		if j.ParentID == 0 {
+			byKey[j.Key] = append(byKey[j.Key], j)
+		}
 	}
 	// again picks the rows of a job to run again.
 	again := func(j *Job) bool {
@@ -95,7 +109,7 @@ func rerunPlan(run *Run, jobs []*Job, failedOnly bool, jobID int64) (*reusePlan,
 		for _, j := range rows {
 			if !again(j) {
 				keep = append(keep, j.ID)
-			} else if len(j.RunsOn) == 0 {
+			} else if len(j.RunsOn) == 0 || j.Uses != "" {
 				partial = false
 			} else {
 				requeue = append(requeue, j.ID)
@@ -110,7 +124,8 @@ func rerunPlan(run *Run, jobs []*Job, failedOnly bool, jobID int64) (*reusePlan,
 }
 
 // reuseJobs carries out a re-run's plan when it starts: it copies the jobs it
-// keeps from the earlier attempt and queues the matrix jobs it runs again.
+// keeps from the earlier attempt (with the jobs of the workflows they call)
+// and queues the matrix jobs it runs again.
 // It reports whether it queued any. s.mu is held, and the run has no jobs
 // yet. If the earlier attempt is gone (pruned), every job runs again.
 func (s *Server) reuseJobs(run *Run, planJSON string) (bool, error) {
@@ -136,20 +151,22 @@ func (s *Server) reuseJobs(run *Run, planJSON string) (bool, error) {
 		return false, nil
 	}
 	for _, j := range keep {
-		if err := s.copyJob(run.ID, j); err != nil {
+		if err := s.copyJob(run.ID, 0, j); err != nil {
 			return false, err
 		}
 	}
 	for _, j := range requeue {
-		if err := s.insertJob(run.ID, j.Key, j.Name, j.Matrix, j.RunsOn, protocol.StatusQueued, "", ""); err != nil {
+		if err := s.insertJob(run.ID, newJob{key: j.Key, name: j.Name, matrix: j.Matrix, runsOn: j.RunsOn, status: protocol.StatusQueued}); err != nil {
 			return false, err
 		}
 	}
 	return len(requeue) > 0, nil
 }
 
-// copyJob copies a finished job, with its log, into the run runID.
-func (s *Server) copyJob(runID int64, j *Job) error {
+// copyJob copies a finished job, with its log, into the run runID, under
+// the job parentID (0 for one at the top), and then the jobs of the workflow
+// it calls, if it calls one.
+func (s *Server) copyJob(runID, parentID int64, j *Job) error {
 	from, attempt := j.ID, int64(0)
 	if j.CopiedFrom != 0 {
 		// A copy of a copy: point at the attempt that ran it.
@@ -157,16 +174,38 @@ func (s *Server) copyJob(runID int64, j *Job) error {
 	} else if err := s.db.QueryRow(`SELECT attempt FROM runs WHERE id = ?`, j.RunID).Scan(&attempt); err != nil {
 		return err
 	}
-	res, err := s.db.Exec(`INSERT INTO jobs (run_id, job_key, name, matrix, runs_on, status, conclusion, error, runner_id, runner_name,
-		outputs, steps, log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, copied_from, copied_attempt)
-		SELECT ?, job_key, name, matrix, runs_on, status, conclusion, error, runner_id, runner_name,
-		outputs, steps, log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, ?, ? FROM jobs WHERE id = ?`,
-		runID, from, attempt, j.ID)
+	res, err := s.db.Exec(`INSERT INTO jobs (run_id, parent_id, job_key, name, uses, inputs, matrix, runs_on, status, conclusion, error,
+		runner_id, runner_name, outputs, steps, log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, copied_from, copied_attempt)
+		SELECT ?, ?, job_key, name, uses, inputs, matrix, runs_on, status, conclusion, error,
+		runner_id, runner_name, outputs, steps, log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, ?, ? FROM jobs WHERE id = ?`,
+		runID, parentID, from, attempt, j.ID)
 	if err != nil {
 		return err
 	}
 	id, _ := res.LastInsertId()
-	return s.copyJobLogs(j.ID, id)
+	if err := s.copyJobLogs(j.ID, id); err != nil {
+		return err
+	}
+	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE parent_id = ? ORDER BY id`, j.ID)
+	if err != nil {
+		return err
+	}
+	var children []*Job
+	for rows.Next() {
+		c, err := scanJob(rows)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		children = append(children, c)
+	}
+	rows.Close()
+	for _, c := range children {
+		if err := s.copyJob(runID, id, c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // copyJobLogs gives job to the log of job from: a link to (or else a copy

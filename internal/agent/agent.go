@@ -408,6 +408,7 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 		Env:                   env,
 		Secrets:               req.Secrets,
 		Vars:                  req.Vars,
+		WorkflowCallInputs:    req.Inputs, // a reusable workflow's job: what its caller passed
 		Token:                 req.Secrets["GITHUB_TOKEN"],
 		Platforms:             a.platforms,
 		GitHubInstance:        "github.com",
