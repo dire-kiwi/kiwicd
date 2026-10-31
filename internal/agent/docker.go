@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	dockerclient "github.com/moby/moby/client"
 	"github.com/nektos/act/pkg/container"
@@ -46,6 +47,19 @@ func createJobNetwork(ctx context.Context, name, bridge string) error {
 		Options: map[string]string{"com.docker.network.bridge.name": bridge},
 		Labels:  map[string]string{"kiwicd.job": name},
 	})
+	return err
+}
+
+// pingDocker checks that the agent can reach the Docker daemon.
+func pingDocker(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cli, err := container.GetDockerClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	_, err = cli.Ping(ctx, dockerclient.PingOptions{})
 	return err
 }
 

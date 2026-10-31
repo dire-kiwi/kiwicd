@@ -22,6 +22,9 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
   commands, `::add-mask::`, `hashFiles()`. `actions/checkout` of the workflow's own repository is
   served from the source archive the agent downloads.
+- **Services and job containers**: `jobs.<id>.services` (`image`, `env`, `ports`, `options`,
+  `credentials`, `volumes`) and `jobs.<id>.container` on every runner, e.g. a database for tests
+  (see [Services](#services)).
 - **Repositories**: *hosted* (push to `https://SERVER/git/OWNER/NAME.git`, which triggers
   workflows immediately) or *mirror* (a remote URL fetched every minute or on a webhook,
   `POST /api/hooks/OWNER/NAME` with GitHub's `X-Hub-Signature-256`, or through the
@@ -81,9 +84,55 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
 
-Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
-artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
-(only other repositories' `repository_pull_request`), commit statuses on GitHub.
+Not yet: reusable workflows (`jobs.<id>.uses`), artifacts and caches, job-level `concurrency`, a
+repository's own `pull_request` workflows (only other repositories' `repository_pull_request`),
+commit statuses on GitHub.
+
+## Services
+
+Jobs can have service containers and run in a container of their own, as on GitHub, whatever
+runner they're on:
+
+```yaml
+jobs:
+  test:
+    runs-on: self-hosted
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test ./...
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/postgres
+```
+
+- **A job on the agent's machine** reaches its services on `localhost`, at the host port Docker
+  picked for each of their `ports` (`job.services.<id>.ports[<port>]`). kiwicd publishes them
+  on `127.0.0.1` only, unless the workflow names an address (`0.0.0.0:8080:80`). A fixed host
+  port (`5432:5432`) works too, but then two jobs using it can't run on the machine at once.
+- **A job with `container:`** runs its steps in that container, which reaches its services by
+  their IDs (`postgres:5432`) on a network the job's containers share. Without services, a
+  container job on the agent's machine uses the machine's network, as act does.
+- Steps wait for services' health checks (`--health-cmd`) before they start. The job context
+  also has `job.services.<id>.id` and `.network`, and `job.container.id` and `.network`.
+- Services and job containers run in Docker, so the agent needs it (`DOCKER_HOST`, or the
+  default socket). An agent that can't reach Docker fails such jobs at once and says why; other
+  jobs aren't affected.
+- Services never get the Docker socket, and job containers get it only from `--docker-socket`
+  (see [Isolating jobs](#isolating-jobs)).
+- The agent removes a job's service containers, job container and network when the job ends or
+  is cancelled, and those of jobs it didn't finish when it starts. They're named
+  `kiwicd-r<runner>-j<job>-...`.
+- On agents that isolate jobs (`--job-image`), services join the job's own network, and the
+  restrictions on container options and volumes apply to them as well. Their ports aren't
+  published on the machine: jobs reach them by name, and `job.services.<id>.ports[<port>]` is
+  the port itself.
 
 ## Deploy a public repository from a private one
 
@@ -363,7 +412,8 @@ the job image. The agent needs Docker; its jobs don't get it. Also:
 - Workflows may not give their `container` or `services` options or volumes that reach outside
   the container: host paths, named volumes (they outlive the job), `--privileged`, devices,
   capabilities, other namespaces, `--env-file`. Options such as `--health-cmd`, `--user`,
-  `-e`, `--memory` and `--tmpfs` work as usual.
+  `-e`, `--memory` and `--tmpfs` work as usual. Service ports aren't published on the machine
+  (see [Services](#services)).
 - act's shared tool cache volume is left out and Docker actions are rebuilt for each job.
 - `--job-options` (`KIWICD_JOB_OPTIONS`) are `docker create` options for every job, service and
   step container, after the workflow's own, e.g. `--memory 4g --cpus 2 --pids-limit 4096`.
@@ -429,3 +479,9 @@ nektos/act. So far:
   options and volumes that reach the host), `ContainerOptions` applied after the workflow's own to
   job and service containers and to `docker://` steps, and a user-defined `ContainerNetworkMode`
   used for services and for building Docker actions too.
+- Services for host jobs: on a network of their own, with their ports published on the host
+  (on `Config.ServicePortHostIP` unless the workflow names an address; not at all under
+  `RestrictContainers`). `job.services.<id>.id`, `.network` and `.ports`, and `job.container.id`
+  and `.network`, are filled in, and a number indexes an object (`ports[5432]`). Services don't
+  get the Docker socket, and one service's registry credentials no longer replace the job
+  container's.
