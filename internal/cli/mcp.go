@@ -610,12 +610,16 @@ func (s *mcpServer) send(m rpcMessage) {
 }
 
 // serve handles messages from in until it ends or ctx is done. Tool calls
-// run concurrently, so a wait_for_run doesn't hold up the others.
+// run concurrently, so a wait_for_run doesn't hold up the others; when in
+// ends, the client has gone, so they're cancelled rather than waited for.
 func (s *mcpServer) serve(ctx context.Context, in io.Reader) error {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	defer cancel()
+	// The tool calls in progress, by request ID, for notifications/cancelled.
+	var mu sync.Mutex
+	calls := map[string]context.CancelFunc{}
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 64<<10), 32<<20)
 	for sc.Scan() {
@@ -632,22 +636,59 @@ func (s *mcpServer) serve(ctx context.Context, in io.Reader) error {
 			continue // a response to something we never send
 		}
 		if len(m.ID) == 0 || string(m.ID) == "null" {
-			continue // notifications: initialized, cancelled
+			// Notifications: initialized needs nothing, cancelled stops a
+			// tool call.
+			if m.Method == "notifications/cancelled" {
+				var p struct {
+					RequestID json.RawMessage `json:"requestId"`
+				}
+				_ = json.Unmarshal(m.Params, &p)
+				mu.Lock()
+				if stop := calls[requestKey(p.RequestID)]; stop != nil {
+					stop()
+				}
+				mu.Unlock()
+			}
+			continue
 		}
 		if m.Method == "tools/call" {
+			key := requestKey(m.ID)
+			callCtx, stop := context.WithCancel(ctx)
+			mu.Lock()
+			calls[key] = stop
+			mu.Unlock()
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				s.handle(ctx, m)
+				reply := s.handle(callCtx, m)
+				mu.Lock()
+				delete(calls, key)
+				mu.Unlock()
+				// A cancelled request gets no response.
+				if callCtx.Err() == nil {
+					s.send(reply)
+				}
+				stop()
 			}()
 			continue
 		}
-		s.handle(ctx, m)
+		s.send(s.handle(ctx, m))
 	}
 	return sc.Err()
 }
 
-func (s *mcpServer) handle(ctx context.Context, m rpcMessage) {
+// requestKey is a request ID in a form to compare: 7 and 7.0 are the same.
+func requestKey(id json.RawMessage) string {
+	var v any
+	if err := json.Unmarshal(id, &v); err != nil {
+		return string(id)
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+// handle answers a request.
+func (s *mcpServer) handle(ctx context.Context, m rpcMessage) rpcMessage {
 	reply := rpcMessage{ID: m.ID}
 	switch m.Method {
 	case "initialize":
@@ -692,7 +733,7 @@ func (s *mcpServer) handle(ctx context.Context, m rpcMessage) {
 	default:
 		reply.Error = &rpcError{Code: -32601, Message: "method not found: " + m.Method}
 	}
-	s.send(reply)
+	return reply
 }
 
 // callTool runs a tool; its errors are results the model sees, not

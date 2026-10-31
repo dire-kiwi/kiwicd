@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,6 +165,12 @@ func TestCLI(t *testing.T) {
 	if out := e.ok("", "variable", "list", "--repo", "t/app"); !strings.Contains(out, "nz-north") {
 		t.Fatalf("variable list: %s", out)
 	}
+	// An empty value is a value, not a reason to read stdin.
+	e.ok("not this", "variable", "set", "EMPTY", "")
+	e.ok("not this", "secret", "set", "EMPTY", "--value", "")
+	if out := e.ok("", "variable", "list"); !strings.Contains(out, "EMPTY") || strings.Contains(out, "not this") {
+		t.Fatalf("empty variable: %s", out)
+	}
 	e.ok("", "secret", "delete", "GLOBAL_ONE")
 	if code, _, errOut := e.kiwicd("", "secret", "delete", "GLOBAL_ONE"); code != 1 || !strings.Contains(errOut, "no global secret named GLOBAL_ONE") {
 		t.Fatalf("deleting a missing secret: %d %s", code, errOut)
@@ -197,6 +205,14 @@ func TestCLI(t *testing.T) {
 	if out := e.ok("", "run", "logs", "2", "--failed"); !strings.Contains(out, "about to fail") || strings.Contains(out, "hello broken") {
 		t.Fatalf("failed logs: %s", out)
 	}
+	// Following a job that's waiting for another.
+	e.ok("", "run", "start", "t/app", "deploy.yml", "--input", "target=broken")
+	if out := e.ok("", "run", "logs", "3", "--job", "fail", "--follow"); !strings.Contains(out, "about to fail") || strings.Contains(out, "hello broken") {
+		t.Fatalf("following a later job: %s", out)
+	}
+	if code, _, errOut := e.kiwicd("", "run", "logs", "1", "--job", "nope"); code != 1 || !strings.Contains(errOut, `no job "nope"`) {
+		t.Fatalf("logs of a missing job: %d %s", code, errOut)
+	}
 	if out := e.ok("", "run", "logs", "2", "--job", "deploy", "--follow"); !strings.Contains(out, "hello broken") {
 		t.Fatalf("logs of one job: %s", out)
 	}
@@ -207,19 +223,36 @@ func TestCLI(t *testing.T) {
 	if err := json.Unmarshal([]byte(e.ok("", "run", "view", "2", "--json")), &d); err != nil || d.Run.Conclusion != "failure" || len(d.Jobs) != 2 {
 		t.Fatalf("run view --json: %v %+v", err, d)
 	}
-	if out := e.ok("", "run", "rerun", "1", "--watch"); !strings.Contains(out, "Started run 3") || !strings.Contains(out, "Deploy #1.2") {
+	if out := e.ok("", "run", "rerun", "1", "--watch"); !strings.Contains(out, "Started run 4") || !strings.Contains(out, "Deploy #1.2") {
 		t.Fatalf("rerun: %s", out)
 	}
-	if out := e.ok("", "api", "runs/3"); !strings.Contains(out, `"attempt": 2`) {
+	if out := e.ok("", "api", "runs/4"); !strings.Contains(out, `"attempt": 2`) {
 		t.Fatalf("api: %s", out)
 	}
 	if out := e.ok("", "runner", "list"); !strings.Contains(out, "cli-test") {
 		t.Fatalf("runner list: %s", out)
 	}
 
-	e.ok("", "logout")
-	if code, _, _ := e.kiwicd("", "whoami"); code != 1 {
-		t.Fatal("still logged in after logout")
+	// logout revokes the saved token, not one in KIWICD_API_TOKEN.
+	shared := strings.TrimSpace(e.ok("", "token", "create", "ci"))
+	t.Setenv("KIWICD_API_TOKEN", shared)
+	if _, _, errOut := e.kiwicd("", "logout"); !strings.Contains(errOut, "its token wasn't revoked") {
+		t.Fatalf("logout with KIWICD_API_TOKEN: %s", errOut)
+	}
+	if code, _, errOut := e.kiwicd("", "whoami"); code != 1 || !strings.Contains(errOut, "not logged in") {
+		t.Fatalf("whoami after logout: %d %s", code, errOut)
+	}
+	t.Setenv("KIWICD_URL", e.url)
+	if out := e.ok("", "whoami"); !strings.HasPrefix(out, "admin on "+e.url) {
+		t.Fatalf("the shared token was revoked: %s", out)
+	}
+	if _, _, errOut := e.kiwicd("", "logout"); !strings.Contains(errOut, "wasn't revoked") {
+		t.Fatalf("logout with only KIWICD_API_TOKEN: %s", errOut)
+	}
+	e.ok("", "whoami")
+	admin := &Client{URL: e.url, Token: "pw"}
+	if tokens, err := admin.Tokens(context.Background()); err != nil || len(tokens) != 1 || tokens[0].Name != "ci" {
+		t.Fatalf("tokens after logout, only the shared one: %v %+v", err, tokens)
 	}
 }
 
@@ -365,5 +398,54 @@ func TestMCP(t *testing.T) {
 	}
 	if resp := ro.call("tools/call", map[string]any{"name": "set_secret", "arguments": map[string]any{}}); resp["error"] == nil {
 		t.Fatalf("read-only set_secret: %v", resp)
+	}
+}
+
+// A wait_for_run in progress stops when the client cancels it or goes away.
+func TestMCPCancel(t *testing.T) {
+	old := pollInterval
+	pollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { pollInterval = old })
+	var polls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		polls.Add(1)
+		fmt.Fprint(w, `{"run":{"id":1,"status":"queued"},"jobs":[],"plan":[]}`)
+	}))
+	defer ts.Close()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	srv := newMCPServer(&Client{URL: ts.URL, Token: "x"}, "test", false, outW, io.Discard)
+	done := make(chan error, 1)
+	go func() { done <- srv.serve(context.Background(), inR) }()
+	s := &mcpSession{t: t, in: inW, out: json.NewDecoder(outR)}
+	send := func(m string) {
+		if _, err := inW.Write([]byte(m + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Cancelled: no response, so the next one is the ping's.
+	send(`{"jsonrpc":"2.0","id":"w1","method":"tools/call","params":{"name":"wait_for_run","arguments":{"run_id":1,"timeout_seconds":600}}}`)
+	send(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"w1","reason":"test"}}`)
+	if ping := s.call("ping", nil); ping["result"] == nil {
+		t.Fatalf("ping: %v", ping)
+	}
+	time.Sleep(50 * time.Millisecond)
+	n := polls.Load()
+	time.Sleep(100 * time.Millisecond)
+	if polls.Load() != n {
+		t.Fatal("the cancelled wait_for_run is still polling")
+	}
+
+	// Stdin closing ends the server without waiting for the call.
+	send(`{"jsonrpc":"2.0","id":"w2","method":"tools/call","params":{"name":"wait_for_run","arguments":{"run_id":1,"timeout_seconds":600}}}`)
+	inW.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("kiwicd mcp didn't exit when stdin closed")
 	}
 }

@@ -282,7 +282,8 @@ git over `/git/`. The admin's can last forever; those of people signed in with G
 most 90 days, since organization membership is only checked when they sign in. Changing the
 admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
 revoked under **Settings → API tokens**, or with `kiwicd token list` and `kiwicd token revoke`;
-`kiwicd logout` revokes its own.
+`kiwicd logout` revokes the saved one, but not one in `KIWICD_API_TOKEN`, which scripts or CI
+may share.
 
 ### MCP
 
