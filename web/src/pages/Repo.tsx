@@ -996,6 +996,56 @@ function ProtectedRefsSettings({ repo, onChanged }: { repo: Repo; onChanged: () 
   );
 }
 
+/** Whether pull requests from forks run the repository's own pull_request workflows. */
+function PullRequestSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const toggle = async (on: boolean) => {
+    if (on && !confirm(`Run ${repo.name}'s pull_request workflows on pull requests from forks? Anyone can open one on a public repository.`))
+      return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { fork_pull_requests: on });
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Pull requests</h3>
+          <p className="muted small">
+            GitHub's <span className="mono">pull_request</span> webhook runs this repository's{" "}
+            <span className="mono">on: pull_request</span> workflows on a merge of the pull request into its base branch. Their workflow
+            comes from the pull request, so their jobs get no secrets except <span className="mono">KIWICD_TOKEN</span> and can't use
+            protected or reserved runners. Pull requests from forks only run them if allowed here; their jobs run the fork's code on
+            your runners.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv kv-pad">
+        <span className="label">Forks</span>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={!!repo.fork_pull_requests}
+            disabled={busy}
+            onChange={(e) => void toggle(e.target.checked)}
+          />{" "}
+          Run pull_request workflows on pull requests from forks
+        </label>
+      </div>
+    </section>
+  );
+}
+
 /** Whether runs of workflows that aren't the GitHub repository's own are reported to it. */
 function ChecksSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
@@ -1081,6 +1131,7 @@ function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => voi
         </div>
       </section>
       {repo.kind === "mirror" && <MirrorSettings repo={repo} onChanged={onChanged} />}
+      {repo.kind === "mirror" && <PullRequestSettings repo={repo} onChanged={onChanged} />}
       <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />
       <ChecksSettings repo={repo} onChanged={onChanged} />

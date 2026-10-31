@@ -244,6 +244,9 @@ var migrations = []struct{ table, column, sql string }{
 	// (repository_push and repository_pull_request listeners, uploaded
 	// workflows) are reported to it as check runs (see checks.go).
 	{"repos", "report_checks", `ALTER TABLE repos ADD COLUMN report_checks INTEGER NOT NULL DEFAULT 0`},
+	// Whether pull requests from forks run the repository's pull_request
+	// workflows (see pullrequest.go).
+	{"repos", "fork_pull_requests", `ALTER TABLE repos ADD COLUMN fork_pull_requests INTEGER NOT NULL DEFAULT 0`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

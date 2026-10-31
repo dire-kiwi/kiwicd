@@ -3,6 +3,9 @@ package e2e
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -296,6 +299,151 @@ func TestRepositoryPush(t *testing.T) {
 	api("GET", "/api/runs?repo=t/app", "", &appRuns)
 	if len(appRuns) != 0 {
 		t.Errorf("t/app has %d runs", len(appRuns))
+	}
+}
+
+const pullRequestWorkflow = `
+name: PR
+on: pull_request
+jobs:
+  check:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - name: The merge of the pull request into main
+        run: test "$(cat base.txt)" = v2 && test "$(cat feature.txt)" = new
+      - run: |
+          test "$GITHUB_REF" = refs/pull/1/merge
+          test "$GITHUB_HEAD_REF" = feature && test "$GITHUB_BASE_REF" = main
+          test "${{ github.event_name }} ${{ github.head_ref }} ${{ github.base_ref }} ${{ github.ref_name }}" = "pull_request feature main 1/merge"
+          test "${{ github.event.pull_request.head.ref }}" = feature
+          echo "secret=[${{ secrets.TOKEN }}]"
+`
+
+// TestPullRequest runs a mirror's own pull_request workflow on GitHub's
+// webhook, on the merge of the pull request into its base branch, without
+// secrets.
+func TestPullRequest(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	tmp := t.TempDir()
+	srv, err := server.New(server.Config{DataDir: filepath.Join(tmp, "data"), AdminPassword: "pw", RegistrationToken: "reg", Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	api := func(method, path, body string, out any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.SetBasicAuth("admin", "pw")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 300 {
+			t.Fatalf("%s %s: %d %s", method, path, resp.StatusCode, b)
+		}
+		if out != nil {
+			if err := json.Unmarshal(b, out); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	creds, err := agent.Register(ctx, ts.URL, "reg", "e2e", nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agent.New(agent.Config{Creds: creds, WorkDir: filepath.Join(tmp, "work"), Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = a.Run(ctx) }()
+
+	// The pull request adds feature.txt; main changes base.txt after it
+	// branched off.
+	origin := filepath.Join(tmp, "origin")
+	write := func(name, content string) {
+		_ = os.MkdirAll(filepath.Dir(filepath.Join(origin, name)), 0o755)
+		_ = os.WriteFile(filepath.Join(origin, name), []byte(content), 0o644)
+	}
+	run(t, tmp, "git", "init", "-q", "-b", "main", origin)
+	write(".github/workflows/pr.yml", pullRequestWorkflow)
+	write("base.txt", "v1")
+	run(t, origin, "git", "add", "-A")
+	run(t, origin, "git", "commit", "-qm", "init")
+	run(t, origin, "git", "checkout", "-qb", "feature")
+	write("feature.txt", "new")
+	run(t, origin, "git", "add", "-A")
+	run(t, origin, "git", "commit", "-qm", "feature")
+	run(t, origin, "git", "update-ref", "refs/pull/1/head", "HEAD")
+	run(t, origin, "git", "checkout", "-q", "main")
+	write("base.txt", "v2")
+	run(t, origin, "git", "commit", "-qam", "v2")
+	out, err := exec.Command("git", "-C", origin, "rev-parse", "refs/pull/1/head").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(string(out))
+
+	api("POST", "/api/repos", `{"name":"t/app","url":"`+origin+`"}`, nil)
+	api("PUT", "/api/secrets", `{"name":"TOKEN","value":"s3cret-value"}`, nil)
+	var app struct {
+		WebhookSecret string `json:"webhook_secret"`
+	}
+	api("GET", "/api/repos/t/app", "", &app)
+	body := fmt.Sprintf(`{"action":"opened","number":1,"pull_request":{"number":1,"title":"Add a feature",`+
+		`"head":{"ref":"feature","sha":%q,"repo":{"full_name":"gh/app"}},"base":{"ref":"main","repo":{"full_name":"gh/app"}}},`+
+		`"sender":{"login":"someone"},"repository":{"full_name":"gh/app"}}`, head)
+	mac := hmac.New(sha256.New, []byte(app.WebhookSecret))
+	mac.Write([]byte(body))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/hooks/t/app", strings.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("webhook: %d", resp.StatusCode)
+	}
+
+	var runs []struct{ ID int64 }
+	deadline := time.Now().Add(30 * time.Second)
+	for len(runs) == 0 && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		api("GET", "/api/runs?repo=t/app", "", &runs)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("expected one run, got %d", len(runs))
+	}
+	var r runResp
+	for time.Now().Before(deadline.Add(60 * time.Second)) {
+		api("GET", fmt.Sprintf("/api/runs/%d", runs[0].ID), "", &r)
+		if r.Run.Status == "completed" {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	var logs []struct{ Text string }
+	if len(r.Jobs) > 0 {
+		api("GET", fmt.Sprintf("/api/jobs/%d/logs", r.Jobs[0].ID), "", &logs)
+	}
+	all := ""
+	for _, l := range logs {
+		all += l.Text + "\n"
+	}
+	if r.Run.Conclusion != "success" {
+		t.Fatalf("run %+v\n%s", r, all)
+	}
+	if !strings.Contains(all, "secret=[]") {
+		t.Errorf("the pull request's job got a secret:\n%s", all)
 	}
 }
 

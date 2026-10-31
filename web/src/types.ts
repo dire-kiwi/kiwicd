@@ -36,6 +36,8 @@ export interface Repo {
   protected_branches?: string[];
   /** Whether runs of its repository_push/repository_pull_request listeners and uploaded workflows are reported to GitHub as check runs. */
   report_checks?: boolean;
+  /** Mirrors: whether pull requests from forks run the repository's pull_request workflows. */
+  fork_pull_requests?: boolean;
 }
 
 export interface WorkflowInput {

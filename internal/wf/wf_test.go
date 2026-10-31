@@ -191,6 +191,64 @@ jobs:
 	}
 }
 
+func TestPullRequest(t *testing.T) {
+	match := func(src string, pr PullRequest) bool {
+		t.Helper()
+		w, err := Parse([]byte(src + "jobs:\n  x: {runs-on: a, steps: [{run: echo}]}\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return MatchesPullRequest(w, pr)
+	}
+	// on: pull_request takes the default types, from any base branch, and
+	// whether a fork's pull request runs isn't the workflow's choice.
+	for _, on := range []string{"on: pull_request\n", "on: [push, pull_request]\n", "on:\n  pull_request:\n"} {
+		for action, want := range map[string]bool{"opened": true, "synchronize": true, "reopened": true, "closed": false, "edited": false} {
+			if got := match(on, PullRequest{Action: action, Base: "dev", Fork: true}); got != want {
+				t.Errorf("%q: %s = %v", on, action, got)
+			}
+		}
+	}
+	if match("on: push\n", PullRequest{Action: "opened", Base: "main"}) ||
+		match("on:\n  repository_pull_request:\n    repositories: [o/app]\n", PullRequest{Repo: "o/app", Action: "opened", Base: "main"}) {
+		t.Error("other events matched")
+	}
+
+	const filtered = `on:
+  pull_request:
+    types: [opened, closed]
+    branches: [main, 'release/**']
+    paths: ['src/**']
+    paths-ignore: ['src/docs/**']
+`
+	pr := func(action, base string, files ...string) PullRequest {
+		return PullRequest{Action: action, Base: base, ChangedFiles: files}
+	}
+	for _, c := range []struct {
+		pr   PullRequest
+		want bool
+	}{
+		{pr("opened", "main", "src/a.go"), true},
+		{pr("closed", "release/1/x", "README", "src/a.go"), true},
+		{pr("synchronize", "main", "src/a.go"), false},      // types
+		{pr("opened", "dev", "src/a.go"), false},            // branches: the base branch
+		{pr("opened", "main", "README"), false},             // paths
+		{pr("opened", "main", "src/docs/a.md"), false},      // paths-ignore
+		{PullRequest{Action: "opened", Base: "main"}, true}, // changed files unknown
+	} {
+		if got := match(filtered, c.pr); got != c.want {
+			t.Errorf("%+v = %v, want %v", c.pr, got, c.want)
+		}
+	}
+	if match("on:\n  pull_request:\n    branches-ignore: [old]\n", pr("opened", "old")) {
+		t.Error("branches-ignore")
+	}
+	// tags filters don't apply to pull requests.
+	if !match("on:\n  pull_request:\n    tags-ignore: ['*']\n", pr("opened", "main")) {
+		t.Error("tags-ignore stopped a pull request")
+	}
+}
+
 func TestWorkflowConcurrency(t *testing.T) {
 	env := func(src string) *Env {
 		w, err := Parse([]byte(src))
