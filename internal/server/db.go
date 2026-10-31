@@ -230,6 +230,16 @@ CREATE TABLE IF NOT EXISTS github_checks (
 );
 CREATE INDEX IF NOT EXISTS github_checks_run ON github_checks(check_run_id);
 CREATE INDEX IF NOT EXISTS github_checks_suite ON github_checks(check_suite_id);
+-- Authors of pull requests from forks whose runs someone approved, which
+-- then run without asking again (see approval.go).
+CREATE TABLE IF NOT EXISTS approved_contributors (
+	repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+	user_id INTEGER NOT NULL,           -- GitHub's user ID: logins can be renamed and reused
+	login TEXT NOT NULL,
+	approved_by TEXT NOT NULL,
+	approved_at INTEGER NOT NULL,
+	PRIMARY KEY (repo_id, user_id)
+);
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -326,6 +336,12 @@ var migrations = []struct{ table, column, sql string }{
 	// Whether the repository's own .github/workflows/ files run (see
 	// workflowsAt); off for mirrors whose workflows run on GitHub Actions.
 	{"repos", "repo_workflows", `ALTER TABLE repos ADD COLUMN repo_workflows INTEGER NOT NULL DEFAULT 1`},
+	// Which pull requests from forks wait for approval before their
+	// pull_request workflows run, and a run's approval (see approval.go).
+	{"repos", "fork_approval", `ALTER TABLE repos ADD COLUMN fork_approval TEXT NOT NULL DEFAULT 'first_time'`},
+	{"runs", "approval", `ALTER TABLE runs ADD COLUMN approval TEXT NOT NULL DEFAULT ''`},
+	{"runs", "approved_by", `ALTER TABLE runs ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''`},
+	{"runs", "approved_at", `ALTER TABLE runs ADD COLUMN approved_at INTEGER NOT NULL DEFAULT 0`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

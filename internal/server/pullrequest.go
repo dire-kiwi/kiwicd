@@ -35,7 +35,8 @@ import (
 //     KIWICD_TOKEN and protected and reserved runner labels keep them off
 //     those runners. Pull requests from forks only start them if the
 //     repository allows it (fork_pull_requests), since the workflow itself
-//     comes from the fork.
+//     comes from the fork, and those of authors it doesn't know wait for
+//     approval (see approval.go).
 //   - other repositories' workflows that listen with repository_pull_request,
 //     from their default branches, as triggerRepositoryPush does for pushes.
 
@@ -45,7 +46,15 @@ type pullRequestEvent struct {
 	Number      int64  `json:"number"`
 	PullRequest struct {
 		Title string `json:"title"`
-		Head  struct {
+		User  struct {
+			Login string `json:"login"`
+			ID    int64  `json:"id"`
+		} `json:"user"`
+		// The author's relation to the repository: OWNER, MEMBER,
+		// COLLABORATOR, CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER,
+		// NONE or MANNEQUIN (see approval.go).
+		AuthorAssociation string `json:"author_association"`
+		Head              struct {
 			Ref  string    `json:"ref"`
 			Sha  string    `json:"sha"`
 			Repo *ghRepoID `json:"repo"` // null once a fork is deleted
@@ -140,6 +149,9 @@ func (s *Server) onPullRequest(ctx context.Context, repoID int64, body []byte) e
 	payload["repository"] = repoEventInfo(repo, s.cfg.PublicURL)
 	pr := wf.PullRequest{Repo: repo.Name, Action: ev.Action, Base: ev.PullRequest.Base.Ref, Fork: ev.fork()}
 	s.log.Info("pull request", "repo", repo.Name, "number", ev.Number, "action", ev.Action, "fork", pr.Fork, "merge", merge.sha)
+	if ev.Action == "closed" {
+		s.cancelWaitingRuns(repo.ID, pullRequestMergeRef(ev.Number), "", 0, "The pull request was closed before anyone approved the run.")
+	}
 	switch {
 	case ferr != nil: // no merge commit to run
 	case merge.conflict:
@@ -149,7 +161,7 @@ func (s *Server) onPullRequest(ctx context.Context, repoID int64, body []byte) e
 	default:
 		pr.ChangedFiles = merge.changed
 		title := fmt.Sprintf("#%d %s: %s", ev.Number, ev.Action, ev.PullRequest.Title)
-		err = s.runPullRequestWorkflows(ctx, repo, ev, pr, merge.sha, payload, title)
+		err = s.runPullRequestWorkflows(ctx, repo, ev, pr, merge.sha, payload, title, s.needsApproval(repo, ev))
 	}
 	title := fmt.Sprintf("%s #%d %s: %s", repo.Name, ev.Number, ev.Action, ev.PullRequest.Title)
 	lerr := s.triggerListeners(ctx, repo, wf.RepositoryPullRequest, payload, ev.Sender.Login, title, func(w *model.Workflow) bool {
@@ -162,9 +174,11 @@ func (s *Server) onPullRequest(ctx context.Context, repoID int64, body []byte) e
 }
 
 // runPullRequestWorkflows starts the repository's own workflows at the
-// pull request's merge commit that listen with pull_request.
+// pull request's merge commit that listen with pull_request, or with
+// approval creates their runs waiting for it. Each replaces the runs of the
+// same workflow and pull request still waiting for approval.
 func (s *Server) runPullRequestWorkflows(ctx context.Context, repo *Repo, ev *pullRequestEvent, pr wf.PullRequest, sha string,
-	payload map[string]any, title string) error {
+	payload map[string]any, title string, approval bool) error {
 	files, err := s.workflowsAt(ctx, repo, sha)
 	if err != nil {
 		return err
@@ -178,8 +192,10 @@ func (s *Server) runPullRequestWorkflows(ctx context.Context, repo *Repo, ev *pu
 			// Report invalid workflows that listen for the pull request,
 			// or, if their triggers can't be read, look like they do.
 			if t := wf.Triggers(src); (t != nil && wf.MatchesPullRequest(t, pr)) || (t == nil && bytes.Contains(src, []byte("pull_request"))) {
-				_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: file, event: "pull_request",
-					payload: payload, ref: ref, sha: sha, actor: actor, title: title, parseErr: perr})
+				if id, err := s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: file, event: "pull_request",
+					payload: payload, ref: ref, sha: sha, actor: actor, title: title, parseErr: perr}); err == nil {
+					s.cancelWaitingRuns(repo.ID, ref, file, id, replacedWhileWaiting)
+				}
 			}
 			continue
 		}
@@ -190,13 +206,17 @@ func (s *Server) runPullRequestWorkflows(ctx context.Context, repo *Repo, ev *pu
 		if name == "" {
 			name = file
 		}
-		if _, err := s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: name, event: "pull_request",
-			payload: payload, ref: ref, sha: sha, actor: actor, title: title}); err != nil {
+		id, err := s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: name, event: "pull_request",
+			payload: payload, ref: ref, sha: sha, actor: actor, title: title, approval: approval})
+		if err != nil {
 			return err
 		}
+		s.cancelWaitingRuns(repo.ID, ref, file, id, replacedWhileWaiting)
 	}
 	return nil
 }
+
+const replacedWhileWaiting = "A newer event of the pull request replaced it before anyone approved it."
 
 func pullRequestMergeRef(number int64) string { return fmt.Sprintf("refs/pull/%d/merge", number) }
 

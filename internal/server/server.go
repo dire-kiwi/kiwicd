@@ -266,6 +266,8 @@ func (s *Server) routes() []route {
 		{"PATCH /api/repos/{owner}/{name}", maintainer, pathRepo, s.handleUpdateRepo},
 		{"DELETE /api/repos/{owner}/{name}", admin, pathRepo, s.handleDeleteRepo},
 		{"POST /api/repos/{owner}/{name}/sync", maintainer, pathRepo, s.handleSyncRepo},
+		{"GET /api/repos/{owner}/{name}/approved-contributors", maintainer, pathRepo, s.handleListApprovedContributors},
+		{"DELETE /api/repos/{owner}/{name}/approved-contributors/{user}", maintainer, pathRepo, s.handleDeleteApprovedContributor},
 		{"GET /api/repos/{owner}/{name}/workflows", viewer, pathRepo, s.handleListWorkflows},
 		// Badges check who may see them themselves (see badge.go).
 		{"GET /api/repos/{owner}/{name}/badge/{file...}", public, nil, s.handleBadge},
@@ -280,6 +282,7 @@ func (s *Server) routes() []route {
 		{"GET /api/runs/{id}", viewer, runRepo, s.handleGetRun},
 		{"POST /api/runs/{id}/cancel", maintainer, runRepo, s.handleCancelRun},
 		{"POST /api/runs/{id}/rerun", maintainer, runRepo, s.handleRerun},
+		{"POST /api/runs/{id}/approve", maintainer, runRepo, s.handleApproveRun},
 		{"GET /api/runs/{id}/logs", viewer, runRepo, s.handleRunLogs},
 		{"GET /api/runs/{id}/reports", viewer, runRepo, s.handleRunReports},
 		{"GET /api/jobs/{id}", viewer, jobRepo, s.handleGetJob},

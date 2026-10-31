@@ -249,7 +249,7 @@ func (s *Server) syncChecks(ctx context.Context, runID int64) error {
 		want[j.ID] = s.jobCheckRun(run, j, target)
 		order = append(order, j.ID)
 	}
-	if len(jobs) == 0 && run.Status == protocol.StatusCompleted && run.Error != "" {
+	if len(jobs) == 0 && run.Status == protocol.StatusCompleted && run.Error != "" && run.Approval == "" {
 		// An invalid workflow: GitHub shows a failed run for those too.
 		want[0] = s.runCheckRun(run, target)
 		order = append(order, 0)
@@ -273,6 +273,12 @@ func (s *Server) syncChecks(ctx context.Context, runID int64) error {
 		have[jobID] = r
 	}
 	rows.Close()
+	if _, reported := have[0]; run.Status == protocol.StatusWaiting || (run.Approval != "" && reported) {
+		// A run waiting for approval shows as one check run until it's
+		// approved, when its jobs have their own.
+		want[0] = s.approvalCheckRun(run, target)
+		order = append(order, 0)
+	}
 
 	auth := ""
 	for _, jobID := range order {
@@ -432,6 +438,36 @@ func (s *Server) runCheckRun(run *Run, target checkTarget) *checkRun {
 		CompletedAt: at,
 		Output:      &checkOutput{Title: "Failed", Summary: limitSummary(quoteMarkdown(run.Error))},
 	}
+}
+
+// approvalCheckRun is the check run for a run that waits for approval, or
+// waited.
+func (s *Server) approvalCheckRun(run *Run, target checkTarget) *checkRun {
+	c := &checkRun{
+		Name:       target.prefix + run.WorkflowName,
+		HeadSHA:    target.sha,
+		DetailsURL: s.detailsURL(fmt.Sprintf("/runs/%d", run.ID)),
+		ExternalID: "run:" + fmt.Sprint(run.ID),
+		Status:     "queued",
+		Output: &checkOutput{Title: "Waiting for approval", Summary: "This pull request is from a fork, and its runs wait for a maintainer " +
+			"to approve them in kiwicd before they start."},
+	}
+	switch {
+	case run.Approval == approvalApproved:
+		at := checkTime(run.ApprovedAt)
+		c.Status, c.Conclusion, c.StartedAt, c.CompletedAt = "completed", "skipped", at, at
+		c.Output = &checkOutput{Title: "Approved", Summary: limitSummary(fmt.Sprintf("Approved by %s. Its jobs have check runs of their own.",
+			run.ApprovedBy))}
+	case run.Status == protocol.StatusCompleted:
+		at := checkTime(run.FinishedAt)
+		c.Status, c.Conclusion, c.StartedAt, c.CompletedAt = "completed", "cancelled", at, at
+		why := run.Error
+		if why == "" {
+			why = "It was cancelled before anyone approved it."
+		}
+		c.Output = &checkOutput{Title: "Cancelled", Summary: limitSummary(quoteMarkdown(why))}
+	}
+	return c
 }
 
 func checkConclusion(result string) string {
