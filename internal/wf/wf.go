@@ -213,6 +213,13 @@ func MatchesPullRequest(w *model.Workflow, pr PullRequest) bool {
 	return ok && matchesPullRequestFilters(cfg, pr, true)
 }
 
+// ListensForPullRequest is MatchesPullRequest without the paths filters,
+// for before the files the pull request changes are known.
+func ListensForPullRequest(w *model.Workflow, pr PullRequest) bool {
+	cfg, ok := eventConfig(w, "pull_request")
+	return ok && matchesPullRequestFilters(cfg, pr, false)
+}
+
 func matchesPullRequestFilters(cfg map[string]any, pr PullRequest, paths bool) bool {
 	if !matchesTypes(cfg, pr.Action, defaultPullRequestTypes) {
 		return false

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,6 +33,9 @@ import (
 //     at refs/pull/N/merge: github.ref is refs/pull/N/merge and github.sha
 //     is that commit, whose workflow files are the ones that run. As on
 //     GitHub, a pull request whose head doesn't merge cleanly starts none.
+//     The base isn't fetched nor the merge made for an action no workflow
+//     listens for (see mayRunPullRequest), and each run keeps its commit
+//     reachable at refs/kiwicd/runs/<id> (see runCommitRef).
 //     These runs are from an unprotected ref, so they get no secrets but
 //     KIWICD_TOKEN and protected and reserved runner labels keep them off
 //     those runners. Pull requests from forks only start them if the
@@ -123,13 +128,6 @@ func (s *Server) onPullRequest(ctx context.Context, repoID int64, body []byte) e
 	if err != nil {
 		return err
 	}
-	// Listeners start even if the fetch fails: a closed pull request needs no
-	// commit, and other jobs report what they can't fetch. The repository's
-	// own workflows need the merge commit.
-	merge, ferr := s.fetchPullRequest(ctx, repo, ev)
-	if ferr != nil {
-		s.log.Warn("fetch pull request", "repo", repo.Name, "number", ev.Number, "err", ferr)
-	}
 	payload := map[string]any{}
 	for _, k := range []string{"action", "number", "pull_request", "sender", "before", "after"} {
 		if v, ok := raw[k]; ok {
@@ -139,14 +137,22 @@ func (s *Server) onPullRequest(ctx context.Context, repoID int64, body []byte) e
 	// Like push events: kiwicd's repository, which the job can clone.
 	payload["repository"] = repoEventInfo(repo, s.cfg.PublicURL)
 	pr := wf.PullRequest{Repo: repo.Name, Action: ev.Action, Base: ev.PullRequest.Base.Ref, Fork: ev.fork()}
-	s.log.Info("pull request", "repo", repo.Name, "number", ev.Number, "action", ev.Action, "fork", pr.Fork, "merge", merge.sha)
-	switch {
-	case ferr != nil: // no merge commit to run
-	case merge.conflict:
-		s.log.Info("pull request doesn't merge cleanly; its pull_request workflows don't run", "repo", repo.Name, "number", ev.Number)
-	case pr.Fork && !repo.ForkPullRequests:
+	s.log.Info("pull request", "repo", repo.Name, "number", ev.Number, "action", ev.Action, "fork", pr.Fork)
+	// Listeners start even if the fetch fails: a closed pull request needs no
+	// commit, and other jobs report what they can't fetch. The repository's
+	// own workflows need the merge commit, which is only made if one of them
+	// could run.
+	if ferr := s.fetchPullRequestHead(ctx, repo, ev); ferr != nil {
+		s.log.Warn("fetch pull request", "repo", repo.Name, "number", ev.Number, "err", ferr)
+	} else if pr.Fork && !repo.ForkPullRequests {
 		s.log.Info("pull request from a fork; the repository doesn't run pull_request workflows for them", "repo", repo.Name, "number", ev.Number)
-	default:
+	} else if !s.mayRunPullRequest(ctx, repo, ev, pr) {
+		s.log.Debug("no pull_request workflow listens for the action; no merge commit", "repo", repo.Name, "number", ev.Number, "action", ev.Action)
+	} else if merge, merr := s.mergePullRequestBase(ctx, repo, ev); merr != nil {
+		s.log.Warn("merge pull request", "repo", repo.Name, "number", ev.Number, "err", merr)
+	} else if merge.conflict {
+		s.log.Info("pull request doesn't merge cleanly; its pull_request workflows don't run", "repo", repo.Name, "number", ev.Number)
+	} else {
 		pr.ChangedFiles = merge.changed
 		title := fmt.Sprintf("#%d %s: %s", ev.Number, ev.Action, ev.PullRequest.Title)
 		err = s.runPullRequestWorkflows(ctx, repo, ev, pr, merge.sha, payload, title)
@@ -200,6 +206,33 @@ func (s *Server) runPullRequestWorkflows(ctx context.Context, repo *Repo, ev *pu
 
 func pullRequestMergeRef(number int64) string { return fmt.Sprintf("refs/pull/%d/merge", number) }
 
+// A pull request's next merge commit moves refs/pull/N/merge, which leaves
+// the one before unreachable, and git gc would in time prune it from under a
+// queued run or a re-run of one. So each pull_request run keeps its commit at
+// refs/kiwicd/runs/<id> until the run is deleted.
+func runCommitRef(runID int64) string { return fmt.Sprintf("refs/kiwicd/runs/%d", runID) }
+
+// keepRunCommit points a run's refs/kiwicd/runs/<id> at its commit, if the
+// run is from a ref that moves to commits on no branch.
+func (s *Server) keepRunCommit(ctx context.Context, repo *Repo, runID int64, ref, sha string) {
+	if !strings.HasPrefix(ref, "refs/pull/") || sha == "" {
+		return
+	}
+	if _, err := git(ctx, s.repoPath(repo.Name), "update-ref", runCommitRef(runID), sha); err != nil {
+		s.log.Warn("keep run commit", "repo", repo.Name, "run", runID, "sha", sha, "err", err)
+	}
+}
+
+// dropRunCommit deletes what keepRunCommit made.
+func (s *Server) dropRunCommit(ctx context.Context, repoName string, runID int64, ref string) {
+	if !strings.HasPrefix(ref, "refs/pull/") {
+		return
+	}
+	if _, err := git(ctx, s.repoPath(repoName), "update-ref", "-d", runCommitRef(runID)); err != nil {
+		s.log.Warn("drop run commit", "repo", repoName, "run", runID, "err", err)
+	}
+}
+
 // pullRequestFetchRetry is how long to wait before fetching a pull request's
 // head again when it isn't the event's commit yet.
 var pullRequestFetchRetry = 3 * time.Second
@@ -212,12 +245,84 @@ type pullRequestMerge struct {
 	conflict bool     // the head doesn't merge cleanly; no commit
 }
 
-// fetchPullRequest fetches refs/pull/N/head of a mirror's origin, until the
-// mirror has the event's head commit (GitHub may send the event before it
-// updates the ref), and the base branch's tip, and merges the head into it.
-func (s *Server) fetchPullRequest(ctx context.Context, repo *Repo, ev *pullRequestEvent) (pullRequestMerge, error) {
+// fetchPullRequestHead fetches refs/pull/N/head of a mirror's origin, until
+// the mirror has the event's head commit (GitHub may send the event before it
+// updates the ref).
+func (s *Server) fetchPullRequestHead(ctx context.Context, repo *Repo, ev *pullRequestEvent) error {
 	if repo.Kind != "mirror" {
-		return pullRequestMerge{}, fmt.Errorf("%s is not a mirror", repo.Name)
+		return fmt.Errorf("%s is not a mirror", repo.Name)
+	}
+	lock := s.repoLock(repo.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	p := s.repoPath(repo.Name)
+	if _, err := git(ctx, p, "remote", "set-url", "origin", repo.URL); err != nil {
+		return err
+	}
+	env, cleanup, err := s.remoteEnv(ctx, repo)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	head := ev.PullRequest.Head.Sha
+	ref := fmt.Sprintf("refs/pull/%d/head", ev.Number)
+	for attempt := 1; ; attempt++ {
+		_, err := gitEnv(ctx, p, env, "fetch", "--no-tags", "origin", "+"+ref+":"+ref)
+		if err == nil {
+			if _, err = resolveRef(ctx, p, head); err == nil {
+				return nil
+			}
+			err = fmt.Errorf("%s doesn't have %s", ref, head)
+		}
+		if attempt == 3 {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pullRequestFetchRetry):
+		}
+	}
+}
+
+// mayRunPullRequest reports whether one of the repository's own workflows
+// could run on the pull request's event, judging by those at its head, at
+// the mirror's base branch (which the merge commit may take a workflow from)
+// and uploaded ones. Most actions (labeled, edited, assigned…) start none,
+// and then there's no need to fetch the base branch and merge. The paths
+// filters need the merge, so they're left for runPullRequestWorkflows.
+func (s *Server) mayRunPullRequest(ctx context.Context, repo *Repo, ev *pullRequestEvent, pr wf.PullRequest) bool {
+	files, err := s.workflowsAt(ctx, repo, ev.PullRequest.Head.Sha)
+	if err != nil {
+		return true // runPullRequestWorkflows reports it
+	}
+	srcs := slices.Collect(maps.Values(files))
+	if repo.RepoWorkflows {
+		p := s.repoPath(repo.Name)
+		if base, err := resolveRef(ctx, p, "refs/heads/"+ev.PullRequest.Base.Ref); err == nil {
+			if files, err := workflowFiles(ctx, p, base); err == nil {
+				srcs = slices.AppendSeq(srcs, maps.Values(files))
+			}
+		}
+	}
+	for _, src := range srcs {
+		// As runPullRequestWorkflows reports invalid workflows.
+		t := wf.Triggers(src)
+		if (t != nil && wf.ListensForPullRequest(t, pr)) || (t == nil && bytes.Contains(src, []byte("pull_request"))) {
+			return true
+		}
+	}
+	return false
+}
+
+// mergePullRequestBase fetches the tip of the pull request's base branch and
+// merges the head, which fetchPullRequestHead fetched, into it.
+func (s *Server) mergePullRequestBase(ctx context.Context, repo *Repo, ev *pullRequestEvent) (pullRequestMerge, error) {
+	// The base branch as it is now, which may be newer than the mirror's,
+	// but only in FETCH_HEAD: the mirror's branches change when it syncs, so
+	// that the sync sees the push.
+	if strings.ContainsAny(ev.PullRequest.Base.Ref, ": ") {
+		return pullRequestMerge{}, fmt.Errorf("bad base branch %q", ev.PullRequest.Base.Ref)
 	}
 	lock := s.repoLock(repo.ID)
 	lock.Lock()
@@ -231,31 +336,6 @@ func (s *Server) fetchPullRequest(ctx context.Context, repo *Repo, ev *pullReque
 		return pullRequestMerge{}, err
 	}
 	defer cleanup()
-	head := ev.PullRequest.Head.Sha
-	ref := fmt.Sprintf("refs/pull/%d/head", ev.Number)
-	for attempt := 1; ; attempt++ {
-		_, err := gitEnv(ctx, p, env, "fetch", "--no-tags", "origin", "+"+ref+":"+ref)
-		if err == nil {
-			if _, err = resolveRef(ctx, p, head); err == nil {
-				break
-			}
-			err = fmt.Errorf("%s doesn't have %s", ref, head)
-		}
-		if attempt == 3 {
-			return pullRequestMerge{}, err
-		}
-		select {
-		case <-ctx.Done():
-			return pullRequestMerge{}, ctx.Err()
-		case <-time.After(pullRequestFetchRetry):
-		}
-	}
-	// The base branch as it is now, which may be newer than the mirror's,
-	// but only in FETCH_HEAD: the mirror's branches change when it syncs, so
-	// that the sync sees the push.
-	if strings.ContainsAny(ev.PullRequest.Base.Ref, ": ") {
-		return pullRequestMerge{}, fmt.Errorf("bad base branch %q", ev.PullRequest.Base.Ref)
-	}
 	if _, err := gitEnv(ctx, p, env, "fetch", "--no-tags", "origin", "refs/heads/"+ev.PullRequest.Base.Ref); err != nil {
 		return pullRequestMerge{}, err
 	}
@@ -263,7 +343,7 @@ func (s *Server) fetchPullRequest(ctx context.Context, repo *Repo, ev *pullReque
 	if err != nil {
 		return pullRequestMerge{}, err
 	}
-	return mergePullRequest(ctx, p, ev.Number, base, head)
+	return mergePullRequest(ctx, p, ev.Number, base, ev.PullRequest.Head.Sha)
 }
 
 // mergePullRequest merges head into base without a work tree and points

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -79,8 +81,14 @@ func (s *Server) pruneRuns(ctx context.Context, cutoff time.Time) (int, error) {
 
 // deleteRun deletes a run with its jobs and their logs. All run deletion goes
 // through here, so anything stored outside the database for a job, such as
-// its log archive, is removed here too.
+// its log archive, or for the run, such as a pull_request run's ref to its
+// commit, is removed here too.
 func (s *Server) deleteRun(ctx context.Context, runID int64) error {
+	var repoName, ref string
+	if err := s.db.QueryRowContext(ctx, `SELECT repos.name, runs.ref FROM runs JOIN repos ON repos.id = runs.repo_id WHERE runs.id = ?`,
+		runID).Scan(&repoName, &ref); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs WHERE run_id = ?`, runID)
 	if err != nil {
 		return err
@@ -108,6 +116,7 @@ func (s *Server) deleteRun(ctx context.Context, runID int64) error {
 		return err
 	}
 	s.removeLogArchives(jobIDs)
+	s.dropRunCommit(ctx, repoName, runID, ref)
 	return nil
 }
 

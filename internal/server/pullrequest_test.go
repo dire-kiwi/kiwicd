@@ -597,7 +597,7 @@ func TestPullRequest(t *testing.T) {
 	for _, j := range all {
 		jobs[j.Key] = j
 	}
-	if j := jobs["trusted"]; j == nil || j.Conclusion != protocol.ResultFailure || !strings.Contains(j.Error, "refs/pull/1/merge") {
+	if j := jobs["trusted"]; j == nil || j.Conclusion != protocol.ResultFailure || !strings.Contains(j.Error, "comes from the pull request") {
 		t.Errorf("job on a protected runner: %+v", j)
 	}
 	if j := jobs["prod"]; j == nil || j.Conclusion != protocol.ResultFailure || !strings.Contains(j.Error, "reserved") {
@@ -657,5 +657,42 @@ func TestPullRequest(t *testing.T) {
 	}
 	if push, _ := srv.getRun(pushID); push.Cancel {
 		t.Error("a pull request cancelled the push")
+	}
+
+	// A run keeps its merge commit reachable after refs/pull/N/merge moves
+	// on, until it's deleted.
+	if kept, err := resolveRef(ctx, mirror, runCommitRef(pr.ID)); err != nil || kept != merge {
+		t.Errorf("the first run's commit ref: %q, %v; want %s", kept, err, merge)
+	}
+
+	// No workflow listens for labeled, so the event fetches the head but
+	// makes no merge commit.
+	labeledHead := newPullRequest(5, "labels", "main", map[string]string{"src/d.go": "x"})
+	labeled := prEvent("labeled", 5, "labels", labeledHead, "gh/app")
+	deliver(labeled)
+	if _, err := resolveRef(ctx, mirror, labeledHead); err != nil {
+		t.Errorf("the labeled event didn't fetch the head: %v", err)
+	}
+	if _, err := resolveRef(ctx, mirror, "refs/pull/5/merge"); err == nil {
+		t.Error("the labeled event made a merge commit")
+	}
+	// Once main has a workflow that does, it runs on the merge commit, though
+	// the pull request's head doesn't have it.
+	write(origin, ".github/workflows/labels.yml", "on:\n  pull_request:\n    types: [labeled]\njobs:\n  x: {runs-on: self-hosted, steps: [{run: echo}]}\n")
+	git(origin, "add", "-A")
+	git(origin, "commit", "-qm", "labels")
+	if err := srv.syncRepo(ctx, app.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	deliver(labeled)
+	got = runs()
+	if len(got) != 5 || got[0].WorkflowFile != ".github/workflows/labels.yml" || got[0].Ref != "refs/pull/5/merge" {
+		t.Fatalf("a labeled event with a workflow for it ran %+v", got[0])
+	}
+	if err := srv.deleteRun(ctx, got[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveRef(ctx, mirror, runCommitRef(got[0].ID)); err == nil {
+		t.Error("a deleted run's commit ref is still there")
 	}
 }
