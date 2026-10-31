@@ -218,6 +218,11 @@ func (s *Server) approveRuns(ctx context.Context, run *Run, by string) ([]int64,
 		s.mu.Unlock()
 		if err != nil {
 			s.log.Error("evaluate an approved run", "run", id, "err", err)
+		} else if r, err := s.getRun(id); err == nil && r.Status == protocol.StatusCompleted {
+			// Its concurrency or run-name is invalid now.
+			s.publishRun(id)
+			s.queueWorkflowRun(id, "completed")
+			continue
 		} else if conc.Group != "" {
 			s.supersede(ctx, run.RepoID, id, "pull_request", conc)
 		}

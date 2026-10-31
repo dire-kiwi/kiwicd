@@ -220,7 +220,8 @@ pre code {
   color: var(--success);
 }
 .text-in_progress,
-.text-queued {
+.text-queued,
+.text-approval {
   color: var(--amber);
 }
 .text-cancelled,
@@ -1996,7 +1997,8 @@ a.graph-job:hover {
   color: var(--neutral);
 }
 .status-in_progress,
-.status-queued {
+.status-queued,
+.status-approval {
   color: var(--amber);
 }
 .log-box .status-pending,

@@ -13,6 +13,7 @@ const filterKeys = ["repo", "workflow", "branch", "event", "status", "actor"] as
 type Filters = Partial<Record<(typeof filterKeys)[number], string>>;
 
 const statuses: [string, string][] = [
+  ["waiting", "Waiting for approval"],
   ["queued", "Queued"],
   ["in_progress", "In progress"],
   ["completed", "Completed"],
@@ -30,7 +31,7 @@ function matches(r: Run, f: Filters): boolean {
   if (f.event && r.event !== f.event) return false;
   if (f.actor && r.actor !== f.actor) return false;
   if (f.status) {
-    if (["queued", "in_progress", "completed", "pending"].includes(f.status)) return r.status === f.status;
+    if (["waiting", "queued", "in_progress", "completed", "pending"].includes(f.status)) return r.status === f.status;
     return r.status === "completed" && r.conclusion === f.status;
   }
   return true;

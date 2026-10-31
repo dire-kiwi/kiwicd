@@ -205,7 +205,7 @@ func mcpTools() []*mcpTool {
 				"workflow": prop("string", "Only this workflow's runs: its file, e.g. ci.yml"),
 				"branch":   prop("string", "Only runs of this branch (or full ref)"),
 				"event":    prop("string", "Only runs started by this event, e.g. push or workflow_dispatch"),
-				"status":   prop("string", "queued, in_progress or completed, or a conclusion: success, failure, cancelled or skipped"),
+				"status":   prop("string", "waiting (for approval), queued, in_progress or completed, or a conclusion: success, failure, cancelled or skipped"),
 				"actor":    prop("string", "Only runs started by this user"),
 				"limit":    prop("integer", "How many (default 20, at most 500)")}),
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
