@@ -40,6 +40,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and jobs check out the pushed commit. Runs show them as `kiwicd:deploy.yml`, separate from a
   committed file of the same name. To keep a public repository's deployment out of it, prefer a
   private repository that listens with `repository_push`.
+- **Reusable workflows**: `jobs.<id>.uses` calls a workflow with `on: workflow_call`, from the
+  same repository or another one, with typed `with:` inputs, `secrets:` (or `secrets: inherit`),
+  outputs for `needs.<id>.outputs`, and `strategy.matrix`, `needs` and `if` on the calling job,
+  nested up to four levels (see [Reusable workflows](#reusable-workflows)).
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)). One with
@@ -81,9 +85,79 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
 
-Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
+Not yet: job `container:`/`services:` on host labels,
 artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
 (only other repositories' `repository_pull_request`), commit statuses on GitHub.
+
+## Reusable workflows
+
+A job with `uses:` runs the jobs of another workflow, as on GitHub:
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [linux, arm]
+    uses: ./.github/workflows/build.yml           # same repository and commit
+    with:
+      target: ${{ matrix.os }}
+    secrets:
+      token: ${{ secrets.REGISTRY_TOKEN }}         # or: secrets: inherit
+  deploy:
+    needs: build
+    uses: owner/shared/.github/workflows/deploy.yml@v1
+    with:
+      image: ${{ needs.build.outputs.image }}
+```
+
+```yaml
+# .github/workflows/build.yml
+on:
+  workflow_call:
+    inputs:
+      target: { type: string, required: true }
+      push: { type: boolean, default: true }
+    secrets:
+      token: { required: true }
+    outputs:
+      image: { value: "${{ jobs.image.outputs.ref }}" }
+jobs:
+  image:
+    runs-on: self-hosted
+    outputs:
+      ref: ${{ steps.build.outputs.ref }}
+    steps: ...
+```
+
+- **Where workflows come from.** `./.github/workflows/x.yml` is read from the same repository and
+  commit as the workflow calling it. `owner/repo/.github/workflows/x.yml@ref` (a branch, tag or
+  commit) is read from the kiwicd repository `owner/repo`, hosted or mirrored, if it is the run's
+  own repository or lists it as a reader in its **Settings → Job access** (as for
+  `KIWICD_TOKEN`: the repository being read agrees, here to any run of the listed one). A name
+  kiwicd doesn't have is read from GitHub: public repositories without credentials, and private
+  ones the [GitHub App](#github-app) is installed on with its installation token, but only for runs
+  from protected refs, so that a branch anyone can push can't read them through the app. Mirror a
+  repository to use it from runs of other refs.
+- **When.** As on GitHub, a run reads every workflow it calls when it's created, down to four
+  levels (the run's own workflow and three below it), at most 50 calls; a call that can't be
+  read, a loop, an unknown or missing required input or secret fails the run as an invalid
+  workflow. The run's page shows each called workflow and the commit it was read at, and a re-run
+  uses the same ones.
+- **Jobs.** The called workflow's jobs run as part of the run, named `build (linux) / image` as on
+  GitHub, and grouped under the calling job on the run's page. The calling job (one per matrix
+  combination) finishes with their result and the workflow's `outputs`; with several
+  combinations, `needs.build.outputs` has the last one's. `inputs` are converted to their types
+  (`string`, `boolean`, `number`) and take their defaults; `github`, `vars` and `github.event`
+  are the calling run's, and `actions/checkout` checks out the run's repository, as on GitHub.
+  `strategy.fail-fast` and cancelling reach the called jobs.
+- **Secrets.** A called workflow's jobs get only what the calling job passes: the `secrets:`
+  mapping, evaluated with the caller's secrets, or all of them with `secrets: inherit`, and
+  `KIWICD_TOKEN`. Runs from refs that aren't protected still get none, so their mappings are
+  empty.
+- Agents run called jobs from protocol 2 on: upgrade the server first, then the agents. Older
+  agents keep taking other jobs.
 
 ## Deploy a public repository from a private one
 
@@ -238,6 +312,9 @@ each of them:
 - **Fetching**: a mirror whose URL is `https://github.com/OWNER/NAME.git` (without credentials)
   fetches with a short-lived installation token, limited to reading that repository, so a private
   one needs no deploy key. The new-mirror form lists the repositories the app is installed on.
+
+The app also lets runs from protected refs call [reusable workflows](#reusable-workflows) in
+private repositories it's installed on.
 
 The app asks for read access to contents, pull requests and organization members, and for the
 push and pull request events.
@@ -429,3 +506,6 @@ nektos/act. So far:
   options and volumes that reach the host), `ContainerOptions` applied after the workflow's own to
   job and service containers and to `docker://` steps, and a user-defined `ContainerNetworkMode`
   used for services and for building Docker actions too.
+- `Config.WorkflowCallInputs`: the `inputs` of a reusable workflow's job, which the server
+  evaluates from the calling job's `with:`, since kiwicd runs called jobs itself rather than
+  through act's own reusable workflow support.

@@ -22,7 +22,7 @@ func TestParseUses(t *testing.T) {
 	for _, bad := range []string{
 		"./build.yml", "./.github/workflows/a/b.yml", "./.github/workflows/x.yml@main", "owner/repo/.github/workflows/x.yml",
 		"owner/.github/workflows/x.yml@v1", "owner/repo/ci/x.yml@v1", "owner/repo/.github/workflows/x.yml@", "owner/repo/.github/workflows/x.yml@-x",
-		"owner/repo/.github/workflows/x.yml@a..b", "actions/checkout@v4",
+		"owner/repo/.github/workflows/x.yml@a..b", "actions/checkout@v4", "../repo/.github/workflows/x.yml@v1", "o/./.github/workflows/x.yml@v1",
 	} {
 		if _, err := ParseUses(bad); err == nil {
 			t.Errorf("ParseUses(%q) succeeded", bad)

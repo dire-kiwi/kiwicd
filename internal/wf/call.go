@@ -54,6 +54,7 @@ func ParseUses(s string) (Uses, error) {
 	parts := strings.SplitN(s[:at], "/", 3)
 	ref := s[at+1:]
 	if len(parts) < 3 || !repoNamePart.MatchString(parts[0]) || !repoNamePart.MatchString(parts[1]) || !workflowPathRE.MatchString(parts[2]) ||
+		strings.Trim(parts[0], ".") == "" || strings.Trim(parts[1], ".") == "" ||
 		ref == "" || strings.HasPrefix(ref, "-") || strings.ContainsAny(ref, " \t\n:^~?*[\\") || strings.Contains(ref, "..") {
 		return Uses{}, fmt.Errorf("uses: %q: a workflow in another repository is owner/repo/.github/workflows/<file>.yml@ref", s)
 	}
