@@ -73,6 +73,18 @@ job with [act](https://github.com/nektos/act), through our fork
   `cancel-in-progress`, and cancels any other that's waiting. A run's page says when it waits.
   `pull_request` runs' groups are apart from other runs': their workflow comes from the pull
   request, which mustn't cancel or hold up a deploy by naming its group.
+- **Re-runs**: re-run all of a finished run's jobs, the ones that failed or were cancelled, or
+  one job. The last two also re-run the jobs that need them, and the new attempt keeps the other
+  jobs' results, outputs and logs (a job that calls a reusable workflow is kept or re-run whole,
+  with its called jobs). **Debug logging** is on for a re-run with *Enable debug
+  logging* ticked, or with a secret or variable `ACTIONS_STEP_DEBUG` (shows `::debug::` messages)
+  or `ACTIONS_RUNNER_DEBUG` (also act's own debug messages) set to `true`; jobs then get
+  `RUNNER_DEBUG=1`.
+- **Status badges**: `https://SERVER/api/repos/OWNER/NAME/badge/ci.yml.svg` shows how the latest
+  finished run of `.github/workflows/ci.yml` on the default branch ended (`?branch=` for
+  another, `&event=` for one event; `kiwicd:NAME.yml.svg` for an uploaded workflow). Badges
+  need someone signed in who may see the repository, unless the repository's **Settings → Status badges** makes them public, which
+  shows its workflows' names and results to anyone; that page also has each badge's Markdown.
 - **Protected refs**: only runs from a repository's protected refs get its secrets and the global
   ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
   collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The
@@ -103,9 +115,11 @@ job with [act](https://github.com/nektos/act), through our fork
   GitHub logins, organizations and teams; API tokens limited to a role and repositories; a log
   of who changed secrets, variables, settings, runners, roles and tokens (see
   [Access](#access)).
-- **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
-  dispatch, runners, secrets and variables (global or per repository), roles, API tokens and the
-  audit log.
+- **UI**: runs, live job logs per step with folding `::group::` sections, links to lines
+  (`#step:3:42`), search and downloads (a job's log, or a run's as a zip), queue times and
+  durations of jobs and steps on a timeline, re-run and cancel, filters on the runs list,
+  repositories and workflows, manual dispatch, runners, secrets and variables (global or per
+  repository), roles, API tokens and the audit log.
 - **Step summaries and annotations**: a run's Summary page shows what each job's steps wrote
   to `$GITHUB_STEP_SUMMARY`, rendered from Markdown, and lists its annotations: `::error`,
   `::warning` and `::notice` workflow commands (with `file`, `line`, `endLine`, `col` and
@@ -634,10 +648,12 @@ your role.
 ```sh
 kiwicd login --url https://SERVER
 kiwicd run list --repo owner/app             # kiwicd runs, for short
+kiwicd run list --workflow ci.yml --branch main --status failure
 kiwicd run view 42                           # jobs and steps
 kiwicd run logs 42 --failed                  # or --job build, --follow
 kiwicd run start owner/app deploy.yml --ref main -i target=prod --watch
 kiwicd run cancel 42; kiwicd run rerun 42 --watch
+kiwicd run rerun 42 --failed                 # or --job build: keeps the other jobs' results
 kiwicd workflow list owner/app
 kiwicd repo dispatch owner/app deploy --payload '{"env":"prod"}'   # a repository_dispatch event
 echo -n "$VALUE" | kiwicd secret set DEPLOY_KEY --repo owner/app   # or type it at the prompt

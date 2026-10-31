@@ -496,6 +496,15 @@ pre code {
   cursor: pointer;
   user-select: none;
 }
+.check-block {
+  align-items: flex-start;
+}
+.check-block input {
+  margin-top: 4px;
+}
+.check-block .hint {
+  display: block;
+}
 .input {
   font: inherit;
   font-size: 14px;
@@ -604,6 +613,116 @@ textarea.input {
   align-items: center;
 }
 
+.timing {
+  padding: 6px 16px 12px;
+  overflow-x: auto;
+}
+.timing-row {
+  display: grid;
+  grid-template-columns: 24px minmax(140px, 1.3fr) 72px 72px minmax(160px, 2fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  min-width: 560px;
+}
+.timing-head {
+  min-height: 24px;
+}
+.timing-job + .timing-job {
+  border-top: 1px solid var(--border);
+}
+.timing-step {
+  min-height: 24px;
+  color: var(--muted);
+}
+.timing-step .timing-name {
+  padding-left: 18px;
+}
+.timing-toggle {
+  width: 22px;
+  height: 22px;
+  transition: transform 0.15s;
+}
+.timing-toggle:disabled {
+  visibility: hidden;
+}
+.timing-toggle-open {
+  transform: rotate(90deg);
+}
+.timing-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.timing-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.timing-track {
+  position: relative;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--surface-hover);
+}
+.timing-track-elsewhere {
+  background: none;
+}
+.timing-track > .muted {
+  position: absolute;
+  top: -4px;
+  line-height: 18px;
+}
+.timing-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 2px;
+  border-radius: 3px;
+  background: var(--neutral);
+}
+.timing-queued {
+  background: repeating-linear-gradient(45deg, var(--amber), var(--amber) 3px, transparent 3px, transparent 6px);
+  opacity: 0.6;
+}
+.timing-success {
+  background: var(--success);
+}
+.timing-failure {
+  background: var(--danger);
+}
+.timing-in_progress {
+  background: var(--amber);
+}
+.badge-preview {
+  display: block;
+  height: 20px;
+}
+.run-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 10px;
+}
+.run-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.run-filter-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+.run-filter select {
+  max-width: 220px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  font-size: 13px;
+}
+.run-filter-on select {
+  border-color: var(--accent);
+}
 .list {
   list-style: none;
   margin: 0;
@@ -1439,6 +1558,41 @@ a.graph-job:hover {
   margin-right: 6px;
   color: var(--muted);
 }
+.log-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px 0 8px;
+  height: 26px;
+  border: 1px solid var(--btn-border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--muted);
+}
+.log-search:focus-within {
+  box-shadow: 0 0 0 3px var(--focus);
+}
+.log-search input {
+  width: 160px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.log-search-count {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.log-search-btn {
+  width: 22px;
+  height: 22px;
+}
+.log-search-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 .job-info {
   display: flex;
   flex-wrap: wrap;
@@ -1545,8 +1699,20 @@ a.graph-job:hover {
 .log-line:hover {
   background: rgba(255, 255, 255, 0.04);
 }
-.log-line:target {
+.log-line mark {
+  background: rgba(210, 153, 34, 0.45);
+  color: inherit;
+  border-radius: 2px;
+}
+.log-line.log-current mark {
+  background: #e3b341;
+  color: #161b22;
+}
+.log-line.log-marked {
   background: rgba(210, 153, 34, 0.18);
+}
+.log-marked .ln {
+  color: var(--log-text);
 }
 .ln {
   flex-shrink: 0;
@@ -1591,11 +1757,6 @@ a.graph-job:hover {
 .log-notice .lt {
   color: #79c0ff;
 }
-/* The line a link points at, over its level's colour. */
-.log-line.log-line-selected {
-  background: rgba(210, 153, 34, 0.22);
-  box-shadow: inset 3px 0 0 #d29922;
-}
 .log-debug .lt {
   color: #a371f7;
 }
@@ -1604,6 +1765,28 @@ a.graph-job:hover {
 }
 .log-group .lt {
   font-weight: 600;
+}
+.log-group-header {
+  cursor: pointer;
+}
+.group-chevron {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 16px;
+  margin-right: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--log-muted);
+  cursor: pointer;
+  transition: transform 0.15s;
+}
+.group-chevron-open {
+  transform: rotate(90deg);
+}
+.log-group-open > .log-line:not(.log-group-header) .lt {
+  padding-left: 20px;
 }
 
 /* ------------------------------------------------ annotations, summaries */

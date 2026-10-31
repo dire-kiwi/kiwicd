@@ -200,19 +200,28 @@ func mcpTools() []*mcpTool {
 		},
 		{
 			Name: "list_runs", Title: "List runs", readOnly: true,
-			Description: "List recent runs, newest first, optionally for one repository.",
+			Description: "List recent runs, newest first, optionally only some: of a repository, workflow, branch, event, status or actor.",
 			InputSchema: schema(map[string]any{"repo": prop("string", "Only this repository's runs, OWNER/NAME"),
-				"limit": prop("integer", "How many (default 20, at most 500)")}),
+				"workflow": prop("string", "Only this workflow's runs: its file, e.g. ci.yml"),
+				"branch":   prop("string", "Only runs of this branch (or full ref)"),
+				"event":    prop("string", "Only runs started by this event, e.g. push or workflow_dispatch"),
+				"status":   prop("string", "queued, in_progress or completed, or a conclusion: success, failure, cancelled or skipped"),
+				"actor":    prop("string", "Only runs started by this user"),
+				"limit":    prop("integer", "How many (default 20, at most 500)")}),
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
-				repo, err := argString(args, "repo", false)
-				if err != nil {
-					return nil, err
+				var f RunFilter
+				for name, to := range map[string]*string{"repo": &f.Repo, "workflow": &f.Workflow, "branch": &f.Branch, "event": &f.Event, "status": &f.Status, "actor": &f.Actor} {
+					v, err := argString(args, name, false)
+					if err != nil {
+						return nil, err
+					}
+					*to = v
 				}
 				limit, err := argInt(args, "limit", false, 20)
 				if err != nil {
 					return nil, err
 				}
-				runs, err := c.Runs(ctx, repo, int(limit))
+				runs, err := c.Runs(ctx, f, int(limit))
 				if err != nil {
 					return nil, err
 				}
@@ -391,15 +400,26 @@ func mcpTools() []*mcpTool {
 		},
 		{
 			Name: "rerun", Title: "Re-run a run",
-			Description: "Start a new attempt of a run, with the same workflow, commit and event. Returns the new run's ID.",
-			InputSchema: schema(map[string]any{"run_id": runIDProp}, "run_id"),
+			Description: "Start a new attempt of a run, with the same workflow, commit and event. By default every job runs again; " +
+				"failed re-runs the jobs that failed or were cancelled and job_id one job, each with the jobs that need them, " +
+				"keeping the other jobs' results. Returns the new run's ID.",
+			InputSchema: schema(map[string]any{
+				"run_id": runIDProp,
+				"failed": map[string]any{"type": "boolean", "description": "Re-run only the jobs that failed or were cancelled (the run must have finished)."},
+				"job_id": map[string]any{"type": "integer", "description": "Re-run only this job of the run (the run must have finished)."},
+				"debug":  map[string]any{"type": "boolean", "description": "Turn on debug logging: ::debug:: messages and the runner's own."},
+			}, "run_id"),
 			Annotations: map[string]any{"destructiveHint": false, "openWorldHint": true},
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
 				id, err := argInt(args, "run_id", true, 0)
 				if err != nil {
 					return nil, err
 				}
-				newID, err := c.Rerun(ctx, id)
+				jobID, err := argInt(args, "job_id", false, 0)
+				if err != nil {
+					return nil, err
+				}
+				newID, err := c.Rerun(ctx, id, RerunOptions{Failed: argBool(args, "failed"), JobID: jobID, Debug: argBool(args, "debug")})
 				if err != nil {
 					return nil, err
 				}

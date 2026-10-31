@@ -32,6 +32,9 @@ type Run struct {
 	Error        string         `json:"error"`
 	Cancel       bool           `json:"cancel_requested"`
 	Protected    bool           `json:"protected"` // its ref got secrets; see protectedrefs.go
+	// Debug turns on ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG for the
+	// run's jobs (a re-run with debug logging).
+	Debug bool `json:"debug,omitempty"`
 	// Concurrency group; see concurrency.go.
 	ConcurrencyGroup string `json:"concurrency_group,omitempty"`
 	// workflow_run events that led to it; see triggers.go.
@@ -42,13 +45,15 @@ type Run struct {
 }
 
 const runCols = `r.id, r.repo_id, p.name, r.number, r.attempt, r.workflow_file, r.workflow_name, r.workflow_yaml, r.title, r.event, r.event_json,
-	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.concurrency_group, r.trigger_depth, r.created_at, r.started_at, r.finished_at`
+	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.debug, r.concurrency_group, r.trigger_depth,
+	r.created_at, r.started_at, r.finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	var ev string
 	if err := row.Scan(&r.ID, &r.RepoID, &r.Repo, &r.Number, &r.Attempt, &r.WorkflowFile, &r.WorkflowName, &r.WorkflowYAML, &r.Title, &r.Event, &ev,
-		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.ConcurrencyGroup, &r.TriggerDepth, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.Debug, &r.ConcurrencyGroup, &r.TriggerDepth,
+		&r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(ev), &r.EventJSON)
@@ -81,20 +86,25 @@ type Job struct {
 	Steps      []protocol.StepState `json:"steps"`
 	Cancel     bool                 `json:"cancel_requested"`
 	LogSeq     int64                `json:"log_seq"`
-	CreatedAt  int64                `json:"created_at"`
-	StartedAt  int64                `json:"started_at"`
-	FinishedAt int64                `json:"finished_at"`
-	Heartbeat  int64                `json:"-"`
+	// A job a re-run kept from an earlier attempt: the job that ran, and
+	// the attempt it ran in (see rerun.go).
+	CopiedFrom    int64 `json:"copied_from,omitempty"`
+	CopiedAttempt int64 `json:"copied_attempt,omitempty"`
+	CreatedAt     int64 `json:"created_at"`
+	StartedAt     int64 `json:"started_at"`
+	FinishedAt    int64 `json:"finished_at"`
+	Heartbeat     int64 `json:"-"`
 }
 
 const jobCols = `id, run_id, job_key, name, parent_id, uses, inputs, matrix, runs_on, status, conclusion, error, runner_id, runner_name, outputs, steps,
-	cancel_requested, log_seq, created_at, started_at, finished_at, heartbeat_at`
+	cancel_requested, log_seq, copied_from, copied_attempt, created_at, started_at, finished_at, heartbeat_at`
 
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var inputs, matrix, runsOn, outputs, steps string
 	if err := row.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &j.ParentID, &j.Uses, &inputs, &matrix, &runsOn, &j.Status, &j.Conclusion, &j.Error,
-		&j.RunnerID, &j.RunnerName, &outputs, &steps, &j.Cancel, &j.LogSeq, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Heartbeat); err != nil {
+		&j.RunnerID, &j.RunnerName, &outputs, &steps, &j.Cancel, &j.LogSeq, &j.CopiedFrom, &j.CopiedAttempt, &j.CreatedAt, &j.StartedAt, &j.FinishedAt,
+		&j.Heartbeat); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(inputs), &j.Inputs)
@@ -144,6 +154,9 @@ type runSpec struct {
 	// called are the reusable workflows the run's jobs call, for a re-run;
 	// createRun reads them otherwise.
 	called []*calledWorkflow
+	// For re-runs of some jobs: what to keep from the earlier attempt.
+	reuse *reusePlan
+	debug bool
 }
 
 func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
@@ -176,10 +189,15 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	if attempt == 0 {
 		attempt = 1
 	}
+	reuse := ""
+	if spec.reuse != nil {
+		reuse = mustJSON(spec.reuse)
+	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
-		status, conclusion, error, protected, trigger_depth, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		status, conclusion, error, protected, trigger_depth, reuse_jobs, debug, created_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
-		status, conclusion, errText, refProtected(spec.repo, spec.ref), spec.depth, nowMS(), finished)
+		status, conclusion, errText, refProtected(spec.repo, spec.ref), spec.depth, reuse, spec.debug, nowMS(), finished)
 	var id int64
 	var conc wf.Concurrency
 	if err == nil {
@@ -404,10 +422,25 @@ func (s *Server) advanceWorkflows(ctx context.Context, run *Run, workflow *model
 		s.publishRun(runID)
 		return nil
 	}
+	queued := false
+	if !run.Cancel {
+		// A re-run of some jobs starts with the ones it keeps.
+		var reuse string
+		var started bool
+		if err := s.db.QueryRow(`SELECT reuse_jobs, EXISTS (SELECT 1 FROM jobs WHERE run_id = ?) FROM runs WHERE id = ?`, runID, runID).Scan(&reuse, &started); err != nil {
+			return err
+		}
+		if reuse != "" && !started {
+			q, err := s.reuseJobs(run, reuse)
+			if err != nil {
+				return err
+			}
+			queued = q
+		}
+	}
 	ghc := s.githubContext(run)
 	vars := s.varsFor(run.RepoID)
 	inputs, _ := run.EventJSON["inputs"].(map[string]any)
-	queued := false
 
 	for changed := true; changed; {
 		changed = false
