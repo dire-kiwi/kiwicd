@@ -160,6 +160,7 @@ func (s *Server) handlePutUploadedWorkflow(w http.ResponseWriter, r *http.Reques
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.audit(r, "workflow.upload", repo.Name, u.File, "")
 	s.schedulesChanged(repo.ID)
 	writeJSON(w, u)
 }
@@ -179,6 +180,7 @@ func (s *Server) handleDeleteUploadedWorkflow(w http.ResponseWriter, r *http.Req
 		httpError(w, 404, "no uploaded workflow %s", r.PathValue("file"))
 		return
 	}
+	s.audit(r, "workflow.delete", repo.Name, r.PathValue("file"), "")
 	s.schedulesChanged(repo.ID)
 	writeJSON(w, map[string]bool{"ok": true})
 }

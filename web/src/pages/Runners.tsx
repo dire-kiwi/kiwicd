@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { useMe } from "../App";
+import { isAdmin } from "../access";
 import { del, errorMessage, post } from "../api";
 import { StatusIcon } from "../components/StatusIcon";
 import { Chip, CodeBlock, Empty, ErrorBox, Flash, Modal, Spinner } from "../components/ui";
@@ -14,6 +16,7 @@ export function RunnersPage() {
   const [showNew, setShowNew] = useState(false);
   const [error, setError] = useState<string>();
   const now = useNow(true, 15000);
+  const admin = isAdmin(useMe());
 
   // Runner state changes on registration (event) and on heartbeats (poll).
   useEventSource("/api/events", { runners: reload, run: reload }, reload);
@@ -40,9 +43,11 @@ export function RunnersPage() {
           <h1>Runners</h1>
           <p className="muted">Machines running kiwicd-agent that pick up jobs whose <code>runs-on</code> labels they match.</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowNew(true)}>
-          New runner
-        </button>
+        {admin && (
+          <button className="btn btn-primary" onClick={() => setShowNew(true)}>
+            New runner
+          </button>
+        )}
       </div>
       {error && <ErrorBox>{error}</ErrorBox>}
       {runners.error && !runners.data && <ErrorBox onRetry={reload}>{runners.error}</ErrorBox>}
@@ -50,11 +55,13 @@ export function RunnersPage() {
       {runners.data && runners.data.length === 0 && (
         <Empty title="No runners registered">
           Jobs stay queued until a runner with matching labels is online.
-          <div style={{ marginTop: 12 }}>
-            <button className="btn btn-primary" onClick={() => setShowNew(true)}>
-              Add a runner
-            </button>
-          </div>
+          {admin && (
+            <div style={{ marginTop: 12 }}>
+              <button className="btn btn-primary" onClick={() => setShowNew(true)}>
+                Add a runner
+              </button>
+            </div>
+          )}
         </Empty>
       )}
       {runners.data && runners.data.length > 0 && (
@@ -114,9 +121,11 @@ export function RunnersPage() {
                       {r.last_seen_at ? relativeTime(r.last_seen_at, now) : "never"}
                     </td>
                     <td className="cell-actions">
-                      <button className="btn btn-sm btn-danger-outline" onClick={() => remove(r)}>
-                        Remove
-                      </button>
+                      {admin && (
+                        <button className="btn btn-sm btn-danger-outline" onClick={() => remove(r)}>
+                          Remove
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))}

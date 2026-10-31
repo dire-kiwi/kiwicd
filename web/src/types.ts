@@ -1,10 +1,28 @@
 export type Status = "queued" | "in_progress" | "completed" | "pending";
 export type Conclusion = "" | "success" | "failure" | "cancelled" | "skipped";
 
+export type Role = "admin" | "maintainer" | "viewer";
+
+/** What the signed-in user (or the API token used) may do; see the server's access.go. */
+export interface Access {
+  role: Role;
+  admin: boolean;
+  /** Maintainer of every repository. */
+  maintain_all: boolean;
+  /** Otherwise of these: "owner/name" or "owner/*". */
+  maintain: string[];
+  /** The only repositories visible; null for all. */
+  repos: string[] | null;
+  /** Signed in with GitHub. */
+  github: boolean;
+  token?: APIToken;
+}
+
 export interface Me {
   user: string;
   version: string;
   public_url: string;
+  access: Access;
 }
 
 export interface Repo {
@@ -34,6 +52,10 @@ export interface Repo {
   protected_refs?: string[];
   /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
   protected_branches?: string[];
+  /** Whether runs of its repository_push/repository_pull_request listeners and uploaded workflows are reported to GitHub as check runs. */
+  report_checks?: boolean;
+  /** Mirrors: whether pull requests from forks run the repository's pull_request workflows. */
+  fork_pull_requests?: boolean;
 }
 
 export interface WorkflowInput {
@@ -58,6 +80,8 @@ export interface Workflow {
   file: string;
   name: string;
   events: string[] | null;
+  /** The events' filters, e.g. "workflows: CI · types: completed", by event. */
+  event_details?: Record<string, string>;
   dispatch: boolean;
   inputs: WorkflowInput[] | null;
   schedules?: WorkflowSchedule[];
@@ -113,6 +137,11 @@ export interface Job {
   run_id: number;
   key: string;
   name: string;
+  /** The calling job's row, for a job of a reusable workflow; 0 otherwise. */
+  parent_id?: number;
+  /** The workflow a calling job calls, and the inputs it gives it. */
+  uses?: string;
+  inputs?: Record<string, unknown> | null;
   matrix: Record<string, unknown> | null;
   runs_on: string[] | null;
   status: Status;
@@ -133,12 +162,28 @@ export interface PlanEntry {
   key: string;
   name: string;
   needs: string[] | null;
+  /** For a job that calls a reusable workflow: what it calls, and its jobs. */
+  uses?: string;
+  jobs?: PlanEntry[];
+}
+
+/** A reusable workflow the run calls, as read when the run was created. */
+export interface CalledWorkflow {
+  /** The calling jobs' keys from the run's workflow down: build/deploy. */
+  path: string;
+  uses: string;
+  source: "kiwicd" | "github";
+  repo: string;
+  file: string;
+  sha: string;
+  yaml: string;
 }
 
 export interface RunDetail {
   run: Run;
   jobs: Job[] | null;
   plan: PlanEntry[] | null;
+  workflows?: CalledWorkflow[] | null;
   // Labels whose runners won't take this run's jobs, as its ref isn't protected.
   protected_labels?: string[];
 }
@@ -189,6 +234,43 @@ export interface APIToken {
   created_at: number;
   expires_at: number; // 0: never
   last_used_at: number;
+  /** At most this role; "" for its maker's. */
+  role: Role | "";
+  /** Only these repositories; empty for all. */
+  repos: string[];
+}
+
+/** A role given to a GitHub login, an organization's members or a team's ("org/team-slug"). */
+export interface RoleGrant {
+  kind: "user" | "org" | "team";
+  name: string;
+  role: Role;
+  /** Maintainers: "owner/name" or "owner/*"; empty for all repositories. */
+  repos: string[];
+  updated_at: number;
+}
+
+/** Someone who has signed in with GitHub, and the role they have now. */
+export interface GitHubUser {
+  login: string;
+  /** Organizations and teams with roles they were members of when they signed in: "org:NAME", "team:ORG/TEAM". */
+  memberships: string[];
+  signed_in_at: number;
+  role: Role | "";
+  maintain_all: boolean;
+  maintain: string[];
+}
+
+export interface AuditEntry {
+  id: number;
+  at: number;
+  actor: string;
+  token?: string;
+  client?: string;
+  action: string;
+  repo?: string;
+  target?: string;
+  detail?: string;
 }
 
 export interface GitHubApp {
@@ -199,12 +281,20 @@ export interface GitHubApp {
   /** The account or organization that owns the app. */
   owner: string;
   client_id: string;
-  /** GitHub logins that may sign in. */
-  allowed_users: string[];
-  /** Organizations whose members may sign in (the app must be installed on them). */
-  allowed_orgs: string[];
   created_at: number;
   install_url?: string;
+  /** What the app and its installations lack for reporting check runs, from GitHub. */
+  access?: GitHubAccess;
+  /** Why GitHub couldn't be asked for access. */
+  access_error?: string;
+}
+
+export interface GitHubAccess {
+  /** The app's permissions page on GitHub. */
+  permissions_url: string;
+  /** "checks: write" and events the app isn't subscribed to. */
+  missing: string[];
+  installations: { account: string; html_url: string; checks: boolean }[];
 }
 
 export interface GitHubSettings {

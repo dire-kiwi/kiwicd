@@ -12,13 +12,11 @@ import (
 // Signing in with GitHub uses the GitHub App's OAuth client (see github.go):
 // /api/auth/github sends the browser to GitHub, which sends it back to
 // /api/auth/github/callback with a code. kiwicd exchanges that for a token,
-// asks GitHub who the user is and lets them in if their login is allowed or
-// they're a member of an allowed organization that the app is installed on.
-// The token isn't kept, so membership is checked when someone signs in:
-// GitHub sessions last a week rather than the admin's 30 days.
-//
-// Everyone signed in has the admin's access; GitHub logins only change who
-// runs show as having started them.
+// asks GitHub who the user is and lets them in if they have a role (see
+// access.go): their login has one, or they're a member of an organization or
+// team with one that the app is installed on. The token isn't kept, so
+// membership is checked when someone signs in: GitHub sessions last a week
+// rather than the admin's 30 days.
 
 const (
 	githubStateCookie = "kiwicd_github_state"
@@ -80,7 +78,12 @@ func (s *Server) handleGitHubLoginCallback(w http.ResponseWriter, r *http.Reques
 		loginRedirect(w, r, "Signing in with GitHub failed: "+err.Error())
 		return
 	}
-	if !s.githubUserAllowed(r, a, login) {
+	allowed, err := s.checkMemberships(r.Context(), a, login)
+	if err != nil {
+		loginRedirect(w, r, err.Error())
+		return
+	}
+	if !allowed {
 		s.log.Warn("GitHub sign-in refused", "login", login, "client", s.clientIP(r))
 		loginRedirect(w, r, "GitHub user "+login+" may not sign in to this kiwicd.")
 		return
@@ -133,30 +136,6 @@ func (s *Server) githubUser(r *http.Request, a *githubApp, code string) (string,
 		return "", errors.New("GitHub didn't say who you are")
 	}
 	return user.Login, nil
-}
-
-// githubUserAllowed reports whether login may sign in: it's an allowed user,
-// or a member of an allowed organization the app is installed on.
-func (s *Server) githubUserAllowed(r *http.Request, a *githubApp, login string) bool {
-	if containsFold(a.AllowedUsers, login) {
-		return true
-	}
-	for _, org := range a.AllowedOrgs {
-		token, err := s.installationToken(r.Context(), a, "org:"+org, map[string]string{"members": "read"})
-		if err != nil || token == "" {
-			s.log.Warn("can't check members of an allowed organization: is the GitHub App installed on it, with members permission?",
-				"org", org, "err", err)
-			continue
-		}
-		err = s.githubAPI(r.Context(), "GET", "/orgs/"+url.PathEscape(org)+"/members/"+url.PathEscape(login), "token "+token, nil, nil)
-		if err == nil {
-			return true
-		}
-		if !isGitHubStatus(err, 404) {
-			s.log.Warn("checking organization membership", "org", org, "login", login, "err", err)
-		}
-	}
-	return false
 }
 
 func firstNonEmpty(v ...string) string {
