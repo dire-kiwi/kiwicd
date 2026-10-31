@@ -109,6 +109,11 @@ func runSummary(c *Client, d *RunDetail) map[string]any {
 		if j.RunnerName != "" {
 			job["runner"] = j.RunnerName
 		}
+		if j.Uses != "" {
+			// It runs the jobs named "<its name> / ...".
+			job["calls"] = j.Uses
+			delete(job, "runs_on")
+		}
 		if j.Error != "" {
 			job["error"] = j.Error
 		}

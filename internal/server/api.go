@@ -104,9 +104,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		jobs = []*Job{}
 	}
 	plan := []plannedJob{}
+	called, _ := s.calledWorkflows(run.ID)
 	if parsed, err := wf.Parse([]byte(run.WorkflowYAML)); err == nil {
-		called, _ := s.calledWorkflows(run.ID)
 		plan = planOf(parsed, "", called)
+	}
+	// The reusable workflows it calls, and where they came from.
+	workflows := []*calledWorkflow{}
+	for _, path := range sortedKeys(called) {
+		workflows = append(workflows, called[path])
 	}
 	// Runners with these labels won't take the run's jobs, as its ref isn't
 	// protected.
@@ -117,7 +122,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(withheld)
 	}
-	writeJSON(w, map[string]any{"run": run, "jobs": jobs, "plan": plan, "protected_labels": withheld})
+	writeJSON(w, map[string]any{"run": run, "jobs": jobs, "plan": plan, "workflows": workflows, "protected_labels": withheld})
 }
 
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {

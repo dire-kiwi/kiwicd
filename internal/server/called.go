@@ -45,13 +45,13 @@ type calledWorkflow struct {
 	// Path is the keys of the calling jobs, from the run's workflow down,
 	// joined with "/": build, or build/deploy for a job deploy in the
 	// workflow build calls. Job keys can't contain "/".
-	Path   string
-	Uses   string // as the calling job has it
-	Source string // sourceKiwicd or sourceGitHub
-	Repo   string // owner/name there
-	File   string // .github/workflows/x.yml
-	Sha    string
-	YAML   string
+	Path   string `json:"path"`
+	Uses   string `json:"uses"`   // as the calling job has it
+	Source string `json:"source"` // sourceKiwicd or sourceGitHub
+	Repo   string `json:"repo"`   // owner/name there
+	File   string `json:"file"`   // .github/workflows/x.yml
+	Sha    string `json:"sha"`
+	YAML   string `json:"yaml"`
 
 	parsed *model.Workflow
 }
