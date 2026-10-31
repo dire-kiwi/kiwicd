@@ -163,6 +163,10 @@ func TestGitHubChecks(t *testing.T) {
 	waitChecks("an in-progress check run", map[string]string{"CI / build (1.22)": "in_progress/"})
 	steps := []protocol.StepState{{Name: "Set up job", Status: protocol.StatusCompleted, Conclusion: protocol.ResultSuccess},
 		{Name: "Run go test ./...", Status: protocol.StatusCompleted, Conclusion: protocol.ResultFailure}}
+	if err := g.srv.saveJobReport(j.ID, []protocol.StepSummary{{Step: 1, Markdown: "## Tests\n1 failed"}},
+		[]protocol.Annotation{{Level: protocol.AnnotationError, Message: "TestX failed", File: "x_test.go", Line: 7}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := g.srv.completeJob(ctx, j.ID, protocol.ResultFailure, "exit status 1", nil, steps); err != nil {
 		t.Fatal(err)
 	}
@@ -172,6 +176,11 @@ func TestGitHubChecks(t *testing.T) {
 	if c.Method != "PATCH" || c.Body.CompletedAt == "" || c.Body.StartedAt == "" || c.Body.Output == nil ||
 		!strings.Contains(c.Body.Output.Summary, "> exit status 1") || !strings.Contains(c.Body.Output.Summary, "| Run go test ./... | ❌ failure |") {
 		t.Errorf("failed check run %+v %+v", c, c.Body.Output)
+	}
+	// With the job's step summary and annotations.
+	if out := c.Body.Output; out == nil || out.Text != "## Tests\n1 failed" || len(out.Annotations) != 1 ||
+		out.Annotations[0] != (checkAnnotation{Path: "x_test.go", StartLine: 7, EndLine: 7, AnnotationLevel: "failure", Message: "TestX failed"}) {
+		t.Errorf("failed check run's report %+v", out)
 	}
 	g.gh.mu.Lock()
 	for _, r := range g.gh.checkReqs {
@@ -353,7 +362,12 @@ func TestCheckTarget(t *testing.T) {
 }
 
 func TestJobCheckRun(t *testing.T) {
-	srv := &Server{cfg: Config{PublicURL: "https://ci.example/"}}
+	db, err := openDB(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := &Server{cfg: Config{PublicURL: "https://ci.example/"}, db: db}
 	run := &Run{ID: 3, WorkflowName: "CI"}
 	target := checkTarget{repo: "o/r", sha: strings.Repeat("a", 40), prefix: "o/deploy: "}
 	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)

@@ -311,3 +311,30 @@ export interface GitHubRepo {
   private: boolean;
   default_branch: string;
 }
+
+export interface StepSummary {
+  /** Index into the job's steps. */
+  step: number;
+  markdown: string;
+}
+
+export interface Annotation {
+  level: "error" | "warning" | "notice";
+  message: string;
+  title?: string;
+  file?: string;
+  line?: number;
+  end_line?: number;
+  col?: number;
+  end_col?: number;
+  /** Where it is in the job's log: a step index and the line's number in it (from 1), or 0. */
+  step: number;
+  log_line?: number;
+}
+
+/** What a finished job reported besides its log. */
+export interface JobReport {
+  job_id: number;
+  summaries: StepSummary[];
+  annotations: Annotation[];
+}

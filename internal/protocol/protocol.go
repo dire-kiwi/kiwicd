@@ -138,4 +138,56 @@ type JobComplete struct {
 	Outputs map[string]string `json:"outputs"`
 	Logs    []LogLine         `json:"logs"`
 	Steps   []StepState       `json:"steps"`
+	// What steps wrote to $GITHUB_STEP_SUMMARY, in the order they wrote it.
+	Summaries []StepSummary `json:"summaries,omitempty"`
+	// The job's ::error, ::warning and ::notice workflow commands and why it
+	// failed, in log order.
+	Annotations []Annotation `json:"annotations,omitempty"`
 }
+
+// StepSummary is the Markdown a step wrote to $GITHUB_STEP_SUMMARY.
+type StepSummary struct {
+	Step     int    `json:"step"`
+	Markdown string `json:"markdown"`
+}
+
+// Annotation levels; GitHub's check runs call the error level "failure".
+const (
+	AnnotationError   = "error"
+	AnnotationWarning = "warning"
+	AnnotationNotice  = "notice"
+)
+
+// Annotation is a message about a job's code or result: an ::error,
+// ::warning or ::notice workflow command, or why the job failed.
+type Annotation struct {
+	Level   string `json:"level"`
+	Message string `json:"message"`
+	Title   string `json:"title,omitempty"`
+	// Where in the repository the message is about, if anywhere.
+	File    string `json:"file,omitempty"`
+	Line    int    `json:"line,omitempty"`
+	EndLine int    `json:"end_line,omitempty"`
+	Col     int    `json:"col,omitempty"`
+	EndCol  int    `json:"end_col,omitempty"`
+	// Where it is in the job's log: the step's index and the line's number
+	// (from 1) among the step's lines; 0 if it has none.
+	Step    int `json:"step"`
+	LogLine int `json:"log_line,omitempty"`
+}
+
+// Limits on what a job reports, as GitHub has them; the server enforces
+// them too.
+const (
+	// MaxStepSummaryBytes is the most one step may write to
+	// $GITHUB_STEP_SUMMARY; a larger summary is dropped, with a warning.
+	MaxStepSummaryBytes = 1 << 20
+	// MaxJobSummaries and MaxJobSummaryBytes cap a job's summaries.
+	MaxJobSummaries    = 20
+	MaxJobSummaryBytes = 8 << 20
+	// MaxAnnotations caps a job's annotations from workflow commands; the
+	// ones explaining a failure come on top of them.
+	MaxAnnotations = 50
+	// MaxAnnotationBytes is the longest message (or title) kept.
+	MaxAnnotationBytes = 4 << 10
+)

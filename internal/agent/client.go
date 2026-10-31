@@ -35,11 +35,15 @@ func (e *apiError) Error() string { return fmt.Sprintf("server returned %d: %s",
 func (c *client) do(ctx context.Context, method, path string, in, out any) error {
 	var body io.Reader
 	if in != nil {
-		b, err := json.Marshal(in)
-		if err != nil {
+		// Without HTML escaping, which would make each <, > and & in logs
+		// and step summaries six bytes against the server's size limit.
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(in); err != nil {
 			return err
 		}
-		body = bytes.NewReader(b)
+		body = &buf
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {

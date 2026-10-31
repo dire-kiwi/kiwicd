@@ -277,6 +277,7 @@ func (s *Server) routes() []route {
 		{"GET /api/runs/{id}", viewer, runRepo, s.handleGetRun},
 		{"POST /api/runs/{id}/cancel", maintainer, runRepo, s.handleCancelRun},
 		{"POST /api/runs/{id}/rerun", maintainer, runRepo, s.handleRerun},
+		{"GET /api/runs/{id}/reports", viewer, runRepo, s.handleRunReports},
 		{"GET /api/jobs/{id}", viewer, jobRepo, s.handleGetJob},
 		{"GET /api/jobs/{id}/logs", viewer, jobRepo, s.handleJobLogs},
 		{"GET /api/jobs/{id}/events", viewer, jobRepo, s.handleJobEvents},

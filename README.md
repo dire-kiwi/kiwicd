@@ -106,6 +106,16 @@ job with [act](https://github.com/nektos/act), through our fork
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository), roles, API tokens and the
   audit log.
+- **Step summaries and annotations**: a run's Summary page shows what each job's steps wrote
+  to `$GITHUB_STEP_SUMMARY`, rendered from Markdown, and lists its annotations: `::error`,
+  `::warning` and `::notice` workflow commands (with `file`, `line`, `endLine`, `col` and
+  `title`) and why a job failed ("Process completed with exit code 1."), each linking to its
+  line in the job's log. As on GitHub, a step's summary may be up to 1 MiB (a larger one is
+  dropped with a warning), a job keeps up to 20 of them (and 8 MiB in all) and 50 annotations
+  from workflow commands; the rest stay in the log. Secrets are masked in both. Summaries are
+  sanitized before they're shown, since a workflow can write anything into them: no scripts,
+  styles, forms or frames, and images other than `data:` ones are shown as links. They're
+  served at `GET /api/runs/{id}/reports`.
 - **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
@@ -521,7 +531,9 @@ each of them:
   check run named `workflow / job`, with matrix values as in the job's name, e.g.
   `CI / test (1.23, linux)`. It's created when the job is queued and updated when it starts and
   finishes, with the conclusion, a short summary (duration, error, steps) and a link to the job
-  in kiwicd (made from `--public-url`). Push and dispatched runs report on their commit, pull
+  in kiwicd (made from `--public-url`). A finished job's check run also carries its step
+  summaries (cut to GitHub's limit) and its first 50 annotations, which GitHub shows on the
+  pull request's files; ones without a file go on `.github`, as GitHub Actions puts them. Push and dispatched runs report on their commit, pull
   request runs on the pull request's head. A workflow file that doesn't parse gets one failed
   check run. Branch protection can require these checks by name. **Re-run** on GitHub (one
   check, or all of a commit's) starts a new attempt of the runs they belong to, unless the
