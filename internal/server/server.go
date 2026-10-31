@@ -103,6 +103,9 @@ type Server struct {
 	gh githubState
 	// Runs waiting to be reported to GitHub as check runs (see checks.go).
 	checks checkReporter
+
+	// Scheduled workflows' entries (see schedule.go).
+	sched scheduleState
 }
 
 func New(cfg Config) (*Server, error) {
@@ -171,6 +174,7 @@ func New(cfg Config) (*Server, error) {
 
 		tipWorkflows: map[int64]cachedWorkflows{},
 		gh:           newGitHubState(),
+		sched:        newScheduleState(),
 	}
 	if err := s.expireSessionsOnPasswordChange(); err != nil {
 		db.Close()
@@ -201,6 +205,7 @@ func (s *Server) Run(ctx context.Context) error {
 	srv := &http.Server{Addr: s.cfg.Listen, Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second}
 	go s.backgroundLoop(ctx)
 	go s.pruneLoop(ctx)
+	go s.scheduleLoop(ctx)
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)

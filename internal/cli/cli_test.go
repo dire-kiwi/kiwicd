@@ -21,6 +21,8 @@ import (
 const workflow = `
 name: Deploy
 on:
+  schedule:
+    - cron: '0 0 1 1 *'
   workflow_dispatch:
     inputs:
       target:
@@ -177,7 +179,8 @@ func TestCLI(t *testing.T) {
 	if out := e.ok("", "repo", "list"); !strings.Contains(out, "t/app") || !strings.Contains(out, "hosted") {
 		t.Fatalf("repo list: %s", out)
 	}
-	if out := e.ok("", "workflow", "list", "t/app"); !strings.Contains(out, ".github/workflows/deploy.yml") || !strings.Contains(out, "target*") {
+	if out := e.ok("", "workflow", "list", "t/app"); !strings.Contains(out, ".github/workflows/deploy.yml") || !strings.Contains(out, "target*") ||
+		!strings.Contains(out, "schedule (0 0 1 1 *)") {
 		t.Fatalf("workflow list: %s", out)
 	}
 

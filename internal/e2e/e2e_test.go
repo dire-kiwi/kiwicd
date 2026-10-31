@@ -523,8 +523,31 @@ jobs:
       svc:
         image: kiwicd-e2e-job:test
         options: --health-cmd true --health-interval 1s
+        ports: ["8080", "5432:5432"]
     steps:
       - run: getent hosts svc && echo "service reachable"
+      - name: Ports aren't published on the host, and map to themselves
+        run: |
+          test -n "${{ job.services.svc.id }}"
+          test "${{ job.services.svc.network }}" = "${{ job.container.network }}"
+          test "${{ job.services.svc.ports[8080] }}" = 8080
+          test "${{ job.services.svc.ports[5432] }}" = 5432
+  privileged-service:
+    runs-on: self-hosted
+    services:
+      svc:
+        image: kiwicd-e2e-job:test
+        options: --privileged
+    steps:
+      - run: echo "privileged service ran"
+  host-volume-service:
+    runs-on: self-hosted
+    services:
+      svc:
+        image: kiwicd-e2e-job:test
+        volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    steps:
+      - run: echo "host volume service ran"
   privileged:
     runs-on: self-hosted
     container:
@@ -655,7 +678,8 @@ func TestIsolatedJobs(t *testing.T) {
 			logs[j.Name] += l.Text + "\n"
 		}
 	}
-	want := map[string]string{"isolated": "success", "services": "success", "privileged": "failure", "host-volume": "failure"}
+	want := map[string]string{"isolated": "success", "services": "success", "privileged": "failure", "host-volume": "failure",
+		"privileged-service": "failure", "host-volume-service": "failure"}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("job %s: got %q want %q\n%s", k, got[k], v, logs[k])
@@ -672,26 +696,18 @@ func TestIsolatedJobs(t *testing.T) {
 	if !strings.Contains(logs["host-volume"], `"/:/host" is not allowed`) || strings.Contains(logs["host-volume"], "host volume ran") {
 		t.Errorf("host-volume job:\n%s", logs["host-volume"])
 	}
+	if !strings.Contains(logs["privileged-service"], `service svc: container option "--privileged" is not allowed`) ||
+		strings.Contains(logs["privileged-service"], "privileged service ran") {
+		t.Errorf("privileged-service job:\n%s", logs["privileged-service"])
+	}
+	if !strings.Contains(logs["host-volume-service"], `"/var/run/docker.sock:/var/run/docker.sock" is not allowed`) ||
+		strings.Contains(logs["host-volume-service"], "host volume service ran") {
+		t.Errorf("host-volume-service job:\n%s", logs["host-volume-service"])
+	}
 
 	// The jobs' containers (and the process left running in one), volumes,
 	// networks and action images are gone.
-	prefix := fmt.Sprintf("kiwicd-r%d-j", creds.RunnerID)
-	for _, args := range [][]string{
-		{"ps", "-a", "--format", "{{.Names}}"},
-		{"volume", "ls", "--format", "{{.Name}}"},
-		{"network", "ls", "--format", "{{.Name}}"},
-		{"image", "ls", "--format", "{{.Repository}}"},
-	} {
-		out, err := exec.Command("docker", args...).Output()
-		if err != nil {
-			t.Fatalf("docker %v: %v", args, err)
-		}
-		for _, name := range strings.Fields(string(out)) {
-			if strings.HasPrefix(name, prefix) {
-				t.Errorf("docker %s: %s is left", args[0], name)
-			}
-		}
-	}
+	assertNoDockerLeftovers(t, creds.RunnerID)
 }
 
 const callerWorkflow = `
