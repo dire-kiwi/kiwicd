@@ -503,3 +503,164 @@ func TestIsolatedJobs(t *testing.T) {
 		}
 	}
 }
+
+const callerWorkflow = `
+name: Caller
+on: push
+jobs:
+  call:
+    strategy:
+      matrix:
+        n: [1, 2]
+    uses: ./.github/workflows/lib.yml
+    with:
+      greeting: hello ${{ matrix.n }}
+      count: ${{ matrix.n }}
+    secrets:
+      key: ${{ secrets.TOKEN }}
+  after:
+    needs: call
+    runs-on: self-hosted
+    steps:
+      - run: test "${{ needs.call.outputs.result }}" = "hi" && echo "outputs reached the caller"
+`
+
+const libWorkflow = `
+on:
+  workflow_call:
+    inputs:
+      greeting:
+        type: string
+        required: true
+      count:
+        type: number
+      shout:
+        type: boolean
+        default: false
+    secrets:
+      key:
+        required: true
+    outputs:
+      result:
+        value: ${{ jobs.first.outputs.v }}
+jobs:
+  first:
+    runs-on: self-hosted
+    outputs:
+      v: ${{ steps.v.outputs.v }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "v=$(cat hello.txt)" >> "$GITHUB_OUTPUT"
+      - run: |
+          echo "greeting=${{ inputs.greeting }} count=${{ inputs.count }} shout=${{ inputs.shout }} key=${{ secrets.key }} token=${{ secrets.TOKEN }}"
+          test "${{ inputs.count }}" -ge 1
+          test "${{ github.event_name }}" = push
+  second:
+    needs: first
+    runs-on: self-hosted
+    steps:
+      - run: test "${{ needs.first.outputs.v }}" = hi && test "${{ inputs.shout }}" = false
+`
+
+// TestReusableWorkflow runs a workflow that calls another with a matrix,
+// inputs, a secret and an output.
+func TestReusableWorkflow(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	tmp := t.TempDir()
+	srv, err := server.New(server.Config{DataDir: filepath.Join(tmp, "data"), AdminPassword: "pw", RegistrationToken: "reg", Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	api := func(method, path, body string, out any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.SetBasicAuth("admin", "pw")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 300 {
+			t.Fatalf("%s %s: %d %s", method, path, resp.StatusCode, b)
+		}
+		if out != nil {
+			if err := json.Unmarshal(b, out); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	creds, err := agent.Register(ctx, ts.URL, "reg", "e2e", nil, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := agent.New(agent.Config{Creds: creds, WorkDir: filepath.Join(tmp, "work"), Version: "test", Capacity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = a.Run(ctx) }()
+
+	api("POST", "/api/repos", `{"name":"t/repo"}`, nil)
+	api("PUT", "/api/secrets?repo=t/repo", `{"name":"TOKEN","value":"s3cret-value"}`, nil)
+	src := filepath.Join(tmp, "src")
+	files := map[string]string{".github/workflows/ci.yml": callerWorkflow, ".github/workflows/lib.yml": libWorkflow, "hello.txt": "hi\n"}
+	for name, content := range files {
+		_ = os.MkdirAll(filepath.Dir(filepath.Join(src, name)), 0o755)
+		_ = os.WriteFile(filepath.Join(src, name), []byte(content), 0o644)
+	}
+	run(t, src, "git", "init", "-q", "-b", "main")
+	run(t, src, "git", "add", "-A")
+	run(t, src, "git", "commit", "-qm", "init")
+	u := strings.Replace(ts.URL, "http://", "http://admin:pw@", 1)
+	run(t, src, "git", "push", "-q", u+"/git/t/repo.git", "main")
+
+	var runs []struct{ ID int64 }
+	deadline := time.Now().Add(30 * time.Second)
+	for len(runs) == 0 && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		api("GET", "/api/runs?repo=t/repo", "", &runs)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("expected one run, got %d", len(runs))
+	}
+	var r runResp
+	for time.Now().Before(deadline.Add(2 * time.Minute)) {
+		api("GET", fmt.Sprintf("/api/runs/%d", runs[0].ID), "", &r)
+		if r.Run.Status == "completed" {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	logs := map[string]string{}
+	got := map[string]string{}
+	for _, j := range r.Jobs {
+		got[j.Name] = j.Conclusion
+		var lines []struct{ Text string }
+		api("GET", fmt.Sprintf("/api/jobs/%d/logs", j.ID), "", &lines)
+		for _, l := range lines {
+			logs[j.Name] += l.Text + "\n"
+		}
+	}
+	for _, name := range []string{"call (1)", "call (2)", "call (1) / first", "call (1) / second", "call (2) / first", "call (2) / second", "after"} {
+		if got[name] != "success" {
+			t.Errorf("job %s: %q (all: %v)\n%s", name, got[name], got, logs[name])
+		}
+	}
+	if r.Run.Conclusion != "success" {
+		t.Errorf("run: %+v", r.Run)
+	}
+	if want := "greeting=hello 2 count=2 shout=false key=*** token="; !strings.Contains(logs["call (2) / first"], want) ||
+		strings.Contains(logs["call (2) / first"], "s3cret-value") {
+		t.Errorf("call (2) / first's log lacks %q:\n%s", want, logs["call (2) / first"])
+	}
+	if !strings.Contains(logs["after"], "outputs reached the caller") {
+		t.Errorf("after's log:\n%s", logs["after"])
+	}
+}

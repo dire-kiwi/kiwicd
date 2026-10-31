@@ -139,6 +139,19 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	expires_at INTEGER NOT NULL DEFAULT 0,  -- 0: never
 	last_used_at INTEGER NOT NULL DEFAULT 0
 );
+-- The reusable workflows a run's jobs call, read when it was created (see
+-- called.go).
+CREATE TABLE IF NOT EXISTS run_workflows (
+	run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	path TEXT NOT NULL,                 -- the calling jobs' keys from the run's workflow down: build/deploy
+	uses TEXT NOT NULL,                 -- as the calling job has it
+	source TEXT NOT NULL,               -- kiwicd | github
+	repo TEXT NOT NULL,                 -- owner/name there
+	file TEXT NOT NULL,                 -- .github/workflows/x.yml
+	sha TEXT NOT NULL,
+	yaml TEXT NOT NULL,
+	PRIMARY KEY (run_id, path)
+);
 -- The GitHub App (see github.go): at most one row.
 CREATE TABLE IF NOT EXISTS github_app (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -208,6 +221,11 @@ var migrations = []struct{ table, column, sql string }{
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
+	// Jobs of reusable workflows (see called.go): the calling job's row, and
+	// for a calling job what it calls and the inputs it gives.
+	{"jobs", "parent_id", `ALTER TABLE jobs ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0`},
+	{"jobs", "uses", `ALTER TABLE jobs ADD COLUMN uses TEXT NOT NULL DEFAULT ''`},
+	{"jobs", "inputs", `ALTER TABLE jobs ADD COLUMN inputs TEXT NOT NULL DEFAULT 'null'`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

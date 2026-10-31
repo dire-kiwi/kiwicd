@@ -8,10 +8,12 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dire-kiwi/kiwicd/internal/protocol"
 	"github.com/dire-kiwi/kiwicd/internal/wf"
+	"github.com/nektos/act/pkg/model"
 )
 
 var osRemoveAll = os.RemoveAll
@@ -57,6 +59,34 @@ type plannedJob struct {
 	Key   string   `json:"key"`
 	Name  string   `json:"name"`
 	Needs []string `json:"needs"`
+	// For a job that calls a reusable workflow: what it calls, and that
+	// workflow's jobs.
+	Uses string       `json:"uses,omitempty"`
+	Jobs []plannedJob `json:"jobs,omitempty"`
+}
+
+// planOf lists a workflow's jobs in order; path is the calledWorkflow path
+// of the workflow ("" for the run's own).
+func planOf(w *model.Workflow, path string, called map[string]*calledWorkflow) []plannedJob {
+	plan := []plannedJob{}
+	order, _ := wf.Order(w)
+	for _, key := range order {
+		j := w.GetJob(key)
+		name := j.Name
+		if name == "" {
+			name = key
+		}
+		needs := j.Needs()
+		if needs == nil {
+			needs = []string{}
+		}
+		p := plannedJob{Key: key, Name: name, Needs: needs, Uses: j.Uses}
+		if c := called[strings.TrimPrefix(path+"/"+key, "/")]; c != nil && j.Uses != "" {
+			p.Jobs = planOf(c.parsed, c.Path, called)
+		}
+		plan = append(plan, p)
+	}
+	return plan
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
@@ -75,19 +105,8 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	}
 	plan := []plannedJob{}
 	if parsed, err := wf.Parse([]byte(run.WorkflowYAML)); err == nil {
-		order, _ := wf.Order(parsed)
-		for _, key := range order {
-			j := parsed.GetJob(key)
-			name := j.Name
-			if name == "" {
-				name = key
-			}
-			needs := j.Needs()
-			if needs == nil {
-				needs = []string{}
-			}
-			plan = append(plan, plannedJob{Key: key, Name: name, Needs: needs})
-		}
+		called, _ := s.calledWorkflows(run.ID)
+		plan = planOf(parsed, "", called)
 	}
 	// Runners with these labels won't take the run's jobs, as its ref isn't
 	// protected.
@@ -122,9 +141,19 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 	}
 	var attempt int64
 	_ = s.db.QueryRow(`SELECT MAX(attempt) FROM runs WHERE repo_id = ? AND number = ?`, run.RepoID, run.Number).Scan(&attempt)
+	// It calls the same reusable workflows, unless reading them failed.
+	called, err := s.calledWorkflows(run.ID)
+	if err != nil {
+		httpError(w, 500, "%v", err)
+		return
+	}
+	var list []*calledWorkflow
+	for _, path := range sortedKeys(called) {
+		list = append(list, called[path])
+	}
 	id, err := s.createRun(r.Context(), runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1})
+		number: run.Number, attempt: attempt + 1, called: list})
 	if err != nil {
 		httpError(w, 500, "%v", err)
 		return
