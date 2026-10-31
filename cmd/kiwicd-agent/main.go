@@ -124,11 +124,15 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("loading registration: %w (run `kiwicd-agent register` first)", err)
 	}
+	oldNames, err := creds.AddAgentID(*config)
+	if err != nil {
+		slog.Warn("saving the registration's new agent ID failed; it's derived from the token, so the next start finds the same", "config", *config, "err", err)
+	}
 	// Host jobs inherit the agent's environment: don't hand them a
 	// registration token, which could register a runner that takes jobs.
 	os.Unsetenv("KIWICD_REGISTRATION_TOKEN")
 	a, err := agent.New(agent.Config{Creds: creds, WorkDir: *workDir, Capacity: *capacity, Version: version, ContainerDaemonSocket: *socket, ActionsURL: *actionsURL,
-		JobImage: *jobImage, JobOptions: *jobOptions, JobBridgePrefix: *bridgePrefix})
+		JobImage: *jobImage, JobOptions: *jobOptions, JobBridgePrefix: *bridgePrefix, RemoveOldNames: oldNames})
 	if err != nil {
 		return err
 	}

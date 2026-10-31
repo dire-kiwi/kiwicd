@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,11 +36,14 @@ import (
 
 // Credentials is the agent's registration, stored in the .runner file.
 type Credentials struct {
-	URL      string   `json:"url"`
-	Name     string   `json:"name"`
-	RunnerID int64    `json:"runner_id"`
-	Token    string   `json:"token"`
-	Labels   []string `json:"labels"` // label specs, see ParseLabel
+	URL      string `json:"url"`
+	Name     string `json:"name"`
+	RunnerID int64  `json:"runner_id"`
+	// AgentID names the agent's Docker objects. It's random, so it's unique
+	// to the registration; the runner ID is unique only on its server.
+	AgentID string   `json:"agent_id,omitempty"`
+	Token   string   `json:"token"`
+	Labels  []string `json:"labels"` // label specs, see ParseLabel
 }
 
 func LoadCredentials(path string) (*Credentials, error) {
@@ -50,6 +56,28 @@ func LoadCredentials(path string) (*Credentials, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &c, nil
+}
+
+var agentIDPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
+
+func newAgentID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// AddAgentID gives a registration made before agent IDs one and saves it.
+// The ID comes from the token, so that it's the same on the next start if
+// the file can't be written. It reports whether the registration lacked an
+// ID: the agent then removes what its jobs left under the old names (see
+// Config.RemoveOldNames).
+func (c *Credentials) AddAgentID(path string) (added bool, err error) {
+	if c.AgentID != "" {
+		return false, nil
+	}
+	h := sha256.Sum256([]byte(c.Token))
+	c.AgentID = hex.EncodeToString(h[:4])
+	return true, c.Save(path)
 }
 
 func (c *Credentials) Save(path string) error {
@@ -102,7 +130,7 @@ func Register(ctx context.Context, url, token, name string, labelSpecs []string,
 	if err != nil {
 		return nil, err
 	}
-	return &Credentials{URL: strings.TrimRight(url, "/"), Name: resp.Name, RunnerID: resp.RunnerID, Token: resp.RunnerToken, Labels: labelSpecs}, nil
+	return &Credentials{URL: strings.TrimRight(url, "/"), Name: resp.Name, RunnerID: resp.RunnerID, AgentID: newAgentID(), Token: resp.RunnerToken, Labels: labelSpecs}, nil
 }
 
 type Config struct {
@@ -129,6 +157,12 @@ type Config struct {
 	JobBridgePrefix string
 	// ActionsURL is where `uses: owner/repo@ref` actions are cloned from.
 	ActionsURL string
+	// RemoveOldNames also removes, on start, the Docker objects of jobs the
+	// agent didn't finish that are named as before registrations had agent
+	// IDs (kiwicd-r<runner ID>-j...). Agents of other servers on the same
+	// Docker daemon may use those names too, so it's only for the first
+	// start after an upgrade.
+	RemoveOldNames bool
 }
 
 type Agent struct {
@@ -151,8 +185,11 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.JobBridgePrefix == "" {
 		cfg.JobBridgePrefix = "kiwicd-"
 	}
+	if !agentIDPattern.MatchString(cfg.Creds.AgentID) {
+		return nil, fmt.Errorf("the registration's agent ID %q isn't 8 hexadecimal digits", cfg.Creds.AgentID)
+	}
 	if len(cfg.JobBridgePrefix) > 7 {
-		// Interface names have at most 15 characters: 8 are for the job ID.
+		// Interface names have at most 15 characters: 8 are for the job.
 		return nil, fmt.Errorf("the job bridge prefix %q is longer than 7 characters", cfg.JobBridgePrefix)
 	}
 	abs, err := filepath.Abs(cfg.WorkDir)
@@ -186,7 +223,7 @@ func New(cfg Config) (*Agent, error) {
 
 // Run polls for jobs until ctx is cancelled. Running jobs finish first.
 func (a *Agent) Run(ctx context.Context) error {
-	a.log.Info("agent started", "name", a.cfg.Creds.Name, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels,
+	a.log.Info("agent started", "name", a.cfg.Creds.Name, "agent_id", a.cfg.Creds.AgentID, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels,
 		"job_image", a.cfg.JobImage, "docker_socket", a.cfg.ContainerDaemonSocket)
 	if a.cfg.JobImage == "" {
 		a.log.Warn("jobs run on this machine, as the agent's user, and can read its registration; set --job-image to isolate them")
@@ -402,7 +439,7 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	}
 	env["RUNNER_NAME"] = a.cfg.Creds.Name
 
-	prefix := jobPrefix(a.cfg.Creds.RunnerID, req.JobID)
+	prefix := jobPrefix(a.cfg.Creds.AgentID, req.JobID)
 	defer a.removeJobContainers(ctx, prefix, a.dockerNeeded(job) != "")
 	cfg := &runner.Config{
 		Actor:                 req.Actor,
@@ -430,11 +467,7 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	}
 	if a.cfg.JobImage != "" {
 		network := prefix + "net"
-		bridge, err := bridgeName(a.cfg.JobBridgePrefix, req.JobID)
-		if err == nil {
-			err = createJobNetwork(ctx, network, bridge)
-		}
-		if err != nil {
+		if err := createJobNetwork(ctx, network, bridgeName(a.cfg.JobBridgePrefix, network)); err != nil {
 			rep.logf(0, "##[error]Creating the job's network failed: %v", err)
 			return protocol.ResultFailure, nil
 		}
@@ -504,7 +537,10 @@ var actTempDir = regexp.MustCompile(`^[0-9a-f]{16}$`)
 // or crashed) left in the work directory: workspaces and act's temporary
 // files, which can hold the jobs' secrets.
 func (a *Agent) removeLeftovers(ctx context.Context) {
-	a.removeJobContainers(ctx, runnerPrefix(a.cfg.Creds.RunnerID), a.cfg.JobImage != "")
+	a.removeJobContainers(ctx, agentPrefix(a.cfg.Creds.AgentID), a.cfg.JobImage != "")
+	if a.cfg.RemoveOldNames {
+		a.removeJobContainers(ctx, oldAgentPrefix(a.cfg.Creds.RunnerID), a.cfg.JobImage != "")
+	}
 	dirs := []string{filepath.Join(a.cfg.WorkDir, "jobs")}
 	entries, _ := os.ReadDir(filepath.Join(a.cfg.WorkDir, "actions"))
 	for _, e := range entries {
