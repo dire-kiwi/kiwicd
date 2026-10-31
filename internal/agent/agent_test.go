@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nektos/act/pkg/model"
+	"github.com/sirupsen/logrus"
 )
 
 func tarGz(t *testing.T, entries []tar.Header, bodies map[string]string) *bytes.Buffer {
@@ -84,5 +86,24 @@ func TestMaskMultilineSecrets(t *testing.T) {
 	r.logf(0, "error: %s", "abcdef")
 	if got := r.pending[len(r.pending)-1].Text; strings.Contains(got, "abc") {
 		t.Errorf("agent message not masked: %q", got)
+	}
+}
+
+func TestGroupCommands(t *testing.T) {
+	r := newReporter(nil, 1, &model.Job{}, map[string]string{"KEY": "hunter22"}, nil)
+	entry := func(level logrus.Level, msg string, data logrus.Fields) {
+		r.handle(&logrus.Entry{Level: level, Message: msg, Data: data, Time: time.Now()})
+	}
+	entry(logrus.InfoLevel, "  ❓  ::group::Build hunter22\n", logrus.Fields{"command": "group", "arg": "Build hunter22", "raw": "::group::Build hunter22\n"})
+	entry(logrus.InfoLevel, "make", logrus.Fields{"raw_output": true})
+	entry(logrus.InfoLevel, "  ❓  ::endgroup::\n", logrus.Fields{"command": "endgroup", "arg": "", "raw": "::endgroup::\n"})
+	entry(logrus.WarnLevel, "  🚧  ::warning::careful\n", logrus.Fields{"command": "warning", "arg": "careful"})
+	var got []string
+	for _, l := range r.pending {
+		got = append(got, l.Text)
+	}
+	want := []string{"##[group]Build ***", "make", "##[endgroup]", "##[warning]🚧  ::warning::careful"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("lines = %q, want %q", got, want)
 	}
 }

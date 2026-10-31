@@ -249,6 +249,12 @@ func (r *reporter) handle(e *logrus.Entry) {
 		r.lastStep = idx
 	}
 
+	if text, ok := r.commandLine(e); ok {
+		if text != "" {
+			r.pending = append(r.pending, protocol.LogLine{Step: idx, TS: e.Time.UnixMilli(), Text: text})
+		}
+		return
+	}
 	if e.Level == logrus.DebugLevel {
 		return
 	}
@@ -272,6 +278,22 @@ func (r *reporter) handle(e *logrus.Entry) {
 	for _, line := range strings.Split(msg, "\n") {
 		r.pending = append(r.pending, protocol.LogLine{Step: idx, TS: e.Time.UnixMilli(), Text: line})
 	}
+}
+
+// commandLine turns a workflow command that act logged (with its own
+// decoration, such as "❓ ::group::Build") into the line GitHub's runner
+// would show: ##[group]Build. ok is false for commands shown as act logs
+// them; text is "" for ones that show nothing.
+func (r *reporter) commandLine(e *logrus.Entry) (text string, ok bool) {
+	cmd, _ := e.Data["command"].(string)
+	arg, _ := e.Data["arg"].(string)
+	switch cmd {
+	case "group":
+		return "##[group]" + r.mask(e, strings.TrimRight(arg, "\r\n")), true
+	case "endgroup":
+		return "##[endgroup]", true
+	}
+	return "", false
 }
 
 // take returns the pending logs (at most max) and, if changed, the steps.

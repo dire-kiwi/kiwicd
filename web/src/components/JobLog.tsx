@@ -324,6 +324,11 @@ const StepSection = memo(function StepSection({
   showTs: boolean;
   onToggle: () => void;
 }) {
+  const blocks = useMemo(() => logBlocks(lines ?? []), [lines]);
+  const [groupOverrides, setGroupOverrides] = useState<Record<number, boolean>>({});
+  // Groups start folded, except one still being written to.
+  const groupOpen = (g: Extract<LogBlock, { kind: "group" }>) =>
+    groupOverrides[g.header.seq] ?? (state === "in_progress" && !g.ended && g === blocks[blocks.length - 1]);
   return (
     <div className={classes("step", open && "step-open")} id={`step-${index}`}>
       <button className="step-header" onClick={onToggle} aria-expanded={open}>
@@ -338,9 +343,20 @@ const StepSection = memo(function StepSection({
         <div className="step-log">
           {lines && lines.length > 0 ? (
             <div className="log-lines">
-              {lines.map((l, i) => (
-                <LogLineRow key={l.seq} n={i + 1} line={l} showTs={showTs} anchor={`step-${index}-L${i + 1}`} />
-              ))}
+              {blocks.map((b) =>
+                b.kind === "line" ? (
+                  <LogLineRow key={b.line.seq} n={b.n} line={b.line} showTs={showTs} anchor={`step-${index}-L${b.n}`} />
+                ) : (
+                  <LogGroup
+                    key={b.header.seq}
+                    index={index}
+                    group={b}
+                    open={groupOpen(b)}
+                    showTs={showTs}
+                    onToggle={() => setGroupOverrides((o) => ({ ...o, [b.header.seq]: !groupOpen(b) }))}
+                  />
+                ),
+              )}
             </div>
           ) : (
             <div className="log-none">{state === "in_progress" ? "Waiting for output…" : "No output"}</div>
@@ -350,6 +366,70 @@ const StepSection = memo(function StepSection({
     </div>
   );
 });
+
+interface NumberedLine {
+  line: LogLine;
+  /** Line number within the step, counting every line. */
+  n: number;
+}
+
+type LogBlock =
+  | ({ kind: "line" } & NumberedLine)
+  | { kind: "group"; header: LogLine; n: number; lines: NumberedLine[]; ended: boolean };
+
+function isGroupStart(text: string) {
+  return text.startsWith("##[group]") || text.startsWith("::group::");
+}
+
+function isGroupEnd(text: string) {
+  return text.startsWith("##[endgroup]") || text.startsWith("::endgroup::");
+}
+
+/**
+ * Splits a step's lines into ::group:: sections and the lines between them.
+ * Groups don't nest: a group runs to its ::endgroup:: or the next ::group::,
+ * as on GitHub.
+ */
+function logBlocks(lines: LogLine[]): LogBlock[] {
+  const out: LogBlock[] = [];
+  let group: Extract<LogBlock, { kind: "group" }> | null = null;
+  lines.forEach((line, i) => {
+    const n = i + 1;
+    if (isGroupStart(line.text)) {
+      group = { kind: "group", header: line, n, lines: [], ended: false };
+      out.push(group);
+    } else if (group && isGroupEnd(line.text)) {
+      group.ended = true;
+      group = null;
+    } else if (group) {
+      group.lines.push({ line, n });
+    } else {
+      out.push({ kind: "line", line, n });
+    }
+  });
+  return out;
+}
+
+function LogGroup({
+  index,
+  group,
+  open,
+  showTs,
+  onToggle,
+}: {
+  index: number;
+  group: Extract<LogBlock, { kind: "group" }>;
+  open: boolean;
+  showTs: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={classes("log-group-block", open && "log-group-open")}>
+      <LogLineRow n={group.n} line={group.header} showTs={showTs} anchor={`step-${index}-L${group.n}`} onToggle={onToggle} open={open} />
+      {open && group.lines.map((l) => <LogLineRow key={l.line.seq} n={l.n} line={l.line} showTs={showTs} anchor={`step-${index}-L${l.n}`} />)}
+    </div>
+  );
+}
 
 function classify(text: string): { cls: string; text: string } {
   if (text.startsWith("##[act]")) return { cls: "log-act", text: text.slice(7) };
@@ -371,14 +451,39 @@ function fmtTs(ts: number): string {
   return d.toLocaleTimeString(undefined, { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
-const LogLineRow = memo(function LogLineRow({ n, line, showTs, anchor }: { n: number; line: LogLine; showTs: boolean; anchor: string }) {
+const LogLineRow = memo(function LogLineRow({
+  n,
+  line,
+  showTs,
+  anchor,
+  onToggle,
+  open,
+}: {
+  n: number;
+  line: LogLine;
+  showTs: boolean;
+  anchor: string;
+  /** Set for a group's header: folds or unfolds the group. */
+  onToggle?: () => void;
+  open?: boolean;
+}) {
   const { cls, text } = classify(line.text);
   if (cls === "log-endgroup") return null;
   const segs = ansiToSegments(text);
   return (
-    <div className={classes("log-line", cls)} id={anchor}>
-      <a className="ln" href={`#${anchor}`} data-n={n} aria-label={`Line ${n}`} />
+    <div className={classes("log-line", cls, onToggle && "log-group-header")} id={anchor} onClick={onToggle}>
+      <a className="ln" href={`#${anchor}`} data-n={n} aria-label={`Line ${n}`} onClick={(e) => e.stopPropagation()} />
       {showTs && <span className="ts">{fmtTs(line.ts)}</span>}
+      {onToggle && (
+        <button
+          type="button"
+          className={classes("group-chevron", open && "group-chevron-open")}
+          aria-expanded={open}
+          aria-label={open ? "Collapse group" : "Expand group"}
+        >
+          <Icon name="chevron" size={10} />
+        </button>
+      )}
       <span className="lt">
         {segs.map((s, i) =>
           s.cls || s.style ? (

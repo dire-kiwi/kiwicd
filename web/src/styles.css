@@ -1580,6 +1580,28 @@ a.graph-job:hover {
 .log-group .lt {
   font-weight: 600;
 }
+.log-group-header {
+  cursor: pointer;
+}
+.group-chevron {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 16px;
+  margin-right: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--log-muted);
+  cursor: pointer;
+  transition: transform 0.15s;
+}
+.group-chevron-open {
+  transform: rotate(90deg);
+}
+.log-group-open > .log-line:not(.log-group-header) .lt {
+  padding-left: 20px;
+}
 
 /* ANSI palette (tuned for the dark log background) */
 .ansi-fg-0 { color: #6e7681; }
