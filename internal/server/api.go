@@ -88,7 +88,7 @@ func runFilters(v url.Values) (where []string, args []any) {
 	}
 	switch status := v.Get("status"); status {
 	case "":
-	case protocol.StatusQueued, protocol.StatusInProgress, protocol.StatusCompleted, protocol.StatusPending:
+	case protocol.StatusQueued, protocol.StatusInProgress, protocol.StatusCompleted, protocol.StatusPending, protocol.StatusWaiting:
 		where, args = append(where, `r.status = ?`), append(args, status)
 	default:
 		where, args = append(where, `r.status = ? AND r.conclusion = ?`), append(args, protocol.StatusCompleted, status)
@@ -309,7 +309,10 @@ func (s *Server) rerun(ctx context.Context, run *Run, opts rerunOptions) (int64,
 	}
 	return s.createRun(ctx, runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1, called: list, depth: run.TriggerDepth, reuse: opts.reuse, debug: opts.debug})
+		number: run.Number, attempt: attempt + 1, called: list, depth: run.TriggerDepth, reuse: opts.reuse, debug: opts.debug,
+		// A run nobody approved isn't approved by re-running it, which
+		// GitHub's Re-run does too.
+		approval: run.Approval == approvalRequired})
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {

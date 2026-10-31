@@ -77,6 +77,21 @@ export function RunPage() {
   const dispatched = run.event === "repository_dispatch" ? dispatchOf(run.event_payload) : undefined;
   const changedRef = run.event === "create" || run.event === "delete" ? refOf(run.event_payload) : undefined;
   const waiting = !!run.concurrency_group && run.status === "queued" && !run.cancel_requested && jobs.length === 0;
+  const awaitingApproval = run.status === "waiting" && !run.cancel_requested;
+  const author = authorOf(run.event_payload);
+
+  const approve = async () => {
+    setBusy(true);
+    setActionError(undefined);
+    try {
+      await post(`/api/runs/${run.id}/approve`);
+      reload();
+    } catch (e) {
+      setActionError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const cancel = async () => {
     setBusy(true);
@@ -114,9 +129,16 @@ export function RunPage() {
             </a>
           )}
           {!canMaintain(me?.access, run.repo) ? null : run.status !== "completed" ? (
-            <button className="btn btn-danger-outline" onClick={cancel} disabled={busy || run.cancel_requested}>
-              {run.cancel_requested ? "Cancelling…" : "Cancel run"}
-            </button>
+            <>
+              {awaitingApproval && (
+                <button className="btn btn-primary" onClick={approve} disabled={busy}>
+                  Approve and run
+                </button>
+              )}
+              <button className="btn btn-danger-outline" onClick={cancel} disabled={busy || run.cancel_requested}>
+                {run.cancel_requested ? "Cancelling…" : "Cancel run"}
+              </button>
+            </>
           ) : (
             <>
               {anyFailed && (
@@ -221,6 +243,14 @@ export function RunPage() {
             {run.debug && <span className="muted"> · debug logging</span>}
           </span>
         </div>
+        {run.approval === "approved" && (
+          <div className="meta-item">
+            <span className="meta-label">Approved by</span>
+            <span className="meta-value" title={run.approved_at ? absoluteTime(run.approved_at) : undefined}>
+              <strong>{run.approved_by}</strong> {run.approved_at ? relativeTime(run.approved_at, now) : null}
+            </span>
+          </div>
+        )}
         {run.permissions && (
           <div className="meta-item">
             <span className="meta-label">Permissions</span>
@@ -230,10 +260,27 @@ export function RunPage() {
           </div>
         )}
       </div>
-      {run.error && (
+      {run.error && run.approval !== "required" && (
         <ErrorBox>
           <span className="pre-wrap">{run.error}</span>
         </ErrorBox>
+      )}
+      {run.approval === "required" && run.status === "completed" && (
+        <Flash>
+          <span className="pre-wrap">{run.error || "The run was cancelled before anyone approved it."}</span>
+        </Flash>
+      )}
+      {awaitingApproval && (
+        <Flash kind="warn">
+          <span>
+            This pull request is from a fork{author ? <> by <strong>{author.login}</strong>{associationLabel(author.association)}</> : null}, so its
+            runs wait for a maintainer of {run.repo} to approve them: their jobs would run the fork's code on this server's runners. Review
+            the pull request's changes{author?.url ? <> on <a href={author.url}>GitHub</a></> : null} first, workflow files included.{" "}
+            {canMaintain(me?.access, run.repo)
+              ? "Approving runs this event's other waiting runs too."
+              : "Only a maintainer of the repository can approve them."}
+          </span>
+        </Flash>
       )}
       {!run.protected && !run.error && run.event === "pull_request" && (
         <Flash kind="warn">
@@ -485,6 +532,30 @@ function pullRequestOf(
     headRepo,
     fork: !headRepo || !baseRepo || headRepo.toLowerCase() !== baseRepo.toLowerCase(),
   };
+}
+
+// authorOf reads who opened the pull request of a pull_request run's event.
+function authorOf(payload: unknown): { login: string; association: string; url?: string } | undefined {
+  const pr = (payload as { pull_request?: { user?: { login?: string }; author_association?: string; html_url?: string } } | undefined)
+    ?.pull_request;
+  if (!pr?.user?.login) return undefined;
+  return { login: pr.user.login, association: pr.author_association ?? "", url: pr.html_url };
+}
+
+// associationLabel describes GitHub's author_association, as a clause after the author's login.
+function associationLabel(a: string): string {
+  switch (a) {
+    case "FIRST_TIMER":
+      return ", who is new to GitHub";
+    case "FIRST_TIME_CONTRIBUTOR":
+      return ", whose first pull request to the repository this is";
+    case "NONE":
+      return ", who hasn't contributed to the repository";
+    case "CONTRIBUTOR":
+      return ", who has contributed before but isn't a collaborator";
+    default:
+      return "";
+  }
 }
 
 // workflowRunOf reads the run a workflow_run run followed from its event.

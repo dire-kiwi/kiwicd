@@ -8,7 +8,7 @@ import { SettingsTable } from "../components/SettingsTable";
 import { isSSHURL, KnownHostsField, SSHKeyField, sshHost, type SSHAuth } from "../components/SSHFields";
 import { Chip, CodeBlock, CopyField, Empty, ErrorBox, Flash, Icon, Modal, Spinner } from "../components/ui";
 import { useDocumentTitle, useFetch } from "../hooks";
-import type { Repo, UploadedWorkflow, Workflow, WorkflowInput } from "../types";
+import type { ApprovedContributor, ForkApproval, Repo, UploadedWorkflow, Workflow, WorkflowInput } from "../types";
 import { absoluteTime, eventLabel, relativeTime, shortSha } from "../util";
 
 function branchesOf(repo: Repo): string[] {
@@ -1135,22 +1135,44 @@ function BadgeSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void 
   );
 }
 
-/** Whether pull requests from forks run the repository's own pull_request workflows. */
-function PullRequestSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+/** How strict each fork policy is: approving fewer pull requests needs an admin. */
+const forkPolicies: { value: "off" | ForkApproval; label: string; strictness: number }[] = [
+  { value: "off", label: "Don't run them", strictness: 3 },
+  { value: "outside", label: "Run them once approved, unless the author is a member or collaborator", strictness: 2 },
+  { value: "first_time", label: "Run them once approved, for first-time contributors", strictness: 1 },
+  { value: "none", label: "Run them without approval", strictness: 0 },
+];
+
+/** Whether pull requests from forks run the repository's own pull_request workflows, and which wait for approval. */
+function PullRequestSettings({ repo, admin, onChanged }: { repo: Repo; admin: boolean; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
-  const toggle = async (on: boolean) => {
-    if (on && !confirm(`Run ${repo.name}'s pull_request workflows on pull requests from forks? Anyone can open one on a public repository.`))
+  const approval = repo.fork_approval ?? "first_time";
+  const policy = repo.fork_pull_requests ? approval : "off";
+  const strictness = (v: string) => forkPolicies.find((p) => p.value === v)?.strictness ?? 1;
+  const contributors = useFetch<ApprovedContributor[]>(`${repoPath(repo.name)}/approved-contributors`);
+  const set = async (v: string) => {
+    if (v === "none" && !confirm(`Run ${repo.name}'s pull_request workflows on every pull request from a fork without approval? Anyone can open one on a public repository.`))
       return;
     setBusy(true);
     setError(undefined);
     try {
-      await patch(repoPath(repo.name), { fork_pull_requests: on });
+      await patch(repoPath(repo.name), v === "off" ? { fork_pull_requests: false } : { fork_pull_requests: true, fork_approval: v });
       onChanged();
     } catch (e) {
       setError(errorMessage(e));
     } finally {
       setBusy(false);
+    }
+  };
+  const forget = async (c: ApprovedContributor) => {
+    if (!confirm(`Forget ${c.login}? Their pull requests from forks will wait for approval again.`)) return;
+    setError(undefined);
+    try {
+      await del(`${repoPath(repo.name)}/approved-contributors/${c.user_id}`);
+      contributors.reload();
+    } catch (e) {
+      setError(errorMessage(e));
     }
   };
 
@@ -1164,23 +1186,47 @@ function PullRequestSettings({ repo, onChanged }: { repo: Repo; onChanged: () =>
             <span className="mono">on: pull_request</span> workflows on a merge of the pull request into its base branch. Their workflow
             comes from the pull request, so their jobs get no secrets except <span className="mono">KIWICD_TOKEN</span> and can't use
             protected or reserved runners. Pull requests from forks only run them if allowed here; their jobs run the fork's code on
-            your runners.
+            your runners, so runs of authors you don't know can wait until a maintainer approves them on the run's page.
           </p>
         </div>
       </div>
       {error && <Flash kind="error">{error}</Flash>}
       <div className="kv kv-pad">
         <span className="label">Forks</span>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={!!repo.fork_pull_requests}
-            disabled={busy}
-            onChange={(e) => void toggle(e.target.checked)}
-          />{" "}
-          Run pull_request workflows on pull requests from forks
-        </label>
+        <select className="input" value={policy} disabled={busy} onChange={(e) => void set(e.target.value)}>
+          {forkPolicies.map((p) => (
+            <option key={p.value} value={p.value} disabled={!admin && p.strictness < strictness(policy)}>
+              {p.label}
+            </option>
+          ))}
+        </select>
       </div>
+      {!admin && <p className="muted small">Only an admin can approve fewer pull requests from forks.</p>}
+      {contributors.data && contributors.data.length > 0 && (
+        <>
+          <p className="muted small">
+            Approved contributors: someone approved a run of theirs, so with first-time contributors' approval their pull requests run
+            straight away.
+          </p>
+          <ul className="list">
+            {contributors.data.map((c) => (
+              <li key={c.user_id} className="list-row setting-row">
+                <div className="setting-main">
+                  <span className="setting-name">{c.login}</span>
+                  <span className="muted small" title={absoluteTime(c.approved_at)}>
+                    approved by {c.approved_by} {relativeTime(c.approved_at)}
+                  </span>
+                </div>
+                <div className="row-actions">
+                  <button className="btn btn-sm btn-danger-outline" onClick={() => void forget(c)}>
+                    Forget
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </section>
   );
 }
@@ -1310,7 +1356,7 @@ function RepoSettingsTab({ repo, admin, onChanged }: { repo: Repo; admin: boolea
         </div>
       </section>
       {repo.kind === "mirror" && <MirrorSettings repo={repo} admin={admin} onChanged={onChanged} />}
-      {repo.kind === "mirror" && admin && <PullRequestSettings repo={repo} onChanged={onChanged} />}
+      {repo.kind === "mirror" && <PullRequestSettings repo={repo} admin={admin} onChanged={onChanged} />}
       <RepoWorkflowsSettings repo={repo} onChanged={onChanged} />
       <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />

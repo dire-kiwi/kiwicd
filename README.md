@@ -158,8 +158,7 @@ job with [act](https://github.com/nektos/act), through our fork
 
 Not yet: artifacts and caches, `pull_request_target` (it runs the base
 branch's workflow with secrets on a pull request's event, which is easy to misuse by checking out
-the pull request's code), approval before a first-time contributor's pull request runs (GitHub's
-*approve and run*), `merge_group`, `issues`, `issue_comment`, `release`.
+the pull request's code), `merge_group`, `issues`, `issue_comment`, `release`.
 
 ## Pull requests
 
@@ -210,7 +209,37 @@ jobs:
   The setting is the repository's, not the workflow's, since the workflow comes from the fork.
   Allowed fork pull requests run like the repository's own: no secrets, no protected runners,
   but the fork's code runs on your runners, so use runners that isolate jobs
-  ([Isolating jobs](#isolating-jobs)). There's no approval step for first-time contributors yet.
+  ([Isolating jobs](#isolating-jobs)), and have runs of authors you don't know wait for approval
+  (below).
+- **Approve and run**: with forks allowed, the repository's `fork_approval` says which fork pull
+  requests wait for a maintainer before they run, as on GitHub. It goes by the webhook's
+  `pull_request.author_association`:
+
+  | `fork_approval` | Waits for approval |
+  | --- | --- |
+  | `first_time` (the default) | authors who haven't contributed to the repository (`FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`, `MANNEQUIN`) and haven't had a run approved here |
+  | `outside` | every author who isn't an `OWNER`, `MEMBER` or `COLLABORATOR`, on every event |
+  | `none` | nobody |
+
+  Set it in **Settings → Pull requests** or with
+  `PATCH /api/repos/OWNER/NAME {"fork_approval":"outside"}`; approving fewer pull requests (moving
+  towards `none`) needs an admin. Pull requests from the repository's own branches never wait.
+  A waiting run has status `waiting` and no jobs; its page shows who opened the pull request and
+  an **Approve and run** button for maintainers of the repository (or `kiwicd run approve RUN`, or
+  `POST /api/runs/ID/approve`). Approving starts it and the pull request's other waiting runs,
+  and is in the audit log. With `first_time` it also remembers the author by GitHub user ID, so
+  their later pull requests run straight away; the settings list approved contributors, and
+  forgetting one (`DELETE /api/repos/OWNER/NAME/approved-contributors/USER_ID`) makes them wait
+  again. Review the pull request, workflow files included, before approving it: its jobs run
+  its code.
+- **Waiting runs** aren't in their concurrency group until they're approved, so a
+  fork's workflow can't cancel or hold up other runs by naming a group, though a newer run of
+  the group cancels them as it would any run that hasn't started. A newer event of the same pull
+  request replaces its waiting runs of the same workflow, and closing the pull request cancels
+  them; runs nobody approves are cancelled after 30 days, and are then kept like any finished
+  run. Re-running a run that was never approved makes an attempt that waits too. With the
+  [GitHub App](#github-app) reporting checks, a waiting run shows on the pull request as one
+  queued check run, linking to the run, until it's approved.
 - `pull_request_target` isn't supported. For a job that needs secrets on a pull request, such as
   a preview deployment, use `repository_pull_request` from another repository (below), which
   runs that repository's default branch.
@@ -325,7 +354,7 @@ jobs:
   (see [Isolating jobs](#isolating-jobs)).
 - The agent removes a job's service containers, job container and network when the job ends or
   is cancelled, and those of jobs it didn't finish when it starts. They're named
-  `kiwicd-r<runner>-j<job>-...`.
+  `kiwicd-<agent>-j<job>-...` (see [Agents sharing a Docker daemon](#agents-sharing-a-docker-daemon)).
 - On agents that isolate jobs (`--job-image`), services join the job's own network, and the
   restrictions on container options and volumes apply to them as well. Their ports aren't
   published on the machine: jobs reach them by name, and `job.services.<id>.ports[<port>]` is
@@ -622,7 +651,7 @@ Everyone signed in has a role:
 | Role | May |
 | --- | --- |
 | **viewer** | see repositories, workflows, runs and their logs, and runners; fetch repositories over `/git/` |
-| **maintainer** of every repository, or of some (`owner/name` or `owner/*`) | also, for those repositories: secrets and variables, protected refs, readers, mirrors' default branch and SSH settings (not their URL, nor letting forks' pull requests run, which only admins do), uploaded workflows, syncing, starting, re-running and cancelling runs, and pushing to hosted ones |
+| **maintainer** of every repository, or of some (`owner/name` or `owner/*`) | also, for those repositories: secrets and variables, protected refs, readers, mirrors' default branch and SSH settings (not their URL, nor letting forks' pull requests run or wait for approval less often, which only admins do), uploaded workflows, syncing, starting, re-running, cancelling and approving runs, and pushing to hosted ones |
 | **admin** | everything, including global secrets and variables, adding and removing repositories, runners, the GitHub App, roles, everyone's API tokens and the audit log |
 
 The admin password is always an admin. Roles are given under **Settings → GitHub** (or
@@ -678,6 +707,7 @@ kiwicd run view 42                           # jobs and steps
 kiwicd run logs 42 --failed                  # or --job build, --follow
 kiwicd run start owner/app deploy.yml --ref main -i target=prod --watch
 kiwicd run cancel 42; kiwicd run rerun 42 --watch
+kiwicd run approve 42                        # a fork's pull request, waiting for approval
 kiwicd run rerun 42 --failed                 # or --job build: keeps the other jobs' results
 kiwicd workflow list owner/app
 kiwicd repo dispatch owner/app deploy --payload '{"env":"prod"}'   # a repository_dispatch event
@@ -772,9 +802,9 @@ the job image. The agent needs Docker; its jobs don't get it. Also:
 
 - Each job has a bridge network of its own, so jobs can't reach each other's containers. Its
   services, `docker://` steps and the builds of its Docker actions use it too. The network's
-  interface is `--job-bridge-prefix` (default `kiwicd-`, at most 7 characters) plus the job ID,
-  so a firewall can match jobs' traffic, e.g. `iptables -I DOCKER-USER -i kiwicd-+ -d
-  10.0.0.0/8 -j DROP`.
+  interface is `--job-bridge-prefix` (default `kiwicd-`, at most 7 characters) plus 8
+  characters unique to the job, so a firewall can match jobs' traffic, e.g. `iptables -I
+  DOCKER-USER -i kiwicd-+ -d 10.0.0.0/8 -j DROP`.
 - Workflows may not give their `container` or `services` options or volumes that reach outside
   the container: host paths, named volumes (they outlive the job), `--privileged`, devices,
   capabilities, other namespaces, `--env-file`. Options such as `--health-cmd`, `--user`,
@@ -785,7 +815,7 @@ the job image. The agent needs Docker; its jobs don't get it. Also:
   step container, after the workflow's own, e.g. `--memory 4g --cpus 2 --pids-limit 4096`.
 - The agent removes each job's containers, volumes, networks and Docker action images when the
   job ends, and those of jobs it didn't finish when it starts. They're named
-  `kiwicd-r<runner>-j<job>-...`.
+  `kiwicd-<agent>-j<job>-...`.
 
 Container jobs don't get the Docker socket unless the agent is given one with `--docker-socket
 /var/run/docker.sock` (`KIWICD_DOCKER_SOCKET`), which hands its jobs the machine. Give it only to
@@ -797,6 +827,18 @@ LABEL` and give those runners the label. Jobs from other refs that ask for the l
 once, saying why; those that don't ask for it wait for another runner, and the job's page says
 which runners won't take it. Every runner has `self-hosted`, so `--protected-label self-hosted`
 keeps them all for protected refs and jobs from other refs don't run at all.
+
+### Agents sharing a Docker daemon
+
+Agents name their jobs' Docker objects `kiwicd-<agent>-j<job>-...`, where `<agent>` is the
+`agent_id` in `.runner`: 8 random hexadecimal digits chosen at registration. Runner and job IDs
+are only unique on their server, so agents of different servers (or test runs) on one Docker
+daemon would otherwise remove each other's containers. Registrations from before agent IDs get
+one on their first start, derived from their token and saved in `.runner`, and that start also
+removes what their unfinished jobs left under the old names (`kiwicd-r<runner>-j<job>-...`).
+Old names can still be shared, so that first start can also remove the running jobs of another
+server's agent with the same runner ID that hasn't been upgraded yet: upgrade agents that share
+a daemon while they're idle.
 
 ### Server configuration
 

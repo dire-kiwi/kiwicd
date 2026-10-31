@@ -73,6 +73,7 @@ export type VisualState =
   | "in_progress"
   | "queued"
   | "pending"
+  | "approval"
   | "cancelling";
 
 export function visualState(status: Status | string, conclusion: Conclusion | string, cancelRequested = false): VisualState {
@@ -93,6 +94,7 @@ export function visualState(status: Status | string, conclusion: Conclusion | st
   if (cancelRequested) return "cancelling";
   if (status === "in_progress") return "in_progress";
   if (status === "queued") return "queued";
+  if (status === "waiting") return "approval";
   return "pending";
 }
 
@@ -112,6 +114,8 @@ export function stateLabel(s: VisualState): string {
       return "Queued";
     case "pending":
       return "Waiting";
+    case "approval":
+      return "Waiting for approval";
     case "cancelling":
       return "Cancelling";
   }
