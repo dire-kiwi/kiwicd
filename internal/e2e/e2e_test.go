@@ -39,6 +39,11 @@ jobs:
       - id: v
         run: echo "v=$(cat hello.txt)" >> "$GITHUB_OUTPUT"
       - run: echo "secret=${{ secrets.TOKEN }}"
+      - name: Report
+        run: |
+          echo "## Build report" >> "$GITHUB_STEP_SUMMARY"
+          echo "token ${{ secrets.TOKEN }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning file=hello.txt,line=1,title=Greeting::says hi"
   test:
     needs: build
     runs-on: [self-hosted, linux]
@@ -176,7 +181,10 @@ func TestPushRunsWorkflow(t *testing.T) {
 		}
 	}
 	// Secrets are masked in logs.
-	var logs []struct{ Text string }
+	var logs []struct {
+		Step int
+		Text string
+	}
 	api("GET", fmt.Sprintf("/api/jobs/%d/logs", r.Jobs[0].ID), "", &logs)
 	all := ""
 	for _, l := range logs {
@@ -184,6 +192,42 @@ func TestPushRunsWorkflow(t *testing.T) {
 	}
 	if strings.Contains(all, "s3cret-value") || !strings.Contains(all, "secret=***") {
 		t.Errorf("secret not masked:\n%s", all)
+	}
+
+	// The build job's step summary, masked, and its annotation, which
+	// points at its line in the log.
+	var reports []struct {
+		JobID     int64 `json:"job_id"`
+		Summaries []struct {
+			Step     int
+			Markdown string
+		}
+		Annotations []struct {
+			Level, Message, Title, File string
+			Line, Step                  int
+			LogLine                     int `json:"log_line"`
+		}
+	}
+	api("GET", fmt.Sprintf("/api/runs/%d/reports", runs[0].ID), "", &reports)
+	// The other report is test (3)'s failure, which continue-on-error allows.
+	if len(reports) != 2 || reports[0].JobID != r.Jobs[0].ID || len(reports[0].Summaries) != 1 || len(reports[0].Annotations) != 1 ||
+		len(reports[1].Annotations) != 1 || reports[1].Annotations[0].Level != "error" {
+		t.Fatalf("reports: %+v", reports)
+	}
+	if sum := reports[0].Summaries[0]; sum.Step != 5 || sum.Markdown != "## Build report\ntoken ***\n" {
+		t.Errorf("summary: %+v", sum)
+	}
+	ann := reports[0].Annotations[0]
+	if ann.Level != "warning" || ann.Message != "says hi" || ann.Title != "Greeting" || ann.File != "hello.txt" || ann.Line != 1 || ann.Step != 5 {
+		t.Errorf("annotation: %+v", ann)
+	}
+	n := 0
+	for _, l := range logs {
+		if l.Step == ann.Step {
+			if n++; n == ann.LogLine && l.Text != "##[warning]says hi" {
+				t.Errorf("annotation's log line %d is %q", n, l.Text)
+			}
+		}
 	}
 }
 

@@ -67,6 +67,15 @@ export interface WorkflowInput {
   options?: string[];
 }
 
+export interface WorkflowSchedule {
+  cron: string;
+  /** IANA time zone of the cron fields; UTC when absent. */
+  timezone?: string;
+  /** When it next runs; absent off the default branch, whose workflows are the ones that run on schedule. */
+  next_run_at?: number;
+  error?: string;
+}
+
 export interface Workflow {
   file: string;
   name: string;
@@ -75,6 +84,7 @@ export interface Workflow {
   event_details?: Record<string, string>;
   dispatch: boolean;
   inputs: WorkflowInput[] | null;
+  schedules?: WorkflowSchedule[];
   error?: string;
   /** Stored in kiwicd rather than the repository; file is "kiwicd:NAME". */
   uploaded?: boolean;
@@ -316,4 +326,31 @@ export interface GitHubRepo {
   clone_url: string;
   private: boolean;
   default_branch: string;
+}
+
+export interface StepSummary {
+  /** Index into the job's steps. */
+  step: number;
+  markdown: string;
+}
+
+export interface Annotation {
+  level: "error" | "warning" | "notice";
+  message: string;
+  title?: string;
+  file?: string;
+  line?: number;
+  end_line?: number;
+  col?: number;
+  end_col?: number;
+  /** Where it is in the job's log: a step index and the line's number in it (from 1), or 0. */
+  step: number;
+  log_line?: number;
+}
+
+/** What a finished job reported besides its log. */
+export interface JobReport {
+  job_id: number;
+  summaries: StepSummary[];
+  annotations: Annotation[];
 }

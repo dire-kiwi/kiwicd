@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS log_lines (
 	text TEXT NOT NULL,
 	PRIMARY KEY (job_id, seq)
 );
+-- What a finished job reported besides its log: step summaries and
+-- annotations, as JSON (see reports.go).
+CREATE TABLE IF NOT EXISTS job_reports (
+	job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+	summaries TEXT NOT NULL DEFAULT '[]',
+	annotations TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE IF NOT EXISTS runners (
 	id INTEGER PRIMARY KEY,
 	name TEXT NOT NULL,
@@ -119,6 +126,17 @@ CREATE TABLE IF NOT EXISTS uploaded_workflows (
 	content TEXT NOT NULL,
 	updated_at INTEGER NOT NULL,
 	PRIMARY KEY (repo_id, file)
+);
+-- Scheduled workflows' cron entries on each repository's default branch,
+-- and the slot each last ran (see schedule.go).
+CREATE TABLE IF NOT EXISTS schedules (
+	repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+	workflow_file TEXT NOT NULL,
+	cron TEXT NOT NULL,
+	timezone TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,        -- first seen; earlier slots don't run
+	last_slot INTEGER NOT NULL DEFAULT 0, -- the slot it last ran; 0 if none yet
+	PRIMARY KEY (repo_id, workflow_file, cron, timezone)
 );
 CREATE TABLE IF NOT EXISTS meta (
 	name TEXT PRIMARY KEY,

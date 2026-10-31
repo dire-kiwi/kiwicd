@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { ansiToSegments } from "../ansi";
 import { useNow } from "../hooks";
 import { jobState, matrixLabel } from "../runmodel";
@@ -154,7 +155,28 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
     }
   }, [logs.count, running, job.steps]);
 
+  // A link to a line (#step-2-L14, from an annotation or a line number)
+  // opens its step and, once the line has loaded, scrolls to it.
+  const { hash } = useLocation();
+  const target = useMemo(() => {
+    const m = /^#step-(\d+)-L(\d+)$/.exec(hash);
+    return m ? { hash, step: Number(m[1]), line: Number(m[2]) } : undefined;
+  }, [hash]);
+  const scrolledTo = useRef("");
+  useEffect(() => {
+    if (target) setOverrides((o) => ({ ...o, [target.step]: true }));
+  }, [target]);
+  useLayoutEffect(() => {
+    if (!target || scrolledTo.current === target.hash) return;
+    const el = document.getElementById(target.hash.slice(1));
+    if (!el) return;
+    scrolledTo.current = target.hash;
+    atBottom.current = false;
+    el.scrollIntoView({ block: "center" });
+  }, [target, logs.count, overrides]);
+
   const isOpen = (index: number, step: Step | null) => {
+    if (target?.step === index && !(index in overrides)) return true;
     if (index in overrides) return overrides[index];
     if (!step) return true;
     return step.status === "in_progress" || (step.status === "completed" && step.conclusion === "failure");
@@ -294,6 +316,7 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
                 state={step ? stepState(step) : st}
                 duration={step ? elapsed(step.started_at, step.finished_at, now) : ""}
                 lines={logs.byStep[index]}
+                selected={target?.step === index ? target.line : 0}
                 open={open}
                 showTs={showTs}
                 onToggle={() => toggle(index, open)}
@@ -334,6 +357,7 @@ const StepSection = memo(function StepSection({
   state,
   duration,
   lines,
+  selected,
   open,
   showTs,
   onToggle,
@@ -343,6 +367,8 @@ const StepSection = memo(function StepSection({
   state: ReturnType<typeof stepState>;
   duration: string;
   lines: LogLine[] | undefined;
+  /** The number of the line linked to, or 0. */
+  selected: number;
   open: boolean;
   showTs: boolean;
   onToggle: () => void;
@@ -362,7 +388,7 @@ const StepSection = memo(function StepSection({
           {lines && lines.length > 0 ? (
             <div className="log-lines">
               {lines.map((l, i) => (
-                <LogLineRow key={l.seq} n={i + 1} line={l} showTs={showTs} anchor={`step-${index}-L${i + 1}`} />
+                <LogLineRow key={l.seq} n={i + 1} line={l} showTs={showTs} anchor={`step-${index}-L${i + 1}`} selected={selected === i + 1} />
               ))}
             </div>
           ) : (
@@ -394,12 +420,24 @@ function fmtTs(ts: number): string {
   return d.toLocaleTimeString(undefined, { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
-const LogLineRow = memo(function LogLineRow({ n, line, showTs, anchor }: { n: number; line: LogLine; showTs: boolean; anchor: string }) {
+const LogLineRow = memo(function LogLineRow({
+  n,
+  line,
+  showTs,
+  anchor,
+  selected,
+}: {
+  n: number;
+  line: LogLine;
+  showTs: boolean;
+  anchor: string;
+  selected: boolean;
+}) {
   const { cls, text } = classify(line.text);
   if (cls === "log-endgroup") return null;
   const segs = ansiToSegments(text);
   return (
-    <div className={classes("log-line", cls)} id={anchor}>
+    <div className={classes("log-line", cls, selected && "log-line-selected")} id={anchor}>
       <a className="ln" href={`#${anchor}`} data-n={n} aria-label={`Line ${n}`} />
       {showTs && <span className="ts">{fmtTs(line.ts)}</span>}
       <span className="lt">

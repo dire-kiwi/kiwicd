@@ -1,9 +1,9 @@
 # kiwicd
 
 kiwicd runs GitHub Actions workflows on your own machines. A Go server hosts (or mirrors) git
-repositories, triggers workflows on push or by hand, schedules jobs and shows live logs in a
-React UI. Agents connect to it the way self-hosted GitHub runners do and run each job with
-[act](https://github.com/nektos/act), through our fork
+repositories, triggers workflows on push, on a schedule or by hand, schedules jobs and shows
+live logs in a React UI. Agents connect to it the way self-hosted GitHub runners do and run each
+job with [act](https://github.com/nektos/act), through our fork
 [dire-kiwi/act](https://github.com/dire-kiwi/act) (the `act/` submodule).
 
 ```
@@ -17,8 +17,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `on: pull_request` with `types`,
   `branches` and `paths` (see [Pull requests](#pull-requests)), `workflow_dispatch` with inputs,
-  `workflow_run`, `repository_dispatch`, `create` and `delete` (see [More events](#more-events)),
-  `types` for the events that have activity types, `needs`, job `if`, `strategy.matrix`
+  `schedule` (see below), `workflow_run`, `repository_dispatch`, `create` and `delete` (see
+  [More events](#more-events)), `types` for the events that have activity types, `needs`, job `if`, `strategy.matrix`
   (include/exclude, fail-fast, `max-parallel`), job `outputs`, `env`, `defaults`,
   `timeout-minutes`, `secrets`, `vars`, `run-name` (the run's title, from `github`, `inputs` and
   `vars`).
@@ -61,6 +61,17 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   same repository or another one, with typed `with:` inputs, `secrets:` (or `secrets: inherit`),
   outputs for `needs.<id>.outputs`, and `strategy.matrix`, `needs` and `if` on the calling job,
   nested up to four levels (see [Reusable workflows](#reusable-workflows)).
+- **Schedules**: `on: schedule` with `- cron: '30 5 * * 1-5'` entries runs a workflow as on
+  GitHub: five POSIX cron fields (minute, hour, day of month, month, day of week; `*/15`, ranges,
+  lists and names like `MON` work; `@daily` and the like don't), in UTC or in the entry's
+  `timezone` (`timezone: Pacific/Auckland`). Workflows on the default branch, committed or
+  uploaded, run at its latest commit with `github.event_name` `schedule` and
+  `github.event.schedule` set to the cron string, and get secrets, as runs from the default
+  branch do. A schedule runs at most every five minutes, and from when kiwicd first sees it on
+  the default branch: pushing it there, uploading it or making its branch the default. A
+  restart doesn't run a slot twice; a slot missed while the server was down runs when it starts,
+  but after a longer outage only the latest one does. The *Workflows* tab shows each schedule
+  and when it next runs.
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)). One with
@@ -93,9 +104,9 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   behind that reads a later protected job's secrets. Keep runners for protected refs with the
   server's `--protected-label`, or isolate jobs (see [Isolating jobs](#isolating-jobs)).
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
-  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request` and dispatched
-  runs from a protected ref, the repositories its workflow listens to that list it as a reader). It
-  can't push or use the API.
+  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request`, scheduled and
+  dispatched runs from a protected ref, the repositories its workflow listens to that list it as a
+  reader). It can't push or use the API.
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
@@ -111,6 +122,16 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository), roles, API tokens and the
   audit log.
+- **Step summaries and annotations**: a run's Summary page shows what each job's steps wrote
+  to `$GITHUB_STEP_SUMMARY`, rendered from Markdown, and lists its annotations: `::error`,
+  `::warning` and `::notice` workflow commands (with `file`, `line`, `endLine`, `col` and
+  `title`) and why a job failed ("Process completed with exit code 1."), each linking to its
+  line in the job's log. As on GitHub, a step's summary may be up to 1 MiB (a larger one is
+  dropped with a warning), a job keeps up to 20 of them (and 8 MiB in all) and 50 annotations
+  from workflow commands; the rest stay in the log. Secrets are masked in both. Summaries are
+  sanitized before they're shown, since a workflow can write anything into them: no scripts,
+  styles, forms or frames, and images other than `data:` ones are shown as links. They're
+  served at `GET /api/runs/{id}/reports`.
 - **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
@@ -335,11 +356,11 @@ curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/
   `github.event.ref`, `github.event.after` (the pushed commit), `github.event.head_commit`. The
   run's title is `owner/app: <commit subject>`, and its page shows the pushed commit.
 - `secrets.KIWICD_TOKEN` fetches the repositories the workflow lists under `repository_push` that
-  list the listening repository as a reader, in runs started by `repository_push` or by hand. The
-  repository being read has to agree, since any repository's default branch can listen to any
-  other, including a public one's where outside contributions land. Runs started by a push to the
-  listening repository only get that repository, since their workflow can come from any branch,
-  and so do dispatches on refs that aren't protected.
+  list the listening repository as a reader, in runs started by `repository_push`, a schedule or
+  by hand. The repository being read has to agree, since any repository's default branch can
+  listen to any other, including a public one's where outside contributions land. Runs started by
+  a push to the listening repository only get that repository, since their workflow can come from
+  any branch, and so do dispatches on refs that aren't protected.
 - GitHub doesn't know `repository_push`, so turn off GitHub Actions on the private repository if
   it's on GitHub, or GitHub reports the workflow as invalid.
 
@@ -526,7 +547,9 @@ each of them:
   check run named `workflow / job`, with matrix values as in the job's name, e.g.
   `CI / test (1.23, linux)`. It's created when the job is queued and updated when it starts and
   finishes, with the conclusion, a short summary (duration, error, steps) and a link to the job
-  in kiwicd (made from `--public-url`). Push and dispatched runs report on their commit, pull
+  in kiwicd (made from `--public-url`). A finished job's check run also carries its step
+  summaries (cut to GitHub's limit) and its first 50 annotations, which GitHub shows on the
+  pull request's files; ones without a file go on `.github`, as GitHub Actions puts them. Push and dispatched runs report on their commit, pull
   request runs on the pull request's head. A workflow file that doesn't parse gets one failed
   check run. Branch protection can require these checks by name. **Re-run** on GitHub (one
   check, or all of a commit's) starts a new attempt of the runs they belong to, unless the
