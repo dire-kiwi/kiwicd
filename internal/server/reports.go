@@ -161,7 +161,8 @@ func reportCheckOutput(out *checkOutput, rep *jobReport) {
 		if len(out.Annotations) == maxCheckAnnotations {
 			break
 		}
-		ca := checkAnnotation{Path: a.File, StartLine: a.Line, EndLine: a.EndLine, AnnotationLevel: a.Level, Message: a.Message, Title: a.Title}
+		ca := checkAnnotation{Path: a.File, StartLine: a.Line, EndLine: a.EndLine, AnnotationLevel: a.Level, Message: a.Message,
+			Title: truncateRunes(a.Title, maxCheckAnnotationTitle)}
 		if ca.AnnotationLevel == protocol.AnnotationError {
 			ca.AnnotationLevel = "failure"
 		}
@@ -182,5 +183,18 @@ func reportCheckOutput(out *checkOutput, rep *jobReport) {
 	}
 }
 
-// maxCheckAnnotations is the most annotations GitHub takes in one request.
-const maxCheckAnnotations = 50
+// maxCheckAnnotations is the most annotations GitHub takes in one request,
+// and maxCheckAnnotationTitle the most characters in an annotation's title
+// (messages are kept well under its 64 KB).
+const (
+	maxCheckAnnotations     = 50
+	maxCheckAnnotationTitle = 255
+)
+
+// truncateRunes cuts s to at most n characters.
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n-1]) + "…"
+}

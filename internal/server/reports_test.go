@@ -50,6 +50,7 @@ func TestReportCheckOutput(t *testing.T) {
 			{Level: "error", Message: "bad", File: "main.go", Line: 3, EndLine: 3, Col: 5},
 			{Level: "warning", Message: "spans", File: "a.go", Line: 1, EndLine: 4, Col: 2},
 			{Level: "error", Message: "Process completed with exit code 1.", Step: 2, LogLine: 7},
+			{Level: "notice", Message: "n", Title: strings.Repeat("é", 300)},
 		},
 	}
 	out := &checkOutput{Title: "Failed", Summary: "**build** failed."}
@@ -61,6 +62,7 @@ func TestReportCheckOutput(t *testing.T) {
 		{Path: "main.go", StartLine: 3, EndLine: 3, StartColumn: 5, EndColumn: 5, AnnotationLevel: "failure", Message: "bad"},
 		{Path: "a.go", StartLine: 1, EndLine: 4, AnnotationLevel: "warning", Message: "spans"},
 		{Path: ".github", StartLine: 1, EndLine: 1, AnnotationLevel: "failure", Message: "Process completed with exit code 1."},
+		{Path: ".github", StartLine: 1, EndLine: 1, AnnotationLevel: "notice", Message: "n", Title: strings.Repeat("é", 254) + "…"},
 	}
 	if fmt.Sprint(out.Annotations) != fmt.Sprint(want) {
 		t.Errorf("annotations:\n%+v\nwant\n%+v", out.Annotations, want)
