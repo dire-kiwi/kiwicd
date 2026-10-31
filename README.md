@@ -76,9 +76,9 @@ job with [act](https://github.com/nektos/act), through our fork
   behind that reads a later protected job's secrets. Keep runners for protected refs with the
   server's `--protected-label`, or isolate jobs (see [Isolating jobs](#isolating-jobs)).
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
-  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request` and dispatched
-  runs from a protected ref, the repositories its workflow listens to that list it as a reader). It
-  can't push or use the API.
+  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request`, scheduled and
+  dispatched runs from a protected ref, the repositories its workflow listens to that list it as a
+  reader). It can't push or use the API.
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
@@ -144,11 +144,11 @@ curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/
   `github.event.ref`, `github.event.after` (the pushed commit), `github.event.head_commit`. The
   run's title is `owner/app: <commit subject>`, and its page shows the pushed commit.
 - `secrets.KIWICD_TOKEN` fetches the repositories the workflow lists under `repository_push` that
-  list the listening repository as a reader, in runs started by `repository_push` or by hand. The
-  repository being read has to agree, since any repository's default branch can listen to any
-  other, including a public one's where outside contributions land. Runs started by a push to the
-  listening repository only get that repository, since their workflow can come from any branch,
-  and so do dispatches on refs that aren't protected.
+  list the listening repository as a reader, in runs started by `repository_push`, a schedule or
+  by hand. The repository being read has to agree, since any repository's default branch can
+  listen to any other, including a public one's where outside contributions land. Runs started by
+  a push to the listening repository only get that repository, since their workflow can come from
+  any branch, and so do dispatches on refs that aren't protected.
 - GitHub doesn't know `repository_push`, so turn off GitHub Actions on the private repository if
   it's on GitHub, or GitHub reports the workflow as invalid.
 
