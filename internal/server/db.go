@@ -151,10 +151,40 @@ CREATE TABLE IF NOT EXISTS github_app (
 	client_secret TEXT NOT NULL,        -- encrypted, as are the next two
 	private_key TEXT NOT NULL,
 	webhook_secret TEXT NOT NULL,
-	allowed_users TEXT NOT NULL DEFAULT '[]', -- GitHub logins that may sign in
-	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- organizations whose members may
+	allowed_users TEXT NOT NULL DEFAULT '[]', -- before roles: GitHub logins that
+	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- may sign in, and organizations
 	created_at INTEGER NOT NULL
 );
+-- Roles given to GitHub logins, organizations' and teams' members (see
+-- access.go).
+CREATE TABLE IF NOT EXISTS role_grants (
+	kind TEXT NOT NULL,                 -- user | org | team
+	name TEXT NOT NULL COLLATE NOCASE,  -- login, organization or ORG/TEAM
+	role TEXT NOT NULL,                 -- admin | maintainer | viewer
+	repos TEXT NOT NULL DEFAULT '[]',   -- maintainers' OWNER/NAME or OWNER/*; [] for all
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (kind, name)
+);
+-- People who have signed in with GitHub, and the organizations and teams
+-- with roles they were members of then.
+CREATE TABLE IF NOT EXISTS github_users (
+	login TEXT PRIMARY KEY COLLATE NOCASE,
+	memberships TEXT NOT NULL DEFAULT '[]', -- org:NAME, team:ORG/TEAM
+	signed_in_at INTEGER NOT NULL
+);
+-- Who changed access and settings (see audit.go).
+CREATE TABLE IF NOT EXISTS audit_log (
+	id INTEGER PRIMARY KEY,
+	at INTEGER NOT NULL,
+	actor TEXT NOT NULL,                -- admin, a GitHub login, or kiwicd itself
+	token TEXT NOT NULL DEFAULT '',     -- the API token used, if any
+	client TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL,               -- secret.set, role.delete, ...
+	repo TEXT NOT NULL DEFAULT '',
+	target TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS audit_repo ON audit_log(repo, id) WHERE repo != '';
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -208,6 +238,10 @@ var migrations = []struct{ table, column, sql string }{
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
+	// An API token's scope (see access.go): '' and [] for its maker's full
+	// rights.
+	{"api_tokens", "role", `ALTER TABLE api_tokens ADD COLUMN role TEXT NOT NULL DEFAULT ''`},
+	{"api_tokens", "repos", `ALTER TABLE api_tokens ADD COLUMN repos TEXT NOT NULL DEFAULT '[]'`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

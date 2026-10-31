@@ -157,10 +157,18 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	case p == "/installation/repositories":
 		reply(200, map[string]any{"repositories": []map[string]any{
 			{"full_name": "gh/app", "clone_url": f.ts.URL + "/gh/app.git", "private": true, "default_branch": "main"}}})
+	case strings.HasPrefix(p, "/orgs/kiwi-org/teams/ops/memberships/"):
+		if r.Header.Get("Authorization") != "token "+fakeOrgToken {
+			reply(401, map[string]string{"message": "bad token"})
+		} else if strings.TrimPrefix(p, "/orgs/kiwi-org/teams/ops/memberships/") == "teammember" {
+			reply(200, map[string]string{"state": "active", "role": "member"})
+		} else {
+			reply(404, map[string]string{"message": "Not Found"})
+		}
 	case strings.HasPrefix(p, "/orgs/kiwi-org/members/"):
 		if r.Header.Get("Authorization") != "token "+fakeOrgToken {
 			reply(401, map[string]string{"message": "bad token"})
-		} else if strings.TrimPrefix(p, "/orgs/kiwi-org/members/") == "orgmember" {
+		} else if m := strings.TrimPrefix(p, "/orgs/kiwi-org/members/"); m == "orgmember" || m == "teammember" {
 			w.WriteHeader(204)
 		} else {
 			reply(404, map[string]string{"message": "Not Found"})
@@ -280,12 +288,11 @@ func TestGitHubAppManifest(t *testing.T) {
 	g.createApp()
 	var info struct {
 		App *struct {
-			AppID        int64    `json:"app_id"`
-			Slug         string   `json:"slug"`
-			ClientID     string   `json:"client_id"`
-			AllowedUsers []string `json:"allowed_users"`
-			InstallURL   string   `json:"install_url"`
-			ClientSecret string   `json:"client_secret"`
+			AppID        int64  `json:"app_id"`
+			Slug         string `json:"slug"`
+			ClientID     string `json:"client_id"`
+			InstallURL   string `json:"install_url"`
+			ClientSecret string `json:"client_secret"`
 		} `json:"app"`
 		WebhookURL string `json:"webhook_url"`
 	}
@@ -294,9 +301,11 @@ func TestGitHubAppManifest(t *testing.T) {
 		info.App.InstallURL != g.gh.ts.URL+"/apps/kiwicd-test/installations/new" || info.WebhookURL != g.ts.URL+"/api/github/webhook" {
 		t.Fatalf("app: %+v", info)
 	}
-	// The owner may sign in; secrets stay on the server.
-	if len(info.App.AllowedUsers) != 1 || info.App.AllowedUsers[0] != "owner" || info.App.ClientSecret != "" {
-		t.Errorf("app: %+v", info.App)
+	// The owner is an admin; secrets stay on the server.
+	var grants []RoleGrant
+	g.do(nil, "GET", "/api/roles", "", &grants)
+	if len(grants) != 1 || grants[0].Kind != "user" || grants[0].Name != "owner" || grants[0].Role != "admin" || info.App.ClientSecret != "" {
+		t.Errorf("app: %+v, roles %+v", info.App, grants)
 	}
 	var stored string
 	_ = g.srv.db.QueryRow(`SELECT private_key FROM github_app`).Scan(&stored)
@@ -318,7 +327,7 @@ func TestGitHubAppManifest(t *testing.T) {
 	// An existing app can be entered by hand; its key and client ID are checked.
 	body := func(clientID string) string {
 		b, _ := json.Marshal(map[string]any{"app_id": fakeAppID, "client_id": clientID, "client_secret": fakeClientSecret,
-			"private_key": g.gh.pem, "webhook_secret": fakeWebhookSecret, "allowed_users": []string{"@Someone", "someone"}})
+			"private_key": g.gh.pem, "webhook_secret": fakeWebhookSecret})
 		return string(b)
 	}
 	if resp := g.do(nil, "PUT", "/api/github/app", body("Iv1.other"), nil); resp.StatusCode != 400 {
@@ -327,7 +336,7 @@ func TestGitHubAppManifest(t *testing.T) {
 	if resp := g.do(nil, "PUT", "/api/github/app", body(fakeClientID), &info); resp.StatusCode != 200 {
 		t.Fatalf("put: %d", resp.StatusCode)
 	}
-	if info.App == nil || info.App.Slug != "kiwicd-test" || strings.Join(info.App.AllowedUsers, ",") != "Someone" {
+	if info.App == nil || info.App.Slug != "kiwicd-test" {
 		t.Errorf("app entered by hand: %+v", info.App)
 	}
 }
@@ -340,7 +349,8 @@ func TestGitHubLogin(t *testing.T) {
 		t.Error("GitHub sign-in offered without an app")
 	}
 	g.createApp()
-	g.do(nil, "PATCH", "/api/github/app", `{"allowed_orgs":["kiwi-org"]}`, nil)
+	g.do(nil, "PUT", "/api/roles", `{"kind":"org","name":"kiwi-org","role":"viewer"}`, nil)
+	g.do(nil, "PUT", "/api/roles", `{"kind":"team","name":"kiwi-org/ops","role":"maintainer","repos":["kiwi-org/*"]}`, nil)
 	g.do(http.DefaultClient, "GET", "/api/auth/providers", "", &providers)
 	if !providers["github"] {
 		t.Error("GitHub sign-in not offered")
@@ -379,14 +389,41 @@ func TestGitHubLogin(t *testing.T) {
 		}
 		return m.User
 	}
+	roleOf := func(c *http.Client) access {
+		t.Helper()
+		var m struct{ Access access }
+		g.do(c, "GET", "/api/me", "", &m)
+		return m.Access
+	}
 
 	c, loc := signIn("owner", nil)
 	if loc != "/" || me(c) != "owner" {
 		t.Fatalf("owner: sent to %s, /api/me says %q", loc, me(c))
 	}
+	if a := roleOf(c); a.Role != "admin" || !a.GitHub {
+		t.Errorf("owner's access: %+v", a)
+	}
 	member, loc := signIn("orgmember", nil)
 	if loc != "/" || me(member) != "orgmember" {
 		t.Fatalf("organization member: sent to %s, /api/me says %q", loc, me(member))
+	}
+	if a := roleOf(member); a.Role != "viewer" || a.MaintainAll || len(a.Maintain) != 0 {
+		t.Errorf("organization member's access: %+v", a)
+	}
+	// Teams' members get the most their organization's and team's roles give.
+	teamMember, loc := signIn("teammember", nil)
+	if a := roleOf(teamMember); loc != "/" || a.Role != "maintainer" || a.MaintainAll || strings.Join(a.Maintain, ",") != "kiwi-org/*" {
+		t.Errorf("team member: sent to %s, access %+v", loc, a)
+	}
+	var users []githubUser
+	g.do(nil, "GET", "/api/users", "", &users)
+	if len(users) != 3 || users[2].Login != "teammember" || strings.Join(users[2].Memberships, ",") != "org:kiwi-org,team:kiwi-org/ops" {
+		t.Errorf("users: %+v", users)
+	}
+	// A role changes at once, for sessions too.
+	g.do(nil, "PUT", "/api/roles", `{"kind":"org","name":"kiwi-org","role":"maintainer"}`, nil)
+	if a := roleOf(member); a.Role != "maintainer" || !a.MaintainAll {
+		t.Errorf("organization member's access after the change: %+v", a)
 	}
 	stranger, loc := signIn("stranger", nil)
 	if !strings.HasPrefix(loc, "/login?error=") || me(stranger) != "" {
@@ -402,17 +439,26 @@ func TestGitHubLogin(t *testing.T) {
 		t.Errorf("requestUser without a user: %q", got)
 	}
 
-	// Adding someone keeps sessions; removing someone ends GitHub ones.
-	g.do(nil, "PATCH", "/api/github/app", `{"allowed_users":["owner","another"]}`, nil)
-	if me(c) != "owner" {
-		t.Error("adding a user logged the owner out")
+	// Taking a role away signs out only those it leaves without one.
+	if resp := g.do(nil, "DELETE", "/api/roles?kind=org&name=kiwi-org", "", nil); resp.StatusCode != 200 {
+		t.Fatalf("delete role: %d", resp.StatusCode)
 	}
-	g.do(nil, "PATCH", "/api/github/app", `{"allowed_orgs":[]}`, nil)
-	if me(c) != "" || me(member) != "" {
-		t.Error("removing an organization kept GitHub sessions")
+	if me(c) != "owner" || me(member) != "" || me(teamMember) != "teammember" {
+		t.Errorf("after removing the organization: owner %q, member %q, team member %q", me(c), me(member), me(teamMember))
+	}
+	var n int
+	_ = g.srv.db.QueryRow(`SELECT count(*) FROM sessions WHERE github_login = 'orgmember'`).Scan(&n)
+	if n != 0 {
+		t.Error("the organization member's session was kept")
 	}
 	if me(nil) != adminUser {
 		t.Error("the admin password stopped working")
+	}
+	var log struct{ Entries []auditEntry }
+	g.do(nil, "GET", "/api/audit", "", &log)
+	if len(log.Entries) < 2 || log.Entries[1].Action != "role.delete" || log.Entries[1].Actor != adminUser ||
+		log.Entries[0].Action != "access.revoke" || log.Entries[0].Target != "orgmember" {
+		t.Errorf("audit log: %+v", log.Entries)
 	}
 }
 
@@ -553,12 +599,22 @@ func TestGitHubRepoName(t *testing.T) {
 	}
 }
 
-func TestCleanAllowed(t *testing.T) {
-	users, orgs, err := cleanAllowed([]string{" @b", "A", "a", ""}, []string{"kiwi-org"})
-	if err != nil || strings.Join(users, ",") != "A,b" || strings.Join(orgs, ",") != "kiwi-org" {
-		t.Errorf("cleanAllowed = %v, %v, %v", users, orgs, err)
+func TestCleanGrant(t *testing.T) {
+	g, err := cleanGrant(RoleGrant{Kind: "user", Name: " @octocat", Role: "Maintainer", Repos: []string{"b/x", "a/*", "b/x.git", ""}})
+	if err != nil || g.Name != "octocat" || g.Role != "maintainer" || strings.Join(g.Repos, ",") != "a/*,b/x" {
+		t.Errorf("cleanGrant = %+v, %v", g, err)
 	}
-	if _, _, err := cleanAllowed([]string{"no/slashes"}, nil); err == nil {
-		t.Error("accepted a login with a slash")
+	for _, bad := range []RoleGrant{
+		{Kind: "user", Name: "no/slashes", Role: "viewer"},
+		{Kind: "team", Name: "no-team", Role: "viewer"},
+		{Kind: "org", Name: "o", Role: "owner"},
+		{Kind: "everyone", Name: "o", Role: "viewer"},
+		{Kind: "org", Name: "o", Role: "viewer", Repos: []string{"a/b"}},
+		{Kind: "org", Name: "o", Role: "maintainer", Repos: []string{"a/b/c"}},
+		{Kind: "org", Name: "o", Role: "maintainer", Repos: []string{"*"}},
+	} {
+		if _, err := cleanGrant(bad); err == nil {
+			t.Errorf("cleanGrant accepted %+v", bad)
+		}
 	}
 }

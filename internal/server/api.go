@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dire-kiwi/kiwicd/internal/protocol"
@@ -22,11 +23,15 @@ func pathID(r *http.Request) int64 {
 }
 
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
-	q := `SELECT ` + runCols + ` FROM runs r JOIN repos p ON p.id = r.repo_id`
+	q := `SELECT ` + runCols + ` FROM runs r JOIN repos p ON p.id = r.repo_id WHERE 1`
 	var args []any
 	if repo := r.URL.Query().Get("repo"); repo != "" {
-		q += ` WHERE p.name = ?`
+		q += ` AND p.name = ?`
 		args = append(args, repo)
+	}
+	if p := requestPrincipal(r); p.repos != nil {
+		q += ` AND p.name IN (SELECT value FROM json_each(?))`
+		args = append(args, mustJSON(p.repos))
 	}
 	limit := 50
 	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 && l <= 500 {
@@ -274,6 +279,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	p := requestPrincipal(r)
 	send("hello", map[string]string{"topic": topic})
 	keepalive := time.NewTicker(20 * time.Second)
 	defer keepalive.Stop()
@@ -287,6 +293,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case ev, ok := <-ch:
 			if !ok {
 				return
+			}
+			if run, ok := ev.Data.(*Run); ok && !p.canView(run.Repo) {
+				continue
 			}
 			send(ev.Type, ev.Data)
 		}
@@ -315,18 +324,31 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request) {
 		runners = append(runners, &rn)
 	}
 	rows.Close()
+	p := requestPrincipal(r)
 	for _, rn := range runners {
-		_ = s.db.QueryRow(`SELECT id, run_id, name FROM jobs WHERE runner_id = ? AND status = ? LIMIT 1`, rn.ID, protocol.StatusInProgress).Scan(&rn.JobID, &rn.RunID, &rn.JobName)
+		var repo string
+		_ = s.db.QueryRow(`SELECT j.id, j.run_id, j.name, p.name FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id
+			WHERE j.runner_id = ? AND j.status = ? LIMIT 1`, rn.ID, protocol.StatusInProgress).Scan(&rn.JobID, &rn.RunID, &rn.JobName, &repo)
 		rn.Busy = rn.JobID != 0
+		if !p.canView(repo) {
+			// Busy with a job the caller can't see.
+			rn.JobID, rn.RunID, rn.JobName = 0, 0, ""
+		}
 	}
 	writeJSON(w, runners)
 }
 
 func (s *Server) handleDeleteRunner(w http.ResponseWriter, r *http.Request) {
+	var name string
+	if err := s.db.QueryRow(`SELECT name FROM runners WHERE id = ?`, pathID(r)).Scan(&name); err != nil {
+		httpError(w, 404, "no such runner")
+		return
+	}
 	if _, err := s.db.Exec(`DELETE FROM runners WHERE id = ?`, pathID(r)); err != nil {
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.audit(r, "runner.delete", "", fmt.Sprintf("%s (%d)", name, pathID(r)), "")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -337,6 +359,7 @@ func (s *Server) handleRegistrationToken(w http.ResponseWriter, r *http.Request)
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.audit(r, "runner.registration_token", "", "", "for an hour")
 	writeJSON(w, map[string]any{"token": token, "expires_at": exp.UnixMilli(), "url": s.publicURL(r)})
 }
 
@@ -345,15 +368,27 @@ func (s *Server) handleRegistrationToken(w http.ResponseWriter, r *http.Request)
 var settingNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func (s *Server) settingRepoID(r *http.Request) (int64, error) {
+	id, _, err := s.settingRepo(r)
+	return id, err
+}
+
+// settingRepo returns the repository of a secrets or variables request: its
+// ID and name, or 0 and "" for the global ones.
+func (s *Server) settingRepo(r *http.Request) (int64, string, error) {
 	name := r.URL.Query().Get("repo")
 	if name == "" {
-		return 0, nil
+		return 0, "", nil
 	}
 	repo, err := s.getRepo(name)
 	if err != nil {
-		return 0, fmt.Errorf("no such repository %s", name)
+		return 0, "", fmt.Errorf("no such repository %s", name)
 	}
-	return repo.ID, nil
+	return repo.ID, repo.Name, nil
+}
+
+// settingAction names a change to a secret or variable in the audit log.
+func settingAction(table, verb string) string {
+	return strings.TrimSuffix(table, "s") + "." + verb
 }
 
 func (s *Server) handleListSettings(table string) http.HandlerFunc {
@@ -389,7 +424,7 @@ func (s *Server) handleListSettings(table string) http.HandlerFunc {
 
 func (s *Server) handlePutSetting(table string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		repoID, err := s.settingRepoID(r)
+		repoID, repoName, err := s.settingRepo(r)
 		if err != nil {
 			httpError(w, 404, "%v", err)
 			return
@@ -416,20 +451,26 @@ func (s *Server) handlePutSetting(table string) http.HandlerFunc {
 			httpError(w, 500, "%v", err)
 			return
 		}
+		s.audit(r, settingAction(table, "set"), repoName, req.Name, "")
 		writeJSON(w, map[string]bool{"ok": true})
 	}
 }
 
 func (s *Server) handleDeleteSetting(table string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		repoID, err := s.settingRepoID(r)
+		repoID, repoName, err := s.settingRepo(r)
 		if err != nil {
 			httpError(w, 404, "%v", err)
 			return
 		}
-		if _, err := s.db.Exec(`DELETE FROM `+table+` WHERE repo_id = ? AND name = ?`, repoID, r.URL.Query().Get("name")); err != nil {
+		name := r.URL.Query().Get("name")
+		res, err := s.db.Exec(`DELETE FROM `+table+` WHERE repo_id = ? AND name = ?`, repoID, name)
+		if err != nil {
 			httpError(w, 500, "%v", err)
 			return
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			s.audit(r, settingAction(table, "delete"), repoName, name, "")
 		}
 		writeJSON(w, map[string]bool{"ok": true})
 	}
