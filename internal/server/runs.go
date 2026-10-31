@@ -182,6 +182,9 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	if err := s.advance(ctx, id); err != nil {
 		s.log.Error("advance", "run", id, "err", err)
 	}
+	if spec.parseErr != nil {
+		s.reportChecks(id) // advance leaves finished runs alone
+	}
 	return id, nil
 }
 
@@ -481,6 +484,7 @@ func (s *Server) publishRun(runID int64) {
 	run.EventJSON = nil
 	s.hub.publish("runs", "run", run)
 	s.hub.publish(fmt.Sprintf("run:%d", runID), "run", run)
+	s.reportChecks(runID)
 }
 
 func (s *Server) publishJob(j *Job) {

@@ -28,13 +28,16 @@ import (
 	"time"
 )
 
-// kiwicd can have one GitHub App. It does three things:
+// kiwicd can have one GitHub App. It does four things:
 //
 //   - Webhooks: GitHub sends the push and pull_request events of every
 //     repository the app is installed on to /api/github/webhook, signed with
 //     the app's webhook secret. Each goes to the mirrors of that repository,
 //     as if it had come to a mirror's own webhook URL, so repositories need
 //     no webhook of their own.
+//   - Checks: runs of mirrors of those repositories show on their commits
+//     and pull requests as check runs, which can be re-run from GitHub (see
+//     checks.go).
 //   - Fetching: mirrors of repositories the app is installed on fetch over
 //     HTTPS with an installation token, so private ones need no deploy key.
 //   - Logins: people sign in with GitHub through the app's OAuth client
@@ -123,8 +126,12 @@ type githubState struct {
 	// Installation IDs by "owner/name" or "org:name" (lower case); 0 when
 	// the app isn't installed there.
 	installs map[string]cachedInstall
-	// Installation tokens by the same keys.
+	// Installation tokens by the same keys and their permissions.
 	tokens map[string]cachedToken
+	// Repositories ("owner/name", lower case) whose check runs aren't
+	// reported, by when to try again: the installation lacks the checks
+	// permission (see checks.go).
+	noChecks map[string]time.Time
 	// Manifest flows started in the UI, by state, until they expire.
 	setups map[string]time.Time
 }
@@ -149,6 +156,7 @@ func newGitHubState() githubState {
 		now:      time.Now,
 		installs: map[string]cachedInstall{},
 		tokens:   map[string]cachedToken{},
+		noChecks: map[string]time.Time{},
 		setups:   map[string]time.Time{},
 	}
 }
@@ -160,6 +168,7 @@ func (g *githubState) forget() {
 	defer g.mu.Unlock()
 	g.installs = map[string]cachedInstall{}
 	g.tokens = map[string]cachedToken{}
+	g.noChecks = map[string]time.Time{}
 }
 
 // githubError is an unexpected response from GitHub.
@@ -315,8 +324,12 @@ func (s *Server) installation(ctx context.Context, a *githubApp, key string) (in
 // Tokens are kept until shortly before they expire.
 func (s *Server) installationToken(ctx context.Context, a *githubApp, key string, permissions map[string]string) (string, error) {
 	key = strings.ToLower(key)
+	tokenKey := key
+	for _, p := range sortedKeys(permissions) {
+		tokenKey += " " + p + ":" + permissions[p]
+	}
 	s.gh.mu.Lock()
-	t, ok := s.gh.tokens[key]
+	t, ok := s.gh.tokens[tokenKey]
 	s.gh.mu.Unlock()
 	if ok && s.gh.now().Before(t.expires.Add(-5*time.Minute)) {
 		return t.token, nil
@@ -345,7 +358,7 @@ func (s *Server) installationToken(ctx context.Context, a *githubApp, key string
 		return "", err
 	}
 	s.gh.mu.Lock()
-	s.gh.tokens[key] = cachedToken{tok.Token, tok.ExpiresAt}
+	s.gh.tokens[tokenKey] = cachedToken{tok.Token, tok.ExpiresAt}
 	s.gh.mu.Unlock()
 	return tok.Token, nil
 }
@@ -445,7 +458,8 @@ func (s *Server) mirrorsOf(fullName string) ([]*Repo, error) {
 // handleGitHubWebhook takes the app's webhook deliveries. Push events sync
 // the repository's mirrors and pull_request events go to them as through
 // their own webhook URL (see handleWebhook). Repositories without a mirror
-// are ignored.
+// are ignored. Re-requested check runs and suites re-run their runs (see
+// onCheckRerequest).
 func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	a, err := s.githubApp()
 	if errors.Is(err, errNoGitHubApp) {
@@ -467,6 +481,14 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	case "installation", "installation_repositories":
 		s.gh.forget()
 		writeJSON(w, map[string]bool{"ok": true})
+		return
+	case "check_run", "check_suite":
+		runs, err := s.onCheckRerequest(event, body)
+		if err != nil {
+			httpError(w, 400, "bad %s event: %v", event, err)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "runs": runs})
 		return
 	case "push", "pull_request":
 	default:
@@ -539,6 +561,79 @@ func webhookJSON(r *http.Request, body []byte) []byte {
 type githubAppInfo struct {
 	*githubApp
 	InstallURL string `json:"install_url,omitempty"`
+	// What the app and its installations lack of what kiwicd needs, from
+	// GitHub; nil if GitHub couldn't be asked.
+	Access      *githubAccess `json:"access,omitempty"`
+	AccessError string        `json:"access_error,omitempty"`
+}
+
+// appEvents are the events the app subscribes to.
+var appEvents = []string{"push", "pull_request", "check_run", "check_suite"}
+
+// githubAccess says whether the app can report check runs: apps made before
+// kiwicd reported them need the checks permission, and every installation
+// has to accept it.
+type githubAccess struct {
+	// The app's permissions page on GitHub.
+	PermissionsURL string `json:"permissions_url"`
+	// "checks: write" and events the app isn't subscribed to.
+	Missing       []string             `json:"missing"`
+	Installations []installationAccess `json:"installations"`
+}
+
+type installationAccess struct {
+	Account string `json:"account"`
+	HTMLURL string `json:"html_url"`
+	// Whether the installation has accepted the checks permission.
+	Checks bool `json:"checks"`
+}
+
+func (s *Server) githubAccess(ctx context.Context, a *githubApp) (*githubAccess, error) {
+	auth, err := s.appAuth(a)
+	if err != nil {
+		return nil, err
+	}
+	var app struct {
+		Slug  string `json:"slug"`
+		Owner struct {
+			Login string `json:"login"`
+			Type  string `json:"type"`
+		} `json:"owner"`
+		Permissions map[string]string `json:"permissions"`
+		Events      []string          `json:"events"`
+	}
+	if err := s.githubAPI(ctx, "GET", "/app", auth, nil, &app); err != nil {
+		return nil, err
+	}
+	var installs []struct {
+		Account struct {
+			Login string `json:"login"`
+		} `json:"account"`
+		HTMLURL     string            `json:"html_url"`
+		Permissions map[string]string `json:"permissions"`
+	}
+	if err := s.githubAPI(ctx, "GET", "/app/installations?per_page=100", auth, nil, &installs); err != nil {
+		return nil, err
+	}
+	out := &githubAccess{PermissionsURL: s.cfg.GitHubURL + "/settings/apps/" + url.PathEscape(app.Slug) + "/permissions",
+		Missing: []string{}, Installations: []installationAccess{}}
+	if app.Owner.Type == "Organization" {
+		out.PermissionsURL = s.cfg.GitHubURL + "/organizations/" + url.PathEscape(app.Owner.Login) + "/settings/apps/" +
+			url.PathEscape(app.Slug) + "/permissions"
+	}
+	if app.Permissions["checks"] != "write" {
+		out.Missing = append(out.Missing, "checks: write")
+	}
+	for _, e := range appEvents {
+		if !containsFold(app.Events, e) {
+			out.Missing = append(out.Missing, e+" events")
+		}
+	}
+	for _, in := range installs {
+		out.Installations = append(out.Installations, installationAccess{Account: in.Account.Login, HTMLURL: in.HTMLURL,
+			Checks: in.Permissions["checks"] == "write"})
+	}
+	return out, nil
 }
 
 func (s *Server) handleGetGitHubApp(w http.ResponseWriter, r *http.Request) {
@@ -560,6 +655,11 @@ func (s *Server) handleGetGitHubApp(w http.ResponseWriter, r *http.Request) {
 		if a.HTMLURL != "" {
 			info.InstallURL = a.HTMLURL + "/installations/new"
 		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		if info.Access, err = s.githubAccess(ctx, a); err != nil {
+			info.AccessError = err.Error()
+		}
+		cancel()
 		out["app"] = info
 	}
 	writeJSON(w, out)
@@ -777,10 +877,11 @@ func (s *Server) handleGitHubAppManifest(w http.ResponseWriter, r *http.Request)
 		"default_permissions": map[string]string{
 			"contents":      "read", // fetching mirrors, push events
 			"metadata":      "read",
-			"pull_requests": "read", // pull_request events
-			"members":       "read", // organizations whose members may sign in
+			"pull_requests": "read",  // pull_request events
+			"members":       "read",  // organizations whose members may sign in
+			"checks":        "write", // reporting runs as check runs
 		},
-		"default_events": []string{"push", "pull_request"},
+		"default_events": appEvents,
 	}
 	action := s.cfg.GitHubURL + "/settings/apps/new"
 	if req.Org != "" {
