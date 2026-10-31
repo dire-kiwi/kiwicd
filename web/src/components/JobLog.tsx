@@ -1,12 +1,13 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useLocation } from "react-router-dom";
-import { ansiToSegments } from "../ansi";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
+import { ansiToSegments, stripAnsi, type Segment } from "../ansi";
 import { useNow } from "../hooks";
 import { jobState, matrixLabel } from "../runmodel";
 import type { Job, LogLine, Step } from "../types";
-import { absoluteTime, classes, elapsed, relativeTime, visualState } from "../util";
+import { absoluteTime, classes, elapsed, permissionsLabel, relativeTime, visualState } from "../util";
+import { queuedFor } from "./RunTiming";
 import { StatusIcon } from "./StatusIcon";
-import { Chip, ErrorBox, Icon } from "./ui";
+import { Chip, ErrorBox, Flash, Icon } from "./ui";
 
 interface LogState {
   byStep: Record<number, LogLine[]>;
@@ -22,12 +23,25 @@ function stepState(s: Step) {
 /**
  * Live log view for one job: collapsible steps streamed over SSE. Runners
  * with the withheld labels won't take it, as its run's ref isn't protected.
+ * onRerun, if set, re-runs the job.
  */
-export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unknown) => void; withheld?: string[] }) {
+export function JobLog({
+  job,
+  onJob,
+  withheld = [],
+  onRerun,
+}: {
+  job: Job;
+  onJob: (j: unknown) => void;
+  withheld?: string[];
+  onRerun?: () => void;
+}) {
   const [logs, setLogs] = useState<LogState>({ byStep: {}, count: 0 });
   const [streamError, setStreamError] = useState(false);
   const [overrides, setOverrides] = useState<Record<number, boolean>>({});
   const [showTs, setShowTs] = useState(false);
+  // The whole log has arrived (the stream ended with the job done).
+  const [complete, setComplete] = useState(false);
   const seen = useRef(new Set<number>());
   const lastSeq = useRef(0);
   const onJobRef = useRef(onJob);
@@ -73,6 +87,7 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
     const stop = () => {
       done = true;
       es?.close();
+      setComplete(true);
     };
     const connect = () => {
       es = new EventSource(`/api/jobs/${job.id}/events?after=${lastSeq.current}`);
@@ -141,7 +156,7 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
   }, [steps, logs.byStep]);
 
   // Follow the log tail while the user is at the bottom of the page.
-  const atBottom = useRef(running);
+  const atBottom = useRef(running && !parseLineHash(window.location.hash));
   useEffect(() => {
     const onScroll = () => {
       atBottom.current = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 60;
@@ -155,25 +170,69 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
     }
   }, [logs.count, running, job.steps]);
 
-  // A link to a line (#step-2-L14, from an annotation or a line number)
-  // opens its step and, once the line has loaded, scrolls to it.
-  const { hash } = useLocation();
-  const target = useMemo(() => {
-    const m = /^#step-(\d+)-L(\d+)$/.exec(hash);
-    return m ? { hash, step: Number(m[1]), line: Number(m[2]) } : undefined;
-  }, [hash]);
-  const scrolledTo = useRef("");
+  // A link to lines (#step:3:42): open their step, then scroll to them once
+  // they have arrived, which for a long log may be some pages in.
+  const location = useLocation();
+  const navigate = useNavigate();
+  const target = useMemo(() => parseLineHash(location.hash), [location.hash]);
+  const scrolledTo = useRef<string>();
   useEffect(() => {
-    if (target) setOverrides((o) => ({ ...o, [target.step]: true }));
+    if (target) setOverrides((o) => (o[target.step] ? o : { ...o, [target.step]: true }));
   }, [target]);
+  const targetLines = target ? (logs.byStep[target.step]?.length ?? 0) : 0;
+  const targetMissing = !!target && complete && (target.from > targetLines || !visible.some((v) => v.index === target.step));
   useLayoutEffect(() => {
-    if (!target || scrolledTo.current === target.hash) return;
-    const el = document.getElementById(target.hash.slice(1));
+    if (!target || scrolledTo.current === location.hash) return;
+    const el = document.getElementById(target.from ? lineID(target.step, target.from) : `step-${target.step}`);
     if (!el) return;
-    scrolledTo.current = target.hash;
+    scrolledTo.current = location.hash;
+    atBottom.current = false;
+    el.scrollIntoView({ block: target.from ? "center" : "start" });
+  });
+  const onSelect = useCallback(
+    (step: number, n: number, extend: boolean) => {
+      const cur = parseLineHash(window.location.hash);
+      const hash = extend && cur && cur.step === step && cur.from ? lineHash(step, Math.min(cur.from, n), Math.max(cur.to, n)) : lineHash(step, n);
+      // The line is already on screen: don't scroll to it.
+      scrolledTo.current = hash;
+      navigate({ hash }, { replace: true });
+    },
+    [navigate],
+  );
+
+  // Search: every matching line, in the order shown; the current one is
+  // unfolded and scrolled to.
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setQuery(search), 150);
+    return () => clearTimeout(t);
+  }, [search]);
+  const matches = useMemo(() => findMatches(visible, logs.byStep, query), [visible, logs.byStep, query]);
+  const [matchIndex, setMatchIndex] = useState(0);
+  useEffect(() => setMatchIndex(0), [query]);
+  const current = matches.length ? matches[Math.min(matchIndex, matches.length - 1)] : undefined;
+  const currentKey = current && `${current.step}:${current.n}`;
+  useEffect(() => {
+    if (current) setOverrides((o) => (o[current.step] ? o : { ...o, [current.step]: true }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentKey]);
+  const scrolledToMatch = useRef<string>();
+  useLayoutEffect(() => {
+    if (!current || scrolledToMatch.current === currentKey) return;
+    const el = document.getElementById(lineID(current.step, current.n));
+    if (!el) return;
+    scrolledToMatch.current = currentKey;
     atBottom.current = false;
     el.scrollIntoView({ block: "center" });
-  }, [target, logs.count, overrides]);
+  });
+  const moveMatch = (by: number) => {
+    if (!matches.length) return;
+    scrolledToMatch.current = undefined;
+    setMatchIndex((i) => (Math.min(i, matches.length - 1) + by + matches.length) % matches.length);
+  };
+
+  const lineView = useMemo(() => ({ showTs, onSelect, query }), [showTs, onSelect, query]);
 
   const isOpen = (index: number, step: Step | null) => {
     if (target?.step === index && !(index in overrides)) return true;
@@ -192,7 +251,10 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
       ? `${verb[st] ?? "completed"} ${relativeTime(job.finished_at, now)}${job.started_at ? ` in ${elapsed(job.started_at, job.finished_at)}` : ""}`
       : job.status === "in_progress"
         ? `started ${relativeTime(job.started_at, now)}`
-        : "waiting for a runner";
+        : job.status === "pending"
+          ? "waiting for its concurrency group"
+          : "waiting for a runner";
+  const mayFail = job.continue_on_error && job.status === "completed" && job.conclusion === "failure";
 
   return (
     <div className="job-view">
@@ -207,6 +269,39 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
           </div>
         </div>
         <div className="job-tools">
+          <div className="log-search">
+            <Icon name="search" size={14} />
+            <input
+              type="search"
+              placeholder="Search logs"
+              aria-label="Search logs"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  setQuery(search);
+                  if (query === search) moveMatch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "Escape") {
+                  setSearch("");
+                  setQuery("");
+                }
+              }}
+            />
+            {query && (
+              <>
+                <span className="log-search-count muted small">
+                  {matches.length ? `${Math.min(matchIndex, matches.length - 1) + 1}/${matches.length}${matches.length >= maxMatches ? "+" : ""}` : "0/0"}
+                </span>
+                <button type="button" className="btn-icon log-search-btn" onClick={() => moveMatch(-1)} disabled={!matches.length} aria-label="Previous match">
+                  <Icon name="chevron-up" size={12} />
+                </button>
+                <button type="button" className="btn-icon log-search-btn" onClick={() => moveMatch(1)} disabled={!matches.length} aria-label="Next match">
+                  <Icon name="chevron-down" size={12} />
+                </button>
+              </>
+            )}
+          </div>
           <label className="check small">
             <input type="checkbox" checked={showTs} onChange={(e) => setShowTs(e.target.checked)} /> Timestamps
           </label>
@@ -219,6 +314,14 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
           <a className="btn btn-sm" href={`/api/jobs/${job.id}/logs?format=text`} target="_blank" rel="noreferrer">
             View raw logs
           </a>
+          <a className="btn btn-sm" href={`/api/jobs/${job.id}/logs?format=text&download=1`} download title="Download this job's log">
+            <Icon name="download" size={14} /> Download
+          </a>
+          {onRerun && (
+            <button className="btn btn-sm" onClick={onRerun}>
+              Re-run this job
+            </button>
+          )}
         </div>
       </div>
       <div className="job-info small">
@@ -238,70 +341,111 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
             <span className="muted">matrix</span> <span className="mono">{matrix}</span>
           </span>
         )}
-        {job.started_at > 0 && (
+        {job.concurrency_group && (
           <span>
+            <span className="muted">concurrency</span> <span className="mono">{job.concurrency_group}</span>
+          </span>
+        )}
+        {job.continue_on_error && (
+          <span>
+            <span className="muted">continue-on-error</span>
+          </span>
+        )}
+        {job.permissions && (
+          <span title="Not enforced yet: kiwicd's job token can only read">
+            <span className="muted">permissions</span> <span className="mono">{permissionsLabel(job.permissions)}</span>
+          </span>
+        )}
+        {queuedFor(job, now) && (
+          <span title="How long the job waited for a runner">
+            <span className="muted">queued</span> {queuedFor(job, now)}
+          </span>
+        )}
+        {job.started_at > 0 && (
+          <span title="How long the job ran">
             <Icon name="clock" size={13} /> {elapsed(job.started_at, job.finished_at, now)}
           </span>
         )}
       </div>
+      {job.copied_from ? (
+        <Flash>
+          <span>
+            This job ran in attempt {job.copied_attempt}; this attempt kept its result.{" "}
+            <Link to={`/jobs/${job.copied_from}`}>See it in attempt {job.copied_attempt}</Link>
+          </span>
+        </Flash>
+      ) : null}
       {job.error && (
         <ErrorBox>
           <span className="pre-wrap">{job.error}</span>
         </ErrorBox>
       )}
+      {mayFail && <div className="flash">This job has continue-on-error, so its failure doesn't fail the run and the jobs that need it see it as successful.</div>}
       {job.cancel_requested && job.status !== "completed" && <div className="flash flash-warn">Cancellation requested…</div>}
       {streamError && <div className="flash flash-warn">Lost connection to the log stream — retrying…</div>}
+      {targetMissing && target && (
+        <div className="flash flash-warn">
+          {target.from ? `Line ${target.from} of step ${target.step + 1}` : `Step ${target.step + 1}`} isn't in this job's log.
+        </div>
+      )}
 
-      <div className="log-box">
-        {visible.length === 0 ? (
-          <div className="log-empty muted">
-            {job.status === "queued" ? (
-              <>
-                Waiting for a runner with labels{" "}
-                {(job.runs_on ?? []).map((l) => (
-                  <code key={l}>{l}</code>
-                ))}{" "}
-                to pick up this job…
-                {withheld.length > 0 && (
-                  <div className="small">
-                    This run's ref isn't protected, so runners with the label{withheld.length > 1 ? "s" : ""}{" "}
-                    {withheld.map((l) => (
-                      <code key={l}>{l}</code>
-                    ))}{" "}
-                    won't take it.
-                  </div>
-                )}
-              </>
-            ) : job.status === "completed" ? (
-              job.conclusion === "skipped" ? (
-                "This job was skipped."
+      <LineViewContext.Provider value={lineView}>
+        <div className="log-box">
+          {visible.length === 0 ? (
+            <div className="log-empty muted">
+              {job.status === "pending" && job.concurrency_group ? (
+                <>
+                  Waiting for the running job of the concurrency group <code>{job.concurrency_group}</code> to finish…
+                </>
+              ) : job.status === "queued" ? (
+                <>
+                  Waiting for a runner with labels{" "}
+                  {(job.runs_on ?? []).map((l) => (
+                    <code key={l}>{l}</code>
+                  ))}{" "}
+                  to pick up this job…
+                  {withheld.length > 0 && (
+                    <div className="small">
+                      This run's ref isn't protected, so runners with the label{withheld.length > 1 ? "s" : ""}{" "}
+                      {withheld.map((l) => (
+                        <code key={l}>{l}</code>
+                      ))}{" "}
+                      won't take it.
+                    </div>
+                  )}
+                </>
+              ) : job.status === "completed" ? (
+                job.conclusion === "skipped" ? (
+                  "This job was skipped."
+                ) : (
+                  "This job produced no steps."
+                )
               ) : (
-                "This job produced no steps."
-              )
-            ) : (
-              "Starting…"
-            )}
-          </div>
-        ) : (
-          visible.map(({ index, step, name }) => {
-            const open = isOpen(index, step);
-            return (
-              <StepSection
-                key={index}
-                index={index}
-                name={name}
-                state={step ? stepState(step) : st}
-                duration={step ? elapsed(step.started_at, step.finished_at, now) : ""}
-                lines={logs.byStep[index]}
-                selected={target?.step === index ? target.line : 0}
-                open={open}
-                showTs={showTs}
-                onToggle={() => toggle(index, open)}
-              />
-            );
-          })
-        )}
-      </div>
+                "Starting…"
+              )}
+            </div>
+          ) : (
+            visible.map(({ index, step, name }) => {
+              const open = isOpen(index, step);
+              return (
+                <StepSection
+                  key={index}
+                  index={index}
+                  name={name}
+                  state={step ? stepState(step) : st}
+                  duration={step ? elapsed(step.started_at, step.finished_at, now) : ""}
+                  lines={logs.byStep[index]}
+                  open={open}
+                  onToggle={() => toggle(index, open)}
+                  marked={target?.step === index && target.from ? ([target.from, target.to] as const) : undefined}
+                  reveal={current?.step === index ? current.n : target?.step === index && target.from ? target.from : undefined}
+                current={current?.step === index ? current.n : undefined}
+                />
+              );
+            })
+          )}
+        </div>
+      </LineViewContext.Provider>
 
       {outputs.length > 0 && (
         <section className="box">
@@ -328,28 +472,54 @@ function OutputRow({ k, v }: { k: string; v: string }) {
   );
 }
 
+/** What every log line needs from the view, besides its own state. */
+interface LineView {
+  showTs: boolean;
+  /** Search text to highlight. */
+  query: string;
+  /** A click on a line number: links to the line, or with shift to a range from the linked line. */
+  onSelect: (step: number, n: number, extend: boolean) => void;
+}
+
+const LineViewContext = createContext<LineView>({ showTs: false, query: "", onSelect: () => {} });
+
 const StepSection = memo(function StepSection({
   index,
   name,
   state,
   duration,
   lines,
-  selected,
   open,
-  showTs,
   onToggle,
+  marked,
+  reveal,
+  current,
 }: {
   index: number;
   name: string;
   state: ReturnType<typeof stepState>;
   duration: string;
   lines: LogLine[] | undefined;
-  /** The number of the line linked to, or 0. */
-  selected: number;
   open: boolean;
-  showTs: boolean;
   onToggle: () => void;
+  /** Lines linked to (first and last line number). */
+  marked?: readonly [number, number];
+  /** A line to show: the group it's in is unfolded. */
+  reveal?: number;
+  /** The current search match's line. */
+  current?: number;
 }) {
+  const blocks = useMemo(() => logBlocks(lines ?? []), [lines]);
+  const [groupOverrides, setGroupOverrides] = useState<Record<number, boolean>>({});
+  // Groups start folded, except one still being written to.
+  const groupOpen = (g: LogGroupBlock) =>
+    groupOverrides[g.header.seq] ?? (state === "in_progress" && !g.ended && g === blocks[blocks.length - 1]);
+  // Unfold the group of a line being revealed, even if it was folded by hand.
+  const revealed = reveal !== undefined ? blocks.find((b): b is LogGroupBlock => b.kind === "group" && b.n < reveal && reveal <= b.last) : undefined;
+  useEffect(() => {
+    if (revealed) setGroupOverrides((o) => (o[revealed.header.seq] ? o : { ...o, [revealed.header.seq]: true }));
+  }, [revealed]);
+  const isMarked = (n: number) => !!marked && marked[0] <= n && n <= marked[1];
   return (
     <div className={classes("step", open && "step-open")} id={`step-${index}`}>
       <button className="step-header" onClick={onToggle} aria-expanded={open}>
@@ -364,9 +534,26 @@ const StepSection = memo(function StepSection({
         <div className="step-log">
           {lines && lines.length > 0 ? (
             <div className="log-lines">
-              {lines.map((l, i) => (
-                <LogLineRow key={l.seq} n={i + 1} line={l} showTs={showTs} anchor={`step-${index}-L${i + 1}`} selected={selected === i + 1} />
-              ))}
+              {blocks.map((b) =>
+                b.kind === "line" ? (
+                  <LogLineRow key={b.line.seq} step={index} n={b.n} line={b.line} marked={isMarked(b.n)} current={current === b.n} />
+                ) : (
+                  <div key={b.header.seq} className={classes("log-group-block", groupOpen(b) && "log-group-open")}>
+                    <LogLineRow
+                      step={index}
+                      n={b.n}
+                      line={b.header}
+                      marked={isMarked(b.n)}
+                      current={current === b.n}
+                      open={groupOpen(b)}
+                      onToggle={() => setGroupOverrides((o) => ({ ...o, [b.header.seq]: !groupOpen(b) }))}
+                    />
+                    {groupOpen(b) && b.lines.map((l) => (
+                        <LogLineRow key={l.line.seq} step={index} n={l.n} line={l.line} marked={isMarked(l.n)} current={current === l.n} />
+                      ))}
+                  </div>
+                ),
+              )}
             </div>
           ) : (
             <div className="log-none">{state === "in_progress" ? "Waiting for output…" : "No output"}</div>
@@ -376,6 +563,89 @@ const StepSection = memo(function StepSection({
     </div>
   );
 });
+
+interface NumberedLine {
+  line: LogLine;
+  /** Line number within the step, counting every line. */
+  n: number;
+}
+
+interface LogGroupBlock {
+  kind: "group";
+  header: LogLine;
+  n: number;
+  lines: NumberedLine[];
+  /** Number of the group's last line (its ::endgroup:: if it has one). */
+  last: number;
+  ended: boolean;
+}
+
+type LogBlock = ({ kind: "line" } & NumberedLine) | LogGroupBlock;
+
+function isGroupStart(text: string) {
+  return text.startsWith("##[group]") || text.startsWith("::group::");
+}
+
+function isGroupEnd(text: string) {
+  return text.startsWith("##[endgroup]") || text.startsWith("::endgroup::");
+}
+
+/**
+ * Splits a step's lines into ::group:: sections and the lines between them.
+ * Groups don't nest: a group runs to its ::endgroup:: or the next ::group::,
+ * as on GitHub.
+ */
+function logBlocks(lines: LogLine[]): LogBlock[] {
+  const out: LogBlock[] = [];
+  let group: LogGroupBlock | null = null;
+  lines.forEach((line, i) => {
+    const n = i + 1;
+    if (isGroupStart(line.text)) {
+      group = { kind: "group", header: line, n, lines: [], last: n, ended: false };
+      out.push(group);
+    } else if (group && isGroupEnd(line.text)) {
+      group.ended = true;
+      group.last = n;
+      group = null;
+    } else if (group) {
+      group.lines.push({ line, n });
+      group.last = n;
+    } else {
+      out.push({ kind: "line", line, n });
+    }
+  });
+  return out;
+}
+
+/**
+ * A link to lines of a job's log: #step:S:L or #step:S:L-M, with S the
+ * step's number (from 1) and L the line's within the step, as on GitHub.
+ */
+export interface LineTarget {
+  step: number; // index into the job's steps
+  from: number;
+  to: number;
+}
+
+export function parseLineHash(hash: string): LineTarget | undefined {
+  // Annotations link to lines by their element's id: #step-2-L14, with the
+  // step's index.
+  const id = /^#step-(-?\d+)-L(\d+)$/.exec(hash);
+  if (id) return { step: Number(id[1]), from: Number(id[2]), to: Number(id[2]) };
+  const m = /^#step:(-?\d+)(?::(\d+)(?:-(\d+))?)?$/.exec(hash);
+  if (!m) return undefined;
+  const from = m[2] ? Number(m[2]) : 0;
+  const to = m[3] ? Number(m[3]) : from;
+  return { step: Number(m[1]) - 1, from: Math.min(from, to), to: Math.max(from, to) };
+}
+
+export function lineHash(step: number, from: number, to = from): string {
+  return `#step:${step + 1}` + (from ? `:${from}${to !== from ? `-${to}` : ""}` : "");
+}
+
+export function lineID(step: number, n: number): string {
+  return `step-${step}-L${n}`;
+}
 
 function classify(text: string): { cls: string; text: string } {
   if (text.startsWith("##[act]")) return { cls: "log-act", text: text.slice(7) };
@@ -392,34 +662,117 @@ function classify(text: string): { cls: string; text: string } {
   return { cls: "", text };
 }
 
+// Stop counting search matches after this many.
+const maxMatches = 10000;
+
+interface Match {
+  step: number;
+  n: number;
+}
+
+/** Lines whose shown text contains query (ignoring case), in the order shown. */
+function findMatches(steps: { index: number }[], byStep: Record<number, LogLine[]>, query: string): Match[] {
+  const q = query.toLowerCase();
+  const out: Match[] = [];
+  if (!q) return out;
+  for (const { index } of steps) {
+    const lines = byStep[index] ?? [];
+    for (let i = 0; i < lines.length; i++) {
+      const { cls, text } = classify(lines[i].text);
+      if (cls === "log-endgroup") continue;
+      if (stripAnsi(text).toLowerCase().includes(q)) {
+        out.push({ step: index, n: i + 1 });
+        if (out.length >= maxMatches) return out;
+      }
+    }
+  }
+  return out;
+}
+
+/** Splits segments where they match query (ignoring case), marking the matches. */
+function highlight(segs: Segment[], query: string): (Segment & { match?: boolean })[] {
+  if (!query) return segs;
+  const q = query.toLowerCase();
+  const plain = segs.map((s) => s.text).join("").toLowerCase();
+  const ranges: [number, number][] = [];
+  for (let i = plain.indexOf(q); i >= 0; i = plain.indexOf(q, i + q.length)) ranges.push([i, i + q.length]);
+  if (!ranges.length) return segs;
+  const out: (Segment & { match?: boolean })[] = [];
+  let pos = 0;
+  let r = 0;
+  for (const seg of segs) {
+    const end = pos + seg.text.length;
+    let at = pos;
+    while (at < end) {
+      while (r < ranges.length && ranges[r][1] <= at) r++;
+      const inMatch = r < ranges.length && ranges[r][0] <= at;
+      const stop = r >= ranges.length ? end : Math.min(end, inMatch ? ranges[r][1] : ranges[r][0]);
+      out.push({ ...seg, text: seg.text.slice(at - pos, stop - pos), match: inMatch });
+      at = stop;
+    }
+    pos = end;
+  }
+  return out;
+}
+
 function fmtTs(ts: number): string {
   const d = new Date(ts);
   return d.toLocaleTimeString(undefined, { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
 const LogLineRow = memo(function LogLineRow({
+  step,
   n,
   line,
-  showTs,
-  anchor,
-  selected,
+  marked,
+  current,
+  onToggle,
+  open,
 }: {
+  step: number;
   n: number;
   line: LogLine;
-  showTs: boolean;
-  anchor: string;
-  selected: boolean;
+  marked: boolean;
+  current: boolean;
+  /** Set for a group's header: folds or unfolds the group. */
+  onToggle?: () => void;
+  open?: boolean;
 }) {
+  const { showTs, onSelect, query } = useContext(LineViewContext);
   const { cls, text } = classify(line.text);
   if (cls === "log-endgroup") return null;
-  const segs = ansiToSegments(text);
+  const segs = highlight(ansiToSegments(text), query);
   return (
-    <div className={classes("log-line", cls, selected && "log-line-selected")} id={anchor}>
-      <a className="ln" href={`#${anchor}`} data-n={n} aria-label={`Line ${n}`} />
+    <div className={classes("log-line", cls, onToggle && "log-group-header", marked && "log-marked", current && "log-current")} id={lineID(step, n)} onClick={onToggle}>
+      <a
+        className="ln"
+        href={lineHash(step, n)}
+        data-n={n}
+        aria-label={`Line ${n}`}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onSelect(step, n, e.shiftKey);
+        }}
+      />
       {showTs && <span className="ts">{fmtTs(line.ts)}</span>}
+      {onToggle && (
+        <button
+          type="button"
+          className={classes("group-chevron", open && "group-chevron-open")}
+          aria-expanded={open}
+          aria-label={open ? "Collapse group" : "Expand group"}
+        >
+          <Icon name="chevron" size={10} />
+        </button>
+      )}
       <span className="lt">
         {segs.map((s, i) =>
-          s.cls || s.style ? (
+          s.match ? (
+            <mark key={i} className={s.cls} style={s.style}>
+              {s.text}
+            </mark>
+          ) : s.cls || s.style ? (
             <span key={i} className={s.cls} style={s.style}>
               {s.text}
             </span>

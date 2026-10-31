@@ -112,6 +112,9 @@ export function buildGroups(run: Run, plan: PlanEntry[], all: Job[]): PlanGroup[
     depth.set(key, v);
     return v;
   };
+  // A re-run's kept matrix jobs come before the ones it runs again: show
+  // them in the matrix's order, by name.
+  for (const list of byKey.values()) list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
   return entries.map((e) => {
     const js = byKey.get(e.key) ?? [];
     let state: VisualState;

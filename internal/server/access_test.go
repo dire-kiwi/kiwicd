@@ -225,6 +225,8 @@ func TestRouteAccess(t *testing.T) {
 		"DELETE /api/repos/{owner}/{name}/uploaded-workflows/{file}": {{"DELETE", "/api/repos/t/b/uploaded-workflows/x.yml", maintain("t/b")}},
 
 		"GET /api/runs":                        {{"GET", "/api/runs", signedIn}},
+		"GET /api/runs/filters":                {{"GET", "/api/runs/filters", signedIn}},
+		"GET /api/runs/{id}/logs":              {{"GET", "/api/runs/" + id(a.run["t/b"]) + "/logs", view("t/b")}},
 		"GET /api/runs/{id}":                   {{"GET", "/api/runs/" + id(run), view("t/a")}, {"GET", "/api/runs/" + id(a.run["t/b"]), view("t/b")}},
 		"POST /api/runs/{id}/cancel":           {{"POST", "/api/runs/" + id(run) + "/cancel", maintain("t/a")}},
 		"POST /api/runs/{id}/rerun":            {{"POST", "/api/runs/" + id(a.run["t/b"]) + "/rerun", maintain("t/b")}},
@@ -253,7 +255,7 @@ func TestRouteAccess(t *testing.T) {
 	public := []string{"GET /healthz", "POST /api/login", "POST /api/logout", "GET /api/auth/providers", "GET /api/auth/github",
 		"GET /api/auth/github/callback", "POST /api/github/webhook", "POST /api/hooks/{owner}/{name}", "POST /api/runner/register",
 		"POST /api/runner/poll", "POST /api/runner/jobs/{id}/update", "POST /api/runner/jobs/{id}/complete",
-		"GET /api/runner/jobs/{id}/source", "/git/", "/"}
+		"GET /api/runner/jobs/{id}/source", "GET /api/repos/{owner}/{name}/badge/{file...}", "/git/", "/"}
 
 	for _, rt := range a.srv.routes() {
 		if rt.need == roleNone {

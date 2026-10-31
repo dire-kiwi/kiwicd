@@ -44,6 +44,14 @@ type Repo struct {
 	// Whether pull requests from forks run pull_request workflows; see
 	// pullrequest.go.
 	ForkPullRequests bool `json:"fork_pull_requests"`
+	// PublicBadges serves the status badges of the repository's workflows
+	// without signing in (see badge.go).
+	PublicBadges bool `json:"public_badges"`
+	// RepoWorkflows runs the repository's own .github/workflows/ files. Off
+	// for mirrors whose workflows are GitHub Actions' (they'd ask for
+	// runs-on labels like ubuntu-latest that no runner has and queue
+	// forever); uploaded workflows still run. See workflowsAt.
+	RepoWorkflows bool `json:"repo_workflows"`
 	// Branches whose runs get secrets, for the UI.
 	ProtectedBranches []string `json:"protected_branches,omitempty"`
 	CloneURL          string   `json:"clone_url,omitempty"`
@@ -51,13 +59,14 @@ type Repo struct {
 }
 
 const repoCols = `id, name, kind, url, default_branch, webhook_secret, refs, last_sync_at, last_sync_error, created_at,
-	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs, report_checks, fork_pull_requests`
+	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs, report_checks, fork_pull_requests, public_badges, repo_workflows`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
 	var refs, readers, protectedRefs string
 	if err := row.Scan(&r.ID, &r.Name, &r.Kind, &r.URL, &r.DefaultBranch, &r.WebhookSecret, &refs, &r.LastSyncAt, &r.LastSyncError, &r.CreatedAt,
-		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs, &r.ReportChecks, &r.ForkPullRequests); err != nil {
+		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs, &r.ReportChecks, &r.ForkPullRequests,
+		&r.PublicBadges, &r.RepoWorkflows); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(refs), &r.Refs)
@@ -265,6 +274,8 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		ProtectedRefs    *[]string `json:"protected_refs"`
 		ReportChecks     *bool     `json:"report_checks"`
 		ForkPullRequests *bool     `json:"fork_pull_requests"`
+		PublicBadges     *bool     `json:"public_badges"`
+		RepoWorkflows    *bool     `json:"repo_workflows"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		httpError(w, 400, "bad request: %v", err)
@@ -340,6 +351,12 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		repo.SSHKey, repo.SSHPublicKey = s.sealSSHKey(ssh.key), ssh.public
 	}
+	if req.PublicBadges != nil {
+		repo.PublicBadges = *req.PublicBadges
+	}
+	if req.RepoWorkflows != nil {
+		repo.RepoWorkflows = *req.RepoWorkflows
+	}
 	if req.SSHKnownHosts != nil {
 		ssh, err := newSSHSettings(repo.Name, "", false, *req.SSHKnownHosts)
 		if err != nil {
@@ -352,8 +369,9 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 	lock := s.repoLock(repo.ID)
 	lock.Lock()
 	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ?, protected_refs = ?,
-		report_checks = ?, fork_pull_requests = ? WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers),
-		mustJSON(repo.ProtectedRefs), repo.ReportChecks, repo.ForkPullRequests, repo.ID)
+		report_checks = ?, fork_pull_requests = ?, public_badges = ?, repo_workflows = ? WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey,
+		repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers), mustJSON(repo.ProtectedRefs), repo.ReportChecks, repo.ForkPullRequests,
+		repo.PublicBadges, repo.RepoWorkflows, repo.ID)
 	if err == nil && req.SSHKnownHosts != nil && repo.SSHKnownHosts == "" {
 		// Forget pinned host keys: the next connection trusts the host again.
 		err = os.Remove(s.knownHostsPath(repo.ID))
@@ -395,6 +413,12 @@ func (s *Server) auditRepoChanges(r *http.Request, old, repo *Repo, sshKey, know
 	}
 	if old.ForkPullRequests != repo.ForkPullRequests {
 		s.audit(r, "repo.settings", repo.Name, "fork pull requests", fmt.Sprint(repo.ForkPullRequests))
+	}
+	if old.PublicBadges != repo.PublicBadges {
+		s.audit(r, "repo.settings", repo.Name, "public badges", fmt.Sprint(repo.PublicBadges))
+	}
+	if old.RepoWorkflows != repo.RepoWorkflows {
+		s.audit(r, "repo.settings", repo.Name, "repository workflows", fmt.Sprint(repo.RepoWorkflows))
 	}
 	if old.DefaultBranch != repo.DefaultBranch {
 		s.audit(r, "repo.settings", repo.Name, "default branch", old.DefaultBranch+" → "+repo.DefaultBranch)
@@ -689,8 +713,9 @@ func (s *Server) runPushWorkflows(ctx context.Context, repo *Repo, ref, after st
 		src := files[file]
 		w, perr := wf.Parse(src)
 		if perr != nil {
-			// Only report broken workflows that look like they listen for pushes.
-			if strings.Contains(string(src), "push") {
+			// As on GitHub, an invalid workflow gets a failed run showing
+			// the error: if its triggers can be read, when they'd run it.
+			if t := wf.Triggers(src); t == nil || wf.MatchesPush(t, ref, changed) {
 				_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: file, event: "push",
 					payload: event, ref: ref, sha: after, actor: commit.Author, title: commit.Subject, parseErr: perr})
 			}
@@ -742,7 +767,8 @@ func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, 
 		listeners = append(listeners, repo)
 	}
 	rows.Close()
-	// Report broken workflows that look like they listen to src.
+	// Report invalid workflows whose triggers can't be read if they look
+	// like they listen to src.
 	broken := mentionsRepo(src.Name).Match
 	var firstErr error
 	for _, repo := range listeners {
@@ -756,8 +782,9 @@ func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, 
 
 // startDefaultBranchRuns starts the workflows on repo's default branch that
 // listen for spec.event and that matches accepts, at the branch's tip, and
-// returns their runs. Workflows that don't parse get a failed run if broken
-// says they look like listeners (broken may be nil).
+// returns their runs. Workflows that don't parse get a failed run if their
+// triggers match or, when those can't be read, if broken says they look like
+// listeners (broken may be nil).
 func (s *Server) startDefaultBranchRuns(ctx context.Context, repo *Repo, spec runSpec, broken func([]byte) bool,
 	matches func(*model.Workflow) bool) ([]int64, error) {
 	ref := "refs/heads/" + repo.DefaultBranch
@@ -779,7 +806,7 @@ func (s *Server) startDefaultBranchRuns(ctx context.Context, repo *Repo, spec ru
 		spec.file, spec.yaml, spec.name, spec.parseErr = file, string(yaml), file, nil
 		w, perr := wf.Parse(yaml)
 		if perr != nil {
-			if broken != nil && broken(yaml) {
+			if t := wf.Triggers(yaml); (t != nil && matches(t)) || (t == nil && broken != nil && broken(yaml)) {
 				spec.parseErr = perr
 				_, _ = s.createRun(ctx, spec)
 			}

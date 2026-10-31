@@ -35,13 +35,13 @@ Usage:
   kiwicd repo dispatch OWNER/NAME EVENT_TYPE [--payload JSON]
   kiwicd workflow list OWNER/NAME [--ref REF]
 
-  kiwicd run list [--repo OWNER/NAME] [--limit N]
+  kiwicd run list [--repo OWNER/NAME] [--workflow FILE] [--branch B] [--event E] [--status S] [--actor A] [--limit N]
   kiwicd run view RUN
   kiwicd run start OWNER/NAME WORKFLOW [--ref REF] [-i NAME=VALUE]... [--watch]
   kiwicd run watch RUN
   kiwicd run logs RUN [--job JOB] [--failed] [--follow] [--timestamps]
   kiwicd run cancel RUN
-  kiwicd run rerun RUN [--watch]
+  kiwicd run rerun RUN [--failed | --job JOB] [--debug] [--watch]
 
   kiwicd secret list [--repo OWNER/NAME]
   kiwicd secret set NAME [--repo OWNER/NAME] [--value VALUE | --from-file PATH]
@@ -568,7 +568,13 @@ func workflowList(ctx context.Context, a *App, args []string) error {
 
 func runList(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("run list", flag.ContinueOnError)
-	repo := fs.String("repo", "", "only this repository's runs (OWNER/NAME)")
+	var f RunFilter
+	fs.StringVar(&f.Repo, "repo", "", "only this repository's runs (OWNER/NAME)")
+	fs.StringVar(&f.Workflow, "workflow", "", "only this workflow's runs (its file, e.g. ci.yml)")
+	fs.StringVar(&f.Branch, "branch", "", "only runs of this branch (or full ref)")
+	fs.StringVar(&f.Event, "event", "", "only runs started by this event (push, workflow_dispatch, ...)")
+	fs.StringVar(&f.Status, "status", "", "only runs that are queued, in_progress or completed, or ended in success, failure, cancelled or skipped")
+	fs.StringVar(&f.Actor, "actor", "", "only runs started by this user")
 	limit := fs.Int("limit", 20, "how many runs, newest first (at most 500)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if _, err := flags(fs, args, 0, 0); err != nil {
@@ -578,7 +584,7 @@ func runList(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	runs, err := c.Runs(ctx, *repo, *limit)
+	runs, err := c.Runs(ctx, f, *limit)
 	if err != nil {
 		return err
 	}
@@ -787,6 +793,9 @@ func runCancel(ctx context.Context, a *App, args []string) error {
 func runRerun(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("run rerun", flag.ContinueOnError)
 	watch := fs.Bool("watch", false, "wait for the new run to finish, and fail if it does")
+	failed := fs.Bool("failed", false, "re-run only the jobs that failed or were cancelled, and the jobs that need them")
+	job := fs.String("job", "", "re-run only this job (its ID, key or name) and the jobs that need it")
+	debug := fs.Bool("debug", false, "turn on debug logging (ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG)")
 	pos, err := flags(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -795,11 +804,29 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *failed && *job != "" {
+		return errors.New("--failed and --job don't go together")
+	}
 	c, err := a.api()
 	if err != nil {
 		return err
 	}
-	newID, err := c.Rerun(ctx, id)
+	opts := RerunOptions{Failed: *failed, Debug: *debug}
+	if *job != "" {
+		d, err := c.Run(ctx, id)
+		if err != nil {
+			return err
+		}
+		jobs, err := selectJobs(d.Jobs, *job, false)
+		if err != nil {
+			return err
+		}
+		if len(jobs) > 1 {
+			return fmt.Errorf("%q is %d jobs (a matrix?); pick one by its ID or full name", *job, len(jobs))
+		}
+		opts.JobID = jobs[0].ID
+	}
+	newID, err := c.Rerun(ctx, id, opts)
 	if err != nil {
 		return err
 	}

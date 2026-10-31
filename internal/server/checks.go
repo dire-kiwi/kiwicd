@@ -554,7 +554,7 @@ func (s *Server) onCheckRerequest(event string, body []byte) ([]int64, error) {
 		if run, err = s.getRun(latest); err != nil || run.Status != protocol.StatusCompleted {
 			continue
 		}
-		newID, err := s.rerun(context.Background(), run)
+		newID, err := s.rerun(context.Background(), run, rerunOptions{})
 		if err != nil {
 			s.log.Error("re-run from GitHub", "run", run.ID, "err", err)
 			continue

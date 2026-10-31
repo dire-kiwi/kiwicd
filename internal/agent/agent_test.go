@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nektos/act/pkg/model"
+	"github.com/sirupsen/logrus"
 )
 
 func tarGz(t *testing.T, entries []tar.Header, bodies map[string]string) *bytes.Buffer {
@@ -84,5 +86,54 @@ func TestMaskMultilineSecrets(t *testing.T) {
 	r.logf(0, "error: %s", "abcdef")
 	if got := r.pending[len(r.pending)-1].Text; strings.Contains(got, "abc") {
 		t.Errorf("agent message not masked: %q", got)
+	}
+}
+
+func TestGroupCommands(t *testing.T) {
+	r := newReporter(nil, 1, &model.Job{}, map[string]string{"KEY": "hunter22"}, nil)
+	entry := func(level logrus.Level, msg string, data logrus.Fields) {
+		r.handle(&logrus.Entry{Level: level, Message: msg, Data: data, Time: time.Now()})
+	}
+	entry(logrus.InfoLevel, "  ❓  ::group::Build hunter22\n", logrus.Fields{"command": "group", "arg": "Build hunter22", "raw": "::group::Build hunter22\n"})
+	entry(logrus.InfoLevel, "make", logrus.Fields{"raw_output": true})
+	entry(logrus.InfoLevel, "  ❓  ::endgroup::\n", logrus.Fields{"command": "endgroup", "arg": "", "raw": "::endgroup::\n"})
+	entry(logrus.WarnLevel, "  🚧  ::warning::careful\n", logrus.Fields{"command": "warning", "arg": "careful"})
+	var got []string
+	for _, l := range r.pending {
+		got = append(got, l.Text)
+	}
+	want := []string{"##[group]Build ***", "make", "##[endgroup]", "##[warning]careful"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("lines = %q, want %q", got, want)
+	}
+}
+
+func TestDebugLines(t *testing.T) {
+	for _, tc := range []struct {
+		step, runner bool
+		want         string
+	}{
+		{false, false, "out"},
+		{true, false, "##[debug]checking ***|out"},
+		{true, true, "##[debug]checking ***|##[debug]evaluating if|out"},
+	} {
+		r := newReporter(nil, 1, &model.Job{}, map[string]string{"KEY": "hunter22"}, nil)
+		r.stepDebug, r.runnerDebug = tc.step, tc.runner
+		for _, e := range []*logrus.Entry{
+			{Level: logrus.DebugLevel, Message: "  💬  ::debug::checking hunter22\n", Data: logrus.Fields{"command": "debug", "arg": "checking hunter22"}},
+			{Level: logrus.DebugLevel, Message: "evaluating if", Data: logrus.Fields{}},
+			{Level: logrus.DebugLevel, Message: "setupEnv => map[HOME:/root AGENT_ONLY:x]", Data: logrus.Fields{}},
+			{Level: logrus.InfoLevel, Message: "out", Data: logrus.Fields{"raw_output": true}},
+		} {
+			e.Time = time.Now()
+			r.handle(e)
+		}
+		var got []string
+		for _, l := range r.pending {
+			got = append(got, l.Text)
+		}
+		if strings.Join(got, "|") != tc.want {
+			t.Errorf("step debug %v, runner debug %v: lines %q, want %q", tc.step, tc.runner, got, tc.want)
+		}
 	}
 }

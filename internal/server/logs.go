@@ -1,13 +1,17 @@
 package server
 
 import (
+	"archive/zip"
 	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -92,13 +96,37 @@ func (s *Server) logPage(jobID, after int64, limit int) ([]logLine, bool, error)
 // handleJobLogs returns one page of a job's log as JSON, starting after
 // ?after= and at most ?limit= lines long. When more lines follow, a Link
 // header (rel="next") points at the next page. ?format=text streams the
-// whole log as plain text instead.
+// whole log as plain text instead, and with ?download=1 as a file to save.
 func (s *Server) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 	id := pathID(r)
 	q := r.URL.Query()
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
 	if q.Get("format") == "text" {
-		s.writeTextLogs(w, id, after)
+		var name string
+		if q.Get("download") != "" {
+			job, err := s.getJob(id)
+			if err != nil {
+				httpError(w, 404, "no such job")
+				return
+			}
+			run, err := s.getRun(job.RunID)
+			if err != nil {
+				httpError(w, 404, "no such run")
+				return
+			}
+			name = fmt.Sprintf("%s-%s.log", runFileName(run), fileNamePart(job.Name))
+		}
+		started := false
+		err := s.copyTextLogs(w, id, after, func() {
+			started = true
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			if name != "" {
+				w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+			}
+		})
+		if err != nil && !started {
+			httpError(w, 500, "%v", err)
+		}
 		return
 	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
@@ -115,10 +143,11 @@ func (s *Server) handleJobLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, lines)
 }
 
-// writeTextLogs streams a job's log a page at a time. Each page is formatted
-// into a buffer and written after its rows are closed, so a slow client
-// doesn't hold the database connection.
-func (s *Server) writeTextLogs(w http.ResponseWriter, jobID, after int64) {
+// copyTextLogs writes a job's log after seq after to w as text, a page at a
+// time, calling start before writing anything. Each page is formatted into
+// a buffer and written after its rows are closed, so a slow client doesn't
+// hold the database connection.
+func (s *Server) copyTextLogs(w io.Writer, jobID, after int64, start func()) error {
 	var buf bytes.Buffer
 	for page := 0; ; page++ {
 		buf.Reset()
@@ -130,18 +159,72 @@ func (s *Server) writeTextLogs(w http.ResponseWriter, jobID, after int64) {
 			after = l.Seq
 		})
 		if err != nil {
-			if page == 0 {
-				httpError(w, 500, "%v", err)
-			}
-			return
+			return err
 		}
-		if page == 0 {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if page == 0 && start != nil {
+			start()
 		}
 		if _, err := w.Write(buf.Bytes()); err != nil || !more {
+			return err
+		}
+	}
+}
+
+// handleRunLogs sends the logs of all of a run's jobs as a zip file, one
+// text file per job.
+func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
+	run, err := s.getRun(pathID(r))
+	if err != nil {
+		httpError(w, 404, "no such run")
+		return
+	}
+	jobs, err := s.runJobs(run.ID)
+	if err != nil {
+		httpError(w, 500, "%v", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": runFileName(run) + "-logs.zip"}))
+	zw := zip.NewWriter(w)
+	for i, j := range jobs {
+		modified := time.UnixMilli(max(j.FinishedAt, j.StartedAt, j.CreatedAt))
+		f, err := zw.CreateHeader(&zip.FileHeader{Name: fmt.Sprintf("%d_%s.txt", i+1, fileNamePart(j.Name)), Method: zip.Deflate, Modified: modified})
+		if err == nil {
+			err = s.copyTextLogs(f, j.ID, 0, nil)
+		}
+		if err != nil {
+			// The response has begun: leave the zip unfinished, so it
+			// doesn't look complete.
+			s.log.Warn("run logs zip", "run", run.ID, "job", j.ID, "err", err)
 			return
 		}
 	}
+	_ = zw.Close()
+}
+
+// runFileName names files downloaded from a run: owner-name-run-12, with
+// -attempt-2 for re-runs.
+func runFileName(run *Run) string {
+	name := fmt.Sprintf("%s-run-%d", fileNamePart(strings.ReplaceAll(run.Repo, "/", "-")), run.Number)
+	if run.Attempt > 1 {
+		name += fmt.Sprintf("-attempt-%d", run.Attempt)
+	}
+	return name
+}
+
+// fileNamePart makes s safe in a file name: path separators, characters
+// Windows refuses and control characters become _.
+func fileNamePart(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(`/\:*?"<>|`, r) {
+			return '_'
+		}
+		return r
+	}, strings.TrimSpace(s))
+	if s == "" || s == "." || s == ".." {
+		return "_"
+	}
+	return s
 }
 
 // truncateLogLine cuts text to maxLogLineBytes, on a UTF-8 boundary, and

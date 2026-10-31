@@ -281,6 +281,28 @@ var migrations = []struct{ table, column, sql string }{
 	// (see concurrency.go).
 	{"runs", "concurrency_group", `ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
+	// Job-level concurrency group, evaluated when the job was created; its
+	// jobs wait as pending (see concurrency.go).
+	{"jobs", "concurrency_group", `ALTER TABLE jobs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
+		CREATE INDEX IF NOT EXISTS jobs_concurrency ON jobs(concurrency_group, status) WHERE concurrency_group != ''`},
+	// The job's continue-on-error: its failure doesn't fail the run.
+	{"jobs", "continue_on_error", `ALTER TABLE jobs ADD COLUMN continue_on_error INTEGER NOT NULL DEFAULT 0`},
+	// strategy.max-parallel: how many of a matrix's jobs run at once; 0 for
+	// no limit.
+	{"jobs", "max_parallel", `ALTER TABLE jobs ADD COLUMN max_parallel INTEGER NOT NULL DEFAULT 0`},
+	// The workflow's and the job's permissions (JSON protocol.Permissions,
+	// null when not set). They have no effect yet.
+	{"runs", "permissions", `ALTER TABLE runs ADD COLUMN permissions TEXT NOT NULL DEFAULT 'null'`},
+	{"jobs", "permissions", `ALTER TABLE jobs ADD COLUMN permissions TEXT NOT NULL DEFAULT 'null'`},
+	// Re-runs of some jobs: what a run keeps from its earlier attempt, and
+	// where a kept job came from (see rerun.go).
+	{"runs", "reuse_jobs", `ALTER TABLE runs ADD COLUMN reuse_jobs TEXT NOT NULL DEFAULT ''`},
+	{"jobs", "copied_from", `ALTER TABLE jobs ADD COLUMN copied_from INTEGER NOT NULL DEFAULT 0`},
+	{"jobs", "copied_attempt", `ALTER TABLE jobs ADD COLUMN copied_attempt INTEGER NOT NULL DEFAULT 0`},
+	// A re-run with debug logging (see Run.Debug).
+	{"runs", "debug", `ALTER TABLE runs ADD COLUMN debug INTEGER NOT NULL DEFAULT 0`},
+	// Status badges anyone may fetch (see badge.go).
+	{"repos", "public_badges", `ALTER TABLE repos ADD COLUMN public_badges INTEGER NOT NULL DEFAULT 0`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
 	// An API token's scope (see access.go): '' and [] for its maker's full
@@ -301,6 +323,9 @@ var migrations = []struct{ table, column, sql string }{
 	{"repos", "fork_pull_requests", `ALTER TABLE repos ADD COLUMN fork_pull_requests INTEGER NOT NULL DEFAULT 0`},
 	// How many workflow_run events led to a run: 0 for others (see triggers.go).
 	{"runs", "trigger_depth", `ALTER TABLE runs ADD COLUMN trigger_depth INTEGER NOT NULL DEFAULT 0`},
+	// Whether the repository's own .github/workflows/ files run (see
+	// workflowsAt); off for mirrors whose workflows run on GitHub Actions.
+	{"repos", "repo_workflows", `ALTER TABLE repos ADD COLUMN repo_workflows INTEGER NOT NULL DEFAULT 1`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

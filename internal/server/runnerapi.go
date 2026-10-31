@@ -183,8 +183,8 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // assignJob gives the oldest queued job whose runs-on labels the runner has
-// and whose run may use the runner's reserved and protected labels.
-// Agents older than protocol.CalledJobsVersion don't get jobs of reusable
+// and whose run may use the runner's reserved and protected labels, leaving
+// a matrix's jobs queued while max-parallel of them run. Agents older than protocol.CalledJobsVersion don't get jobs of reusable
 // workflows, which they would run without their inputs.
 func (s *Server) assignJob(ctx context.Context, rn *Runner, agentProtocol int, baseURL string) (*protocol.JobRequest, error) {
 	s.mu.Lock()
@@ -212,7 +212,20 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, agentProtocol int, b
 	// forever: fail them.
 	denied := map[int64]string{}
 	limited := s.reserved.reservesAny(rn.Labels) || len(s.protectedLabels.of(rn.Labels)) > 0
+	running := map[string]int{} // of a matrix with max-parallel, by run and job key
 	for _, j := range candidates {
+		if j.MaxParallel > 0 {
+			k := fmt.Sprintf("%d/%s", j.RunID, j.Key)
+			n, ok := running[k]
+			if !ok {
+				_ = s.db.QueryRow(`SELECT count(*) FROM jobs WHERE run_id = ? AND job_key = ? AND status = ?`,
+					j.RunID, j.Key, protocol.StatusInProgress).Scan(&n)
+				running[k] = n
+			}
+			if n >= j.MaxParallel {
+				continue
+			}
+		}
 		if limited {
 			run, err := s.getRun(j.RunID)
 			if err != nil {
@@ -346,6 +359,17 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 			return nil, err
 		}
 	}
+	// Debug logging is on for a re-run with it, or with the secret or
+	// variable ACTIONS_STEP_DEBUG or ACTIONS_RUNNER_DEBUG set to true, as on
+	// GitHub.
+	vars := s.varsFor(run.RepoID)
+	debugOn := func(name string) bool {
+		return run.Debug || strings.EqualFold(secrets[name], "true") || strings.EqualFold(vars[name], "true")
+	}
+	stepDebug, runnerDebug := debugOn("ACTIONS_STEP_DEBUG"), debugOn("ACTIONS_RUNNER_DEBUG")
+	if stepDebug || runnerDebug {
+		env["RUNNER_DEBUG"] = "1"
+	}
 	token, err := s.issueJobToken(j.ID)
 	if err != nil {
 		return nil, err
@@ -370,9 +394,12 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		Event:          run.EventJSON,
 		Actor:          run.Actor,
 		Secrets:        secrets,
-		Vars:           s.varsFor(run.RepoID),
+		Vars:           vars,
 		Notices:        notices,
+		StepDebug:      stepDebug,
+		RunnerDebug:    runnerDebug,
 		Env:            env,
+		Permissions:    j.Permissions,
 		TimeoutMinutes: 360,
 		ServerURL:      server,
 		SourcePath:     fmt.Sprintf("/api/runner/jobs/%d/source", j.ID),

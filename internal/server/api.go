@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -26,12 +28,16 @@ func pathID(r *http.Request) int64 {
 	return id
 }
 
+// handleListRuns lists the latest runs, newest first. These narrow it:
+// ?repo=OWNER/NAME, ?workflow= (its file, or the file name in
+// .github/workflows), ?branch= (a branch name or a full ref), ?event=,
+// ?actor= and ?status= (queued, in_progress or completed, or a conclusion:
+// success, failure, cancelled or skipped).
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	q := `SELECT ` + runCols + ` FROM runs r JOIN repos p ON p.id = r.repo_id WHERE 1`
-	var args []any
-	if repo := r.URL.Query().Get("repo"); repo != "" {
-		q += ` AND p.name = ?`
-		args = append(args, repo)
+	where, args := runFilters(r.URL.Query())
+	for _, cond := range where {
+		q += ` AND ` + cond
 	}
 	if p := requestPrincipal(r); p.repos != nil {
 		q += ` AND p.name IN (SELECT value FROM json_each(?))`
@@ -60,6 +66,95 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		runs = append(runs, run)
 	}
 	writeJSON(w, runs)
+}
+
+// runFilters turns handleListRuns' query parameters into SQL conditions on
+// runs r joined with repos p.
+func runFilters(v url.Values) (where []string, args []any) {
+	if repo := v.Get("repo"); repo != "" {
+		where, args = append(where, `p.name = ?`), append(args, repo)
+	}
+	if file := v.Get("workflow"); file != "" {
+		where, args = append(where, `(r.workflow_file = ? OR r.workflow_file = '.github/workflows/' || ?)`), append(args, file, file)
+	}
+	if branch := v.Get("branch"); branch != "" {
+		where, args = append(where, `(r.ref = ? OR r.ref = 'refs/heads/' || ?)`), append(args, branch, branch)
+	}
+	if event := v.Get("event"); event != "" {
+		where, args = append(where, `r.event = ?`), append(args, event)
+	}
+	if actor := v.Get("actor"); actor != "" {
+		where, args = append(where, `r.actor = ?`), append(args, actor)
+	}
+	switch status := v.Get("status"); status {
+	case "":
+	case protocol.StatusQueued, protocol.StatusInProgress, protocol.StatusCompleted, protocol.StatusPending:
+		where, args = append(where, `r.status = ?`), append(args, status)
+	default:
+		where, args = append(where, `r.status = ? AND r.conclusion = ?`), append(args, protocol.StatusCompleted, status)
+	}
+	return where, args
+}
+
+// handleRunFilters lists the values the runs list can be filtered by, from
+// the latest runs (of ?repo=, if given): workflows, refs, events and actors.
+func (s *Server) handleRunFilters(w http.ResponseWriter, r *http.Request) {
+	recent := `SELECT r.id, r.workflow_file, r.workflow_name, r.ref, r.event, r.actor FROM runs r JOIN repos p ON p.id = r.repo_id WHERE 1`
+	var args []any
+	if repo := r.URL.Query().Get("repo"); repo != "" {
+		recent += ` AND p.name = ?`
+		args = append(args, repo)
+	}
+	if p := requestPrincipal(r); p.repos != nil {
+		recent += ` AND p.name IN (SELECT value FROM json_each(?))`
+		args = append(args, mustJSON(p.repos))
+	}
+	recent += ` ORDER BY r.id DESC LIMIT 5000`
+	type workflow struct {
+		File string `json:"file"`
+		Name string `json:"name"`
+	}
+	out := struct {
+		Workflows []workflow `json:"workflows"`
+		Refs      []string   `json:"refs"`
+		Events    []string   `json:"events"`
+		Actors    []string   `json:"actors"`
+	}{[]workflow{}, []string{}, []string{}, []string{}}
+	// Each file with its latest name: SQLite takes a bare column from the
+	// row with the MAX.
+	rows, err := s.db.Query(`SELECT workflow_file, workflow_name, MAX(id) FROM (`+recent+`) GROUP BY workflow_file ORDER BY workflow_name, workflow_file`, args...)
+	if err != nil {
+		httpError(w, 500, "%v", err)
+		return
+	}
+	for rows.Next() {
+		var f workflow
+		var id int64
+		if err := rows.Scan(&f.File, &f.Name, &id); err != nil {
+			rows.Close()
+			httpError(w, 500, "%v", err)
+			return
+		}
+		out.Workflows = append(out.Workflows, f)
+	}
+	rows.Close()
+	for _, f := range []struct {
+		col string
+		to  *[]string
+	}{{"ref", &out.Refs}, {"event", &out.Events}, {"actor", &out.Actors}} {
+		rows, err := s.db.Query(`SELECT DISTINCT `+f.col+` FROM (`+recent+`) WHERE `+f.col+` != '' ORDER BY `+f.col, args...)
+		if err != nil {
+			httpError(w, 500, "%v", err)
+			return
+		}
+		for rows.Next() {
+			var v string
+			_ = rows.Scan(&v)
+			*f.to = append(*f.to, v)
+		}
+		rows.Close()
+	}
+	writeJSON(w, out)
 }
 
 type plannedJob struct {
@@ -140,13 +235,43 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
+// handleRerun starts a new attempt of a run. By default it runs every job
+// again; {"failed": true} re-runs the jobs that failed or were cancelled and
+// {"job_id": ID} that job, each with the jobs that need them, keeping the
+// other jobs' results (see rerun.go). "debug": true turns on debug logging
+// for the jobs that run.
 func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Failed bool  `json:"failed"`
+		JobID  int64 `json:"job_id"`
+		Debug  bool  `json:"debug"`
+	}
+	if err := readJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+		httpError(w, 400, "bad request: %v", err)
+		return
+	}
 	run, err := s.getRun(pathID(r))
 	if err != nil {
 		httpError(w, 404, "no such run")
 		return
 	}
-	id, err := s.rerun(r.Context(), run)
+	opts := rerunOptions{debug: req.Debug}
+	if req.Failed || req.JobID != 0 {
+		if run.Status != protocol.StatusCompleted {
+			httpError(w, 409, "the run hasn't finished; re-run some of its jobs once it has")
+			return
+		}
+		jobs, err := s.runJobs(run.ID)
+		if err != nil {
+			httpError(w, 500, "%v", err)
+			return
+		}
+		if opts.reuse, err = rerunPlan(run, jobs, req.Failed, req.JobID); err != nil {
+			httpError(w, 400, "%v", err)
+			return
+		}
+	}
+	id, err := s.rerun(r.Context(), run, opts)
 	if errors.Is(err, sql.ErrNoRows) {
 		httpError(w, 404, "repository is gone")
 		return
@@ -158,8 +283,15 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]int64{"run_id": id})
 }
 
+// rerunOptions are what a re-run keeps from the attempt it re-runs (nil:
+// nothing, every job runs again) and whether it has debug logging.
+type rerunOptions struct {
+	reuse *reusePlan
+	debug bool
+}
+
 // rerun starts the next attempt of run.
-func (s *Server) rerun(ctx context.Context, run *Run) (int64, error) {
+func (s *Server) rerun(ctx context.Context, run *Run, opts rerunOptions) (int64, error) {
 	repo, err := s.getRepoByID(run.RepoID)
 	if err != nil {
 		return 0, err
@@ -177,7 +309,7 @@ func (s *Server) rerun(ctx context.Context, run *Run) (int64, error) {
 	}
 	return s.createRun(ctx, runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1, called: list, depth: run.TriggerDepth})
+		number: run.Number, attempt: attempt + 1, called: list, depth: run.TriggerDepth, reuse: opts.reuse, debug: opts.debug})
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {

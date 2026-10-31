@@ -32,26 +32,34 @@ type Run struct {
 	Error        string         `json:"error"`
 	Cancel       bool           `json:"cancel_requested"`
 	Protected    bool           `json:"protected"` // its ref got secrets; see protectedrefs.go
+	// Debug turns on ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG for the
+	// run's jobs (a re-run with debug logging).
+	Debug bool `json:"debug,omitempty"`
 	// Concurrency group; see concurrency.go.
 	ConcurrencyGroup string `json:"concurrency_group,omitempty"`
 	// workflow_run events that led to it; see triggers.go.
 	TriggerDepth int64 `json:"-"`
-	CreatedAt    int64 `json:"created_at"`
-	StartedAt    int64 `json:"started_at"`
-	FinishedAt   int64 `json:"finished_at"`
+	// The workflow's permissions:, or nil.
+	Permissions *protocol.Permissions `json:"permissions"`
+	CreatedAt   int64                 `json:"created_at"`
+	StartedAt   int64                 `json:"started_at"`
+	FinishedAt  int64                 `json:"finished_at"`
 }
 
 const runCols = `r.id, r.repo_id, p.name, r.number, r.attempt, r.workflow_file, r.workflow_name, r.workflow_yaml, r.title, r.event, r.event_json,
-	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.concurrency_group, r.trigger_depth, r.created_at, r.started_at, r.finished_at`
+	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.debug, r.concurrency_group, r.trigger_depth, r.permissions,
+	r.created_at, r.started_at, r.finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
-	var ev string
+	var ev, perms string
 	if err := row.Scan(&r.ID, &r.RepoID, &r.Repo, &r.Number, &r.Attempt, &r.WorkflowFile, &r.WorkflowName, &r.WorkflowYAML, &r.Title, &r.Event, &ev,
-		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.ConcurrencyGroup, &r.TriggerDepth, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.Debug, &r.ConcurrencyGroup, &r.TriggerDepth, &perms,
+		&r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(ev), &r.EventJSON)
+	_ = json.Unmarshal([]byte(perms), &r.Permissions)
 	return &r, nil
 }
 
@@ -80,23 +88,38 @@ type Job struct {
 	Outputs    map[string]string    `json:"outputs"`
 	Steps      []protocol.StepState `json:"steps"`
 	Cancel     bool                 `json:"cancel_requested"`
-	LogSeq     int64                `json:"log_seq"`
-	CreatedAt  int64                `json:"created_at"`
-	StartedAt  int64                `json:"started_at"`
-	FinishedAt int64                `json:"finished_at"`
-	Heartbeat  int64                `json:"-"`
+	// Job-level concurrency group; a pending job waits for it.
+	ConcurrencyGroup string `json:"concurrency_group,omitempty"`
+	// A failure doesn't fail the run, and dependent jobs see success.
+	ContinueOnError bool `json:"continue_on_error"`
+	// strategy.max-parallel, or 0.
+	MaxParallel int `json:"max_parallel,omitempty"`
+	// The job's permissions (its own or its workflow's), or nil.
+	Permissions *protocol.Permissions `json:"permissions"`
+	LogSeq      int64                 `json:"log_seq"`
+	// A job a re-run kept from an earlier attempt: the job that ran, and
+	// the attempt it ran in (see rerun.go).
+	CopiedFrom    int64 `json:"copied_from,omitempty"`
+	CopiedAttempt int64 `json:"copied_attempt,omitempty"`
+	CreatedAt     int64 `json:"created_at"`
+	StartedAt     int64 `json:"started_at"`
+	FinishedAt    int64 `json:"finished_at"`
+	Heartbeat     int64 `json:"-"`
 }
 
 const jobCols = `id, run_id, job_key, name, parent_id, uses, inputs, matrix, runs_on, status, conclusion, error, runner_id, runner_name, outputs, steps,
-	cancel_requested, log_seq, created_at, started_at, finished_at, heartbeat_at`
+	cancel_requested, concurrency_group, continue_on_error, max_parallel, permissions, log_seq, copied_from, copied_attempt, created_at, started_at,
+	finished_at, heartbeat_at`
 
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
-	var inputs, matrix, runsOn, outputs, steps string
+	var inputs, matrix, runsOn, outputs, steps, perms string
 	if err := row.Scan(&j.ID, &j.RunID, &j.Key, &j.Name, &j.ParentID, &j.Uses, &inputs, &matrix, &runsOn, &j.Status, &j.Conclusion, &j.Error,
-		&j.RunnerID, &j.RunnerName, &outputs, &steps, &j.Cancel, &j.LogSeq, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Heartbeat); err != nil {
+		&j.RunnerID, &j.RunnerName, &outputs, &steps, &j.Cancel, &j.ConcurrencyGroup, &j.ContinueOnError, &j.MaxParallel, &perms,
+		&j.LogSeq, &j.CopiedFrom, &j.CopiedAttempt, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Heartbeat); err != nil {
 		return nil, err
 	}
+	_ = json.Unmarshal([]byte(perms), &j.Permissions)
 	_ = json.Unmarshal([]byte(inputs), &j.Inputs)
 	_ = json.Unmarshal([]byte(matrix), &j.Matrix)
 	_ = json.Unmarshal([]byte(runsOn), &j.RunsOn)
@@ -144,6 +167,9 @@ type runSpec struct {
 	// called are the reusable workflows the run's jobs call, for a re-run;
 	// createRun reads them otherwise.
 	called []*calledWorkflow
+	// For re-runs of some jobs: what to keep from the earlier attempt.
+	reuse *reusePlan
+	debug bool
 }
 
 func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
@@ -176,10 +202,15 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	if attempt == 0 {
 		attempt = 1
 	}
+	reuse := ""
+	if spec.reuse != nil {
+		reuse = mustJSON(spec.reuse)
+	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
-		status, conclusion, error, protected, trigger_depth, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		status, conclusion, error, protected, trigger_depth, reuse_jobs, debug, created_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
-		status, conclusion, errText, refProtected(spec.repo, spec.ref), spec.depth, nowMS(), finished)
+		status, conclusion, errText, refProtected(spec.repo, spec.ref), spec.depth, reuse, spec.debug, nowMS(), finished)
 	var id int64
 	var conc wf.Concurrency
 	if err == nil {
@@ -192,7 +223,7 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 		// The group can use github.run_id and run_number, so it's evaluated
 		// once the run has them, and set before any run can advance.
 		if spec.parseErr == nil {
-			conc, err = s.setRunConcurrency(id)
+			conc, err = s.evaluateRun(id)
 		}
 	}
 	s.mu.Unlock()
@@ -244,7 +275,8 @@ func (s *Server) githubContext(run *Run) *model.GithubContext {
 	return ghc
 }
 
-// aggregate combines the rows of one workflow job (several for a matrix).
+// aggregate combines the rows of one workflow job (several for a matrix). A
+// failure with continue-on-error counts as success, as on GitHub.
 func aggregate(rows []*Job) (wf.JobResult, bool) {
 	res := wf.JobResult{Outputs: map[string]string{}}
 	allSkipped := true
@@ -253,10 +285,10 @@ func aggregate(rows []*Job) (wf.JobResult, bool) {
 		if j.Status != protocol.StatusCompleted {
 			return res, false
 		}
-		switch j.Conclusion {
-		case protocol.ResultFailure:
+		switch {
+		case j.Conclusion == protocol.ResultFailure && !j.ContinueOnError:
 			failed = true
-		case protocol.ResultCancelled:
+		case j.Conclusion == protocol.ResultCancelled:
 			cancelled = true
 		}
 		if j.Conclusion != protocol.ResultSkipped {
@@ -320,6 +352,10 @@ type newJob struct {
 	status, conclusion, error string
 	uses                      string
 	inputs                    map[string]any
+	concurrencyGroup          string
+	continueOnError           bool
+	maxParallel               int
+	permissions               *protocol.Permissions
 }
 
 func (s *Server) insertJob(runID int64, j newJob) error {
@@ -334,11 +370,19 @@ func (s *Server) insertJob(runID int64, j newJob) error {
 	if j.runsOn == nil {
 		j.runsOn = []string{}
 	}
-	_, err := s.db.Exec(`INSERT INTO jobs (run_id, parent_id, job_key, name, uses, inputs, matrix, runs_on, status, conclusion, error,
-		created_at, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	res, err := s.db.Exec(`INSERT INTO jobs (run_id, parent_id, job_key, name, uses, inputs, matrix, runs_on, status, conclusion, error,
+		concurrency_group, continue_on_error, max_parallel, permissions, created_at, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		runID, j.parentID, j.key, j.name, j.uses, mustJSON(j.inputs), mustJSON(j.matrix), mustJSON(j.runsOn), j.status, j.conclusion, j.error,
-		now, started, finished)
-	return err
+		j.concurrencyGroup, j.continueOnError, j.maxParallel, mustJSON(j.permissions), now, started, finished)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	if created, err := s.getJob(id); err == nil {
+		s.publishJob(created)
+	}
+	return nil
 }
 
 // advance moves a run forward: it creates jobs whose needs are satisfied
@@ -356,6 +400,7 @@ type scope struct {
 	caller   *Job   // the calling job's row; nil for the run's own workflow
 	path     string // see calledWorkflow.Path; "" for the run's own
 	workflow *model.Workflow
+	extras   *wf.Extras // what act's model doesn't keep of the workflow
 	inputs   map[string]any
 	cancel   bool // the run or a calling job was cancelled
 }
@@ -404,10 +449,31 @@ func (s *Server) advanceWorkflows(ctx context.Context, run *Run, workflow *model
 		s.publishRun(runID)
 		return nil
 	}
+	queued := false
+	// Other runs whose jobs this run's job-level concurrency cancelled.
+	others := map[int64]bool{}
+	if !run.Cancel {
+		// A re-run of some jobs starts with the ones it keeps.
+		var reuse string
+		var started bool
+		if err := s.db.QueryRow(`SELECT reuse_jobs, EXISTS (SELECT 1 FROM jobs WHERE run_id = ?) FROM runs WHERE id = ?`, runID, runID).Scan(&reuse, &started); err != nil {
+			return err
+		}
+		if reuse != "" && !started {
+			q, err := s.reuseJobs(run, reuse, others)
+			if err != nil {
+				return err
+			}
+			queued = q
+		}
+	}
 	ghc := s.githubContext(run)
 	vars := s.varsFor(run.RepoID)
 	inputs, _ := run.EventJSON["inputs"].(map[string]any)
-	queued := false
+	extras, err := wf.ReadExtras([]byte(run.WorkflowYAML))
+	if err != nil {
+		return err // wf.Parse read it
+	}
 
 	for changed := true; changed; {
 		changed = false
@@ -416,7 +482,7 @@ func (s *Server) advanceWorkflows(ctx context.Context, run *Run, workflow *model
 			return err
 		}
 		tree := newJobTree(jobs)
-		scopes := []*scope{{workflow: workflow, inputs: inputs, cancel: run.Cancel}}
+		scopes := []*scope{{workflow: workflow, extras: extras, inputs: inputs, cancel: run.Cancel}}
 		for _, j := range jobs {
 			if j.Uses == "" || j.Status == protocol.StatusCompleted {
 				continue
@@ -434,11 +500,15 @@ func (s *Server) advanceWorkflows(ctx context.Context, run *Run, workflow *model
 			if in == nil {
 				in = map[string]any{}
 			}
-			scopes = append(scopes, &scope{caller: j, path: path, workflow: c.parsed, inputs: in, cancel: run.Cancel || tree.cancelled(j)})
+			x, err := wf.ReadExtras([]byte(c.YAML))
+			if err != nil {
+				x = &wf.Extras{}
+			}
+			scopes = append(scopes, &scope{caller: j, path: path, workflow: c.parsed, extras: x, inputs: in, cancel: run.Cancel || tree.cancelled(j)})
 		}
 		for _, sc := range scopes {
 			rows := tree.children[sc.parentID()]
-			c, q, err := s.advanceScope(run, sc, rows, ghc, vars, called)
+			c, q, err := s.advanceScope(run, sc, rows, ghc, vars, called, others)
 			if err != nil {
 				return err
 			}
@@ -472,10 +542,10 @@ func (s *Server) advanceWorkflows(ctx context.Context, run *Run, workflow *model
 		if j.Status == protocol.StatusInProgress || j.Status == protocol.StatusCompleted {
 			anyStarted = true
 		}
-		switch j.Conclusion {
-		case protocol.ResultFailure:
+		switch {
+		case j.Conclusion == protocol.ResultFailure && !j.ContinueOnError:
 			failed = true
-		case protocol.ResultCancelled:
+		case j.Conclusion == protocol.ResultCancelled:
 			cancelled = true
 		}
 	}
@@ -511,6 +581,14 @@ func (s *Server) advanceWorkflows(ctx context.Context, run *Run, workflow *model
 		return err
 	}
 	s.publishRun(runID)
+	for id := range others {
+		if err := s.advanceLocked(ctx, id); err != nil {
+			s.log.Error("advance", "run", id, "err", err)
+		}
+	}
+	if s.startWaitingJobs(run.RepoID) {
+		queued = true
+	}
 	if queued {
 		go s.notifyJobsReady()
 	}
@@ -518,9 +596,10 @@ func (s *Server) advanceWorkflows(ctx context.Context, run *Run, workflow *model
 }
 
 // advanceScope creates the jobs of one of a run's workflows whose needs are
-// done. rows are the workflow's job rows so far.
+// done. rows are the workflow's job rows so far. It adds to others the runs
+// whose jobs a new job's concurrency group cancelled.
 func (s *Server) advanceScope(run *Run, sc *scope, rows []*Job, ghc *model.GithubContext, vars map[string]string,
-	called map[string]*calledWorkflow) (changed, queued bool, err error) {
+	called map[string]*calledWorkflow, others map[int64]bool) (changed, queued bool, err error) {
 	exists := map[string]bool{}
 	for _, j := range rows {
 		exists[j.Key] = true
@@ -572,12 +651,19 @@ func (s *Server) advanceScope(run *Run, sc *scope, rows []*Job, ghc *model.Githu
 			}
 			continue
 		}
+		// A job's permissions are its own, else its workflow's, else (in a
+		// called workflow) its calling job's.
+		perms := sc.extras.JobPermissions(key)
+		if perms == nil && sc.caller != nil {
+			perms = sc.caller.Permissions
+		}
 		for _, combo := range combos {
 			if len(combo) == 0 {
 				combo = nil
 			}
 			env.Matrix = combo
-			j := newJob{key: key, name: sc.jobName(env.Name()), matrix: combo, status: protocol.StatusCompleted, conclusion: protocol.ResultFailure}
+			j := newJob{key: key, name: sc.jobName(env.Name()), matrix: combo, status: protocol.StatusCompleted, conclusion: protocol.ResultFailure,
+				permissions: perms}
 			if job.Uses != "" {
 				// A calling job is in progress while the workflow it calls
 				// runs; advanceWorkflows runs that as a scope of its own.
@@ -605,15 +691,49 @@ func (s *Server) advanceScope(run *Run, sc *scope, rows []*Job, ghc *model.Githu
 			if err != nil {
 				j.error = "runs-on: " + err.Error()
 			} else if j.runsOn, j.error = labels, s.labelDenied(run, labels); j.error == "" {
-				j.status, j.conclusion = protocol.StatusQueued, ""
-				queued = true
+				j.error = s.queueJob(run, sc, env, &j, others)
 			}
+			queued = queued || j.status == protocol.StatusQueued
 			if err := insert(j); err != nil {
 				return changed, queued, err
 			}
 		}
 	}
 	return changed, queued, nil
+}
+
+// queueJob evaluates a runnable job's continue-on-error, max-parallel and
+// concurrency, and queues it, or leaves it pending for its concurrency group.
+// It returns why the job fails instead.
+func (s *Server) queueJob(run *Run, sc *scope, env *wf.Env, j *newJob, others map[int64]bool) string {
+	var err error
+	if j.continueOnError, err = env.ContinueOnError(sc.extras); err != nil {
+		return err.Error()
+	}
+	if j.maxParallel, err = env.MaxParallel(); err != nil {
+		return err.Error()
+	}
+	conc, err := env.JobConcurrency(sc.extras)
+	if err != nil {
+		return err.Error()
+	}
+	j.status, j.conclusion = protocol.StatusQueued, ""
+	if conc.Group == "" {
+		return ""
+	}
+	j.concurrencyGroup = conc.Group
+	status, affected, err := s.enterJobGroup(run, conc)
+	if err != nil {
+		j.status, j.conclusion = protocol.StatusCompleted, protocol.ResultFailure
+		return err.Error()
+	}
+	j.status = status
+	for _, id := range affected {
+		if id != run.ID {
+			others[id] = true
+		}
+	}
+	return ""
 }
 
 // finishCalled finishes a calling job once every job of the workflow it
@@ -691,8 +811,12 @@ func (s *Server) cancelRun(ctx context.Context, runID int64) error {
 }
 
 // failFast cancels the other matrix jobs of a failed job, and for a calling
-// job the jobs of the workflows they call.
+// job the jobs of the workflows they call, unless the failed job has
+// continue-on-error.
 func (s *Server) failFast(job *Job) {
+	if job.ContinueOnError {
+		return // it may fail
+	}
 	run, err := s.getRun(job.RunID)
 	if err != nil {
 		return
@@ -797,6 +921,9 @@ func (s *Server) completeJob(ctx context.Context, jobID int64, result, errText s
 		s.publishJob(j)
 	}
 	s.log.Info("job completed", "job", jobID, "run", job.RunID, "name", job.Name, "result", result)
+	if job.MaxParallel > 0 {
+		go s.notifyJobsReady() // another of its matrix may start
+	}
 	err = s.advance(ctx, job.RunID)
 	if aerr := s.archiveJobLogs(jobID); aerr != nil {
 		// The lines stay in the database; archivePendingLogs retries at startup.
