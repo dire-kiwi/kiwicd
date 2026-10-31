@@ -128,6 +128,36 @@ type Me struct {
 	User      string `json:"user"`
 	Version   string `json:"version"`
 	PublicURL string `json:"public_url"`
+	Access    Access `json:"access"`
+}
+
+// Access is what the caller may do: see the server's access.go.
+type Access struct {
+	Role        string   `json:"role"` // admin, maintainer or viewer
+	Admin       bool     `json:"admin"`
+	MaintainAll bool     `json:"maintain_all"`
+	Maintain    []string `json:"maintain"` // OWNER/NAME or OWNER/*
+	Repos       []string `json:"repos"`    // the only repositories it sees; nil for all
+	Token       *Token   `json:"token,omitempty"`
+}
+
+// CanWrite reports whether the caller may change anything at all.
+func (a Access) CanWrite() bool { return a.Role == "admin" || a.Role == "maintainer" }
+
+func (a Access) String() string {
+	s := "a viewer"
+	switch {
+	case a.Admin:
+		s = "an admin"
+	case a.Role == "maintainer" && a.MaintainAll:
+		s = "a maintainer of every repository"
+	case a.Role == "maintainer":
+		s = "a maintainer of " + strings.Join(a.Maintain, ", ")
+	}
+	if a.Repos != nil {
+		s += ", seeing only " + strings.Join(a.Repos, ", ")
+	}
+	return s
 }
 
 type Repo struct {
@@ -249,12 +279,36 @@ type Runner struct {
 }
 
 type Token struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	User       string `json:"user"`
-	CreatedAt  int64  `json:"created_at"`
-	ExpiresAt  int64  `json:"expires_at"`
-	LastUsedAt int64  `json:"last_used_at"`
+	ID         int64    `json:"id"`
+	Name       string   `json:"name"`
+	User       string   `json:"user"`
+	CreatedAt  int64    `json:"created_at"`
+	ExpiresAt  int64    `json:"expires_at"`
+	LastUsedAt int64    `json:"last_used_at"`
+	Role       string   `json:"role"`  // "" for its maker's
+	Repos      []string `json:"repos"` // none for all
+}
+
+// Scope says what a token may do.
+func (t Token) Scope() string {
+	s := "full"
+	if t.Role != "" {
+		s = t.Role
+	}
+	if len(t.Repos) > 0 {
+		s += " of " + strings.Join(t.Repos, ",")
+	}
+	return s
+}
+
+// NewToken is what CreateToken makes: ExpiresInDays 0 means never (or the
+// server's limit, for GitHub users); Role ("viewer", "maintainer" or
+// "admin"; "" for its maker's) and Repos limit what it may do.
+type NewToken struct {
+	Name          string   `json:"name"`
+	ExpiresInDays int      `json:"expires_in_days"`
+	Role          string   `json:"role,omitempty"`
+	Repos         []string `json:"repos,omitempty"`
 }
 
 // ---------------------------------------------------------------- calls
@@ -449,15 +503,21 @@ func (c *Client) Tokens(ctx context.Context) ([]Token, error) {
 	return out, err
 }
 
-// CreateToken makes an API token; expiresInDays 0 means never (or the
-// server's limit, for GitHub users).
-func (c *Client) CreateToken(ctx context.Context, name string, expiresInDays int) (string, *Token, error) {
+// CreateToken makes an API token.
+func (c *Client) CreateToken(ctx context.Context, t NewToken) (string, *Token, error) {
 	var out struct {
 		Token string `json:"token"`
 		Info  Token  `json:"info"`
 	}
-	err := c.Do(ctx, http.MethodPost, "/api/tokens", map[string]any{"name": name, "expires_in_days": expiresInDays}, &out)
+	err := c.Do(ctx, http.MethodPost, "/api/tokens", t, &out)
 	return out.Token, &out.Info, err
+}
+
+// Me says who the client is and what it may do.
+func (c *Client) Me(ctx context.Context) (*Me, error) {
+	var me Me
+	err := c.Get(ctx, "/api/me", &me)
+	return &me, err
 }
 
 // RevokeToken revokes a token by ID, or the client's own with id "current".

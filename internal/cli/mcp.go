@@ -31,6 +31,11 @@ type mcpTool struct {
 	Annotations map[string]any `json:"annotations,omitempty"`
 
 	readOnly bool
+	// maintainer: the tool needs a maintainer even if it changes nothing.
+	maintainer bool
+	// settings: the tool is about global secrets or variables without a
+	// repository, which only admins may use.
+	settings bool
 	call     func(ctx context.Context, c *Client, args map[string]any) (any, error)
 }
 
@@ -295,13 +300,13 @@ func mcpTools() []*mcpTool {
 			},
 		},
 		{
-			Name: "list_secrets", Title: "List secrets", readOnly: true,
+			Name: "list_secrets", Title: "List secrets", readOnly: true, maintainer: true, settings: true,
 			Description: "List secrets' names (values can't be read), global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp}),
 			call:        listSettingsTool("secrets"),
 		},
 		{
-			Name: "list_variables", Title: "List variables", readOnly: true,
+			Name: "list_variables", Title: "List variables", readOnly: true, maintainer: true, settings: true,
 			Description: "List variables with their values, global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp}),
 			call:        listSettingsTool("variables"),
@@ -383,28 +388,28 @@ func mcpTools() []*mcpTool {
 			},
 		},
 		{
-			Name: "set_secret", Title: "Set a secret",
+			Name: "set_secret", Title: "Set a secret", settings: true,
 			Description: "Create or replace a secret, global or a repository's. Only runs from protected refs (the default branch and the repository's protected_refs) get secrets.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp, "value": prop("string", "The secret value")}, "name", "value"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
 			call:        setSettingTool("secrets"),
 		},
 		{
-			Name: "delete_secret", Title: "Delete a secret",
+			Name: "delete_secret", Title: "Delete a secret", settings: true,
 			Description: "Delete a secret, global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp}, "name"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
 			call:        deleteSettingTool("secrets"),
 		},
 		{
-			Name: "set_variable", Title: "Set a variable",
+			Name: "set_variable", Title: "Set a variable", settings: true,
 			Description: "Create or replace a variable (vars.NAME in workflows), global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp, "value": prop("string", "The value")}, "name", "value"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
 			call:        setSettingTool("variables"),
 		},
 		{
-			Name: "delete_variable", Title: "Delete a variable",
+			Name: "delete_variable", Title: "Delete a variable", settings: true,
 			Description: "Delete a variable, global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp}, "name"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
@@ -571,21 +576,36 @@ type rpcError struct {
 }
 
 type mcpServer struct {
-	client  *Client
-	version string
-	tools   []*mcpTool
-	byName  map[string]*mcpTool
+	client       *Client
+	version      string
+	instructions string
+	tools        []*mcpTool
+	byName       map[string]*mcpTool
 
 	outMu sync.Mutex
 	out   io.Writer
 	log   io.Writer
 }
 
-func newMCPServer(c *Client, version string, readOnly bool, out, log io.Writer) *mcpServer {
-	s := &mcpServer{client: c, version: version, byName: map[string]*mcpTool{}, out: out, log: log}
+// newMCPServer serves the tools that access (nil if unknown) allows, or
+// only those that change nothing if readOnly.
+func newMCPServer(c *Client, version string, readOnly bool, access *Access, out, log io.Writer) *mcpServer {
+	s := &mcpServer{client: c, version: version, instructions: mcpInstructions, byName: map[string]*mcpTool{}, out: out, log: log}
+	if access != nil {
+		s.instructions += " You are " + access.String() + "."
+		if !access.CanWrite() {
+			readOnly = true
+		}
+	}
 	for _, t := range mcpTools() {
-		if readOnly && !t.readOnly {
+		if readOnly && !t.readOnly || t.maintainer && access != nil && !access.CanWrite() {
 			continue
+		}
+		if t.settings && access != nil && !access.Admin {
+			// Global secrets and variables are for admins.
+			props := t.InputSchema["properties"].(map[string]any)
+			props["repo"] = repoProp
+			t.InputSchema["required"] = append([]string{"repo"}, toStrings(t.InputSchema["required"])...)
 		}
 		if t.readOnly {
 			if t.Annotations == nil {
@@ -665,7 +685,7 @@ func (s *mcpServer) handle(ctx context.Context, m rpcMessage) {
 			"protocolVersion": version,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "kiwicd", "title": "kiwicd", "version": s.version},
-			"instructions":    mcpInstructions,
+			"instructions":    s.instructions,
 		}
 	case "ping":
 		reply.Result = map[string]any{}
@@ -724,5 +744,17 @@ func mcpCommand(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	return newMCPServer(c, a.Version, *readOnly, a.Stdout, a.Stderr).serve(ctx, a.Stdin)
+	// Tools the token can't use are left out.
+	var access *Access
+	if me, err := c.Me(ctx); err != nil {
+		fmt.Fprintln(a.Stderr, "kiwicd mcp: can't tell what the token may do, so offering every tool:", err)
+	} else {
+		access = &me.Access
+	}
+	return newMCPServer(c, a.Version, *readOnly, access, a.Stdout, a.Stderr).serve(ctx, a.Stdin)
+}
+
+func toStrings(v any) []string {
+	s, _ := v.([]string)
+	return s
 }
