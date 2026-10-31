@@ -472,7 +472,9 @@ each of them:
   check run named `workflow / job`, with matrix values as in the job's name, e.g.
   `CI / test (1.23, linux)`. It's created when the job is queued and updated when it starts and
   finishes, with the conclusion, a short summary (duration, error, steps) and a link to the job
-  in kiwicd (made from `--public-url`). Push and dispatched runs report on their commit, pull
+  in kiwicd (made from `--public-url`). A finished job's check run also carries its step
+  summaries (cut to GitHub's limit) and its first 50 annotations, which GitHub shows on the
+  pull request's files; ones without a file go on `.github`, as GitHub Actions puts them. Push and dispatched runs report on their commit, pull
   request runs on the pull request's head. A workflow file that doesn't parse gets one failed
   check run. Branch protection can require these checks by name. **Re-run** on GitHub (one
   check, or all of a commit's) starts a new attempt of the runs they belong to, unless the

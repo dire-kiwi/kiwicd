@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -142,62 +141,27 @@ func (s *Server) handleRunReports(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// Check runs: GitHub's API for showing a run on a commit or pull request.
-// checkRunOutput is the hook for reporting a job there: it turns the job's
-// report into a check run's "output", within GitHub's limits.
-
-// GitHub's limits on a check run's output.
-const (
-	checkSummaryChars  = 65535
-	checkAnnotationMax = 50 // per request; more need further PATCHes
-)
-
-type checkRunOutput struct {
-	Title       string               `json:"title"`
-	Summary     string               `json:"summary"`
-	Annotations []checkRunAnnotation `json:"annotations,omitempty"`
-}
-
-type checkRunAnnotation struct {
-	Path            string `json:"path"`
-	StartLine       int    `json:"start_line"`
-	EndLine         int    `json:"end_line"`
-	StartColumn     int    `json:"start_column,omitempty"`
-	EndColumn       int    `json:"end_column,omitempty"`
-	AnnotationLevel string `json:"annotation_level"` // notice, warning or failure
-	Message         string `json:"message"`
-	Title           string `json:"title,omitempty"`
-}
-
-// jobCheckRunOutput makes a job's check run output: its step summaries one
-// after the other, and its annotations. GitHub needs a file and line for
-// each annotation; like GitHub Actions, the ones without a file are put on
-// .github, line 1.
-func jobCheckRunOutput(job *Job, rep *jobReport) checkRunOutput {
-	out := checkRunOutput{Title: job.Name}
-	switch n := len(rep.Annotations); n {
-	case 0:
-	case 1:
-		out.Title = job.Name + ": 1 annotation"
-	default:
-		out.Title = fmt.Sprintf("%s: %d annotations", job.Name, n)
-	}
+// reportCheckOutput adds a finished job's report to its check run's output:
+// its step summaries one after the other as the text, and its annotations.
+// GitHub needs a file and line for each annotation; like GitHub Actions, the
+// ones without a file are put on .github, line 1. GitHub takes 50
+// annotations per request, so a job's first 50 are reported.
+func reportCheckOutput(out *checkOutput, rep *jobReport) {
 	var parts []string
 	for _, s := range rep.Summaries {
 		parts = append(parts, strings.TrimRight(s.Markdown, "\n"))
 	}
-	summary := strings.Join(parts, "\n\n")
-	if utf8.RuneCountInString(summary) > checkSummaryChars {
-		const note = "\n\n*The summary was cut to fit GitHub's limit; see the run in kiwicd for all of it.*"
-		r := []rune(summary)
-		summary = string(r[:checkSummaryChars-utf8.RuneCountInString(note)]) + note
+	if len(parts) > 0 {
+		out.Text = strings.Join(parts, "\n\n")
+		if len(out.Text) > maxSummary {
+			out.Text = limitSummary(out.Text) + "\n\n*The summary was cut to fit GitHub's limit; kiwicd shows all of it.*"
+		}
 	}
-	out.Summary = summary
 	for _, a := range rep.Annotations {
-		if len(out.Annotations) == checkAnnotationMax {
+		if len(out.Annotations) == maxCheckAnnotations {
 			break
 		}
-		ca := checkRunAnnotation{Path: a.File, StartLine: a.Line, EndLine: a.EndLine, AnnotationLevel: a.Level, Message: a.Message, Title: a.Title}
+		ca := checkAnnotation{Path: a.File, StartLine: a.Line, EndLine: a.EndLine, AnnotationLevel: a.Level, Message: a.Message, Title: a.Title}
 		if ca.AnnotationLevel == protocol.AnnotationError {
 			ca.AnnotationLevel = "failure"
 		}
@@ -216,5 +180,7 @@ func jobCheckRunOutput(job *Job, rep *jobReport) checkRunOutput {
 		}
 		out.Annotations = append(out.Annotations, ca)
 	}
-	return out
 }
+
+// maxCheckAnnotations is the most annotations GitHub takes in one request.
+const maxCheckAnnotations = 50

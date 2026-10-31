@@ -43,8 +43,7 @@ func TestLimitReport(t *testing.T) {
 	}
 }
 
-func TestJobCheckRunOutput(t *testing.T) {
-	job := &Job{Name: "build"}
+func TestReportCheckOutput(t *testing.T) {
 	rep := &jobReport{
 		Summaries: []protocol.StepSummary{{Step: 1, Markdown: "# One\n"}, {Step: 3, Markdown: "two"}},
 		Annotations: []protocol.Annotation{
@@ -53,11 +52,12 @@ func TestJobCheckRunOutput(t *testing.T) {
 			{Level: "error", Message: "Process completed with exit code 1.", Step: 2, LogLine: 7},
 		},
 	}
-	out := jobCheckRunOutput(job, rep)
-	if out.Title != "build: 3 annotations" || out.Summary != "# One\n\ntwo" {
-		t.Errorf("title %q summary %q", out.Title, out.Summary)
+	out := &checkOutput{Title: "Failed", Summary: "**build** failed."}
+	reportCheckOutput(out, rep)
+	if out.Summary != "**build** failed." || out.Text != "# One\n\ntwo" {
+		t.Errorf("summary %q text %q", out.Summary, out.Text)
 	}
-	want := []checkRunAnnotation{
+	want := []checkAnnotation{
 		{Path: "main.go", StartLine: 3, EndLine: 3, StartColumn: 5, EndColumn: 5, AnnotationLevel: "failure", Message: "bad"},
 		{Path: "a.go", StartLine: 1, EndLine: 4, AnnotationLevel: "warning", Message: "spans"},
 		{Path: ".github", StartLine: 1, EndLine: 1, AnnotationLevel: "failure", Message: "Process completed with exit code 1."},
@@ -66,8 +66,16 @@ func TestJobCheckRunOutput(t *testing.T) {
 		t.Errorf("annotations:\n%+v\nwant\n%+v", out.Annotations, want)
 	}
 
-	rep = &jobReport{Summaries: []protocol.StepSummary{{Markdown: strings.Repeat("ü", checkSummaryChars+10)}}}
-	if out := jobCheckRunOutput(job, rep); utf8.RuneCountInString(out.Summary) != checkSummaryChars || !strings.Contains(out.Summary, "GitHub's limit") {
-		t.Errorf("long summary: %d characters", utf8.RuneCountInString(out.Summary))
+	rep = &jobReport{Summaries: []protocol.StepSummary{{Markdown: strings.Repeat("ü", maxSummary)}}}
+	for range 2 * maxCheckAnnotations {
+		rep.Annotations = append(rep.Annotations, protocol.Annotation{Level: "notice", Message: "n"})
+	}
+	out = &checkOutput{}
+	reportCheckOutput(out, rep)
+	if len(out.Text) > maxSummary+200 || !utf8.ValidString(out.Text) || !strings.Contains(out.Text, "GitHub's limit") {
+		t.Errorf("long summary: %d bytes", len(out.Text))
+	}
+	if len(out.Annotations) != maxCheckAnnotations {
+		t.Errorf("%d annotations", len(out.Annotations))
 	}
 }
