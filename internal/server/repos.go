@@ -40,6 +40,10 @@ type Repo struct {
 	SSHHostKeys   []string          `json:"ssh_host_keys,omitempty"`
 	Readers       []string          `json:"readers"`        // see jobtoken.go
 	ProtectedRefs []string          `json:"protected_refs"` // see protectedrefs.go
+	ReportChecks  bool              `json:"report_checks"`  // see checks.go
+	// Whether pull requests from forks run pull_request workflows; see
+	// pullrequest.go.
+	ForkPullRequests bool `json:"fork_pull_requests"`
 	// Branches whose runs get secrets, for the UI.
 	ProtectedBranches []string `json:"protected_branches,omitempty"`
 	CloneURL          string   `json:"clone_url,omitempty"`
@@ -47,13 +51,13 @@ type Repo struct {
 }
 
 const repoCols = `id, name, kind, url, default_branch, webhook_secret, refs, last_sync_at, last_sync_error, created_at,
-	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs`
+	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs, report_checks, fork_pull_requests`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
 	var refs, readers, protectedRefs string
 	if err := row.Scan(&r.ID, &r.Name, &r.Kind, &r.URL, &r.DefaultBranch, &r.WebhookSecret, &refs, &r.LastSyncAt, &r.LastSyncError, &r.CreatedAt,
-		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs); err != nil {
+		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs, &r.ReportChecks, &r.ForkPullRequests); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(refs), &r.Refs)
@@ -252,13 +256,15 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		URL            *string   `json:"url"`
-		DefaultBranch  *string   `json:"default_branch"`
-		SSHKey         *string   `json:"ssh_key"`
-		GenerateSSHKey bool      `json:"generate_ssh_key"`
-		SSHKnownHosts  *string   `json:"ssh_known_hosts"`
-		Readers        *[]string `json:"readers"`
-		ProtectedRefs  *[]string `json:"protected_refs"`
+		URL              *string   `json:"url"`
+		DefaultBranch    *string   `json:"default_branch"`
+		SSHKey           *string   `json:"ssh_key"`
+		GenerateSSHKey   bool      `json:"generate_ssh_key"`
+		SSHKnownHosts    *string   `json:"ssh_known_hosts"`
+		Readers          *[]string `json:"readers"`
+		ProtectedRefs    *[]string `json:"protected_refs"`
+		ReportChecks     *bool     `json:"report_checks"`
+		ForkPullRequests *bool     `json:"fork_pull_requests"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		httpError(w, 400, "bad request: %v", err)
@@ -277,9 +283,21 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.ReportChecks != nil {
+		repo.ReportChecks = *req.ReportChecks
+	}
 	if repo.Kind != "mirror" && (req.URL != nil || req.SSHKey != nil || req.GenerateSSHKey || req.SSHKnownHosts != nil) {
 		httpError(w, 400, "only mirrors have a remote URL and SSH settings")
 		return
+	}
+	if req.ForkPullRequests != nil {
+		// Forks' pull requests run anyone's code on the server's runners,
+		// which are the admins'.
+		if *req.ForkPullRequests && !repo.ForkPullRequests && !requestPrincipal(r).admin() {
+			httpError(w, 403, "only an admin can let pull requests from forks run workflows")
+			return
+		}
+		repo.ForkPullRequests = *req.ForkPullRequests
 	}
 	if req.URL != nil {
 		if *req.URL = strings.TrimSpace(*req.URL); *req.URL == "" {
@@ -333,9 +351,9 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 	// Under the sync lock, so a fetch never runs with half-applied settings.
 	lock := s.repoLock(repo.ID)
 	lock.Lock()
-	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ?, protected_refs = ?
-		WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers),
-		mustJSON(repo.ProtectedRefs), repo.ID)
+	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ?, protected_refs = ?,
+		report_checks = ?, fork_pull_requests = ? WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers),
+		mustJSON(repo.ProtectedRefs), repo.ReportChecks, repo.ForkPullRequests, repo.ID)
 	if err == nil && req.SSHKnownHosts != nil && repo.SSHKnownHosts == "" {
 		// Forget pinned host keys: the next connection trusts the host again.
 		err = os.Remove(s.knownHostsPath(repo.ID))
@@ -370,6 +388,12 @@ func (s *Server) auditRepoChanges(r *http.Request, old, repo *Repo, sshKey, know
 	}
 	if old.URL != repo.URL {
 		s.audit(r, "repo.settings", repo.Name, "url", redactURL(old.URL)+" → "+redactURL(repo.URL))
+	}
+	if old.ReportChecks != repo.ReportChecks {
+		s.audit(r, "repo.settings", repo.Name, "report checks", fmt.Sprint(repo.ReportChecks))
+	}
+	if old.ForkPullRequests != repo.ForkPullRequests {
+		s.audit(r, "repo.settings", repo.Name, "fork pull requests", fmt.Sprint(repo.ForkPullRequests))
 	}
 	if old.DefaultBranch != repo.DefaultBranch {
 		s.audit(r, "repo.settings", repo.Name, "default branch", old.DefaultBranch+" → "+repo.DefaultBranch)
@@ -496,7 +520,8 @@ func (s *Server) handleSyncRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleWebhook accepts GitHub-style webhooks. A pull_request event starts
-// repository_pull_request workflows (see pullrequest.go); any other event
+// the mirror's pull_request workflows and other repositories'
+// repository_pull_request ones (see pullrequest.go); any other event
 // triggers a sync. The secret is checked with X-Hub-Signature-256 or a
 // ?secret= parameter.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {

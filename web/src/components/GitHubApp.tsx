@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { del, errorMessage, post, put } from "../api";
 import { useFetch } from "../hooks";
-import type { GitHubApp, GitHubSettings, GitHubUser, Role, RoleGrant } from "../types";
+import type { GitHubAccess, GitHubApp, GitHubSettings, GitHubUser, Role, RoleGrant } from "../types";
 import { absoluteTime, relativeTime } from "../util";
 import { CopyField, Empty, ErrorBox, Flash, Modal, Spinner } from "./ui";
 
@@ -27,8 +27,8 @@ export function GitHubAppSettings() {
           <h3>GitHub</h3>
           <p className="muted small">
             A GitHub App sends kiwicd the pushes and pull requests of the repositories it's installed on, so their mirrors need no
-            webhook of their own, and lets mirrors of private ones fetch without a deploy key. It also lets people sign in with
-            GitHub.
+            webhook of their own, lets mirrors of private ones fetch without a deploy key, and shows their runs on GitHub as check
+            runs. It also lets people sign in with GitHub.
           </p>
         </div>
       </div>
@@ -125,8 +125,8 @@ function CreateApp({ settings, onChange }: { settings: GitHubSettings; onChange:
         <p className="muted small">
           The app is private, so it can only be installed on the account that owns it: create it in the organization whose
           repositories kiwicd mirrors. GitHub asks you to confirm, then sends you back here. The app gets read access to contents,
-          pull requests and organization members, and the push and pull request events. Its owner (or the organization's members)
-          becomes an admin.
+          pull requests and organization members, write access to checks, and the push, pull request, check run and check suite
+          events. Its owner (or the organization's members) becomes an admin.
         </p>
         <div className="form-actions">
           <button type="submit" className="btn btn-primary" disabled={busy || !name.trim() || (owner === "org" && !org.trim())}>
@@ -165,7 +165,7 @@ function ExistingApp({ settings, onChange }: { settings: GitHubSettings; onChang
     <form className="form" onSubmit={submit}>
       <p className="muted small">
         Give the app these URLs on GitHub, read access to contents, pull requests and (to let organizations' members sign in)
-        members, and subscribe it to push and pull request events.
+        members, read and write access to checks, and subscribe it to push, pull request, check run and check suite events.
       </p>
       <div className="kv">
         <span className="label">Webhook URL</span>
@@ -254,10 +254,16 @@ function AppDetails({ settings, app, onChange }: { settings: GitHubSettings; app
         <CopyField value={settings.webhook_url} />
       </div>
       <p className="muted small">
-        Install the app on the repositories kiwicd mirrors: their pushes and pull requests then reach their mirrors at once, and
-        mirrors with an HTTPS URL on GitHub fetch with the app's token. Remove any webhook you added to such a repository for
-        kiwicd, or its pull requests start runs twice.
+        Install the app on the repositories kiwicd mirrors: their pushes and pull requests then reach their mirrors at once,
+        mirrors with an HTTPS URL on GitHub fetch with the app's token, and their runs show on their commits and pull requests as
+        check runs. Remove any webhook you added to such a repository for kiwicd, or its pull requests start runs twice.
       </p>
+      {app.access && <AccessWarning access={app.access} />}
+      {app.access_error && (
+        <Flash kind="warn">
+          <span>Couldn't ask GitHub what the app may do: {app.access_error}</span>
+        </Flash>
+      )}
       <div className="inline-actions">
         {app.install_url && (
           <a className="btn btn-primary" href={app.install_url} target="_blank" rel="noreferrer">
@@ -463,6 +469,44 @@ function RoleModal({ grant, onClose, onSaved }: { grant: RoleGrant; onClose: () 
         </div>
       </form>
     </Modal>
+  );
+}
+
+/** What the app or its installations lack for reporting check runs. */
+function AccessWarning({ access }: { access: GitHubAccess }) {
+  const unapproved = access.installations.filter((i) => !i.checks);
+  if (access.missing.length === 0 && unapproved.length === 0) return null;
+  return (
+    <Flash kind="warn">
+      <div className="stack-sm">
+        {access.missing.length > 0 && (
+          <span>
+            The app needs {access.missing.join(", ")} to report runs to GitHub as check runs and re-run them from there. Add them
+            under the app's{" "}
+            <a href={access.permissions_url} target="_blank" rel="noreferrer">
+              permissions and events
+            </a>{" "}
+            on GitHub (Checks: Read and write; Check run and Check suite events), then accept the new permissions on each
+            installation.
+          </span>
+        )}
+        {unapproved.length > 0 && (
+          <span>
+            {access.missing.length > 0 ? "These installations" : "The app asks for the checks permission, but these installations"}{" "}
+            haven't accepted it yet, so their runs aren't reported:{" "}
+            {unapproved.map((i, n) => (
+              <span key={i.html_url}>
+                {n > 0 && ", "}
+                <a href={i.html_url} target="_blank" rel="noreferrer">
+                  {i.account}
+                </a>
+              </span>
+            ))}
+            .
+          </span>
+        )}
+      </div>
+    </Flash>
   );
 }
 

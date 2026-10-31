@@ -408,3 +408,35 @@ func TestScopedTokens(t *testing.T) {
 		}
 	}
 }
+
+func TestSelectCalledJobs(t *testing.T) {
+	jobs := []Job{
+		{ID: 1, Key: "lint", Name: "lint"},
+		{ID: 2, Key: "build", Name: "build (linux)", Uses: "./.github/workflows/build.yml"},
+		{ID: 3, Key: "compile", Name: "build (linux) / compile", Status: "completed", Conclusion: "failure"},
+		{ID: 4, Key: "test", Name: "build (linux) / test", Uses: "./.github/workflows/test.yml"},
+		{ID: 5, Key: "unit", Name: "build (linux) / test / unit"},
+	}
+	names := func(sel string) string {
+		got, err := selectJobs(jobs, sel, false)
+		if err != nil {
+			return err.Error()
+		}
+		var out []string
+		for _, j := range got {
+			out = append(out, j.Name)
+		}
+		return strings.Join(out, ", ")
+	}
+	for sel, want := range map[string]string{
+		"":                     "lint, build (linux) / compile, build (linux) / test / unit",
+		"build":                "build (linux) / compile, build (linux) / test / unit",
+		"2":                    "build (linux) / compile, build (linux) / test / unit",
+		"build (linux) / test": "build (linux) / test / unit",
+		"compile":              "build (linux) / compile",
+	} {
+		if got := names(sel); got != want {
+			t.Errorf("selectJobs(%q) = %q, want %q", sel, got, want)
+		}
+	}
+}

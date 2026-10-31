@@ -97,6 +97,8 @@ type Server struct {
 
 	// The GitHub App's caches and pending setups (see github.go).
 	gh githubState
+	// Runs waiting to be reported to GitHub as check runs (see checks.go).
+	checks checkReporter
 }
 
 func New(cfg Config) (*Server, error) {

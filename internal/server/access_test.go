@@ -357,10 +357,17 @@ func TestAccessHandlers(t *testing.T) {
 		{tokenM, `{"url":"https://github.com/private/repo.git"}`, 403},
 		{"session-owner", `{"url":"https://***@git.example/m.git","default_branch":"dev"}`, 200},
 		{"session-owner", `{"url":" https://u:p@git.example/m.git "}`, 200},
+		{"session-owner", `{"fork_pull_requests":true}`, 403},
+		{"session-owner", `{"report_checks":true}`, 200},
 		{"pw", `{"url":"https://git.example/other.git"}`, 200},
+		{"pw", `{"fork_pull_requests":true}`, 200},
+		{"session-owner", `{"fork_pull_requests":false}`, 200},
 	} {
 		if code, b := a.do(c.auth, "PATCH", "/api/repos/t/m", c.body, nil); code != c.want {
 			t.Errorf("PATCH t/m %s as %.20s: %d, want %d: %s", c.body, c.auth, code, c.want, b)
+		}
+		if c.want == 200 && c.auth != "pw" && !strings.Contains(c.body, "url") {
+			continue
 		}
 		if c.want == 200 && c.auth != "pw" {
 			if m, _ := a.srv.getRepo("t/m"); m.URL != "https://u:p@git.example/m.git" {

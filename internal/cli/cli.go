@@ -762,12 +762,17 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 }
 
 // selectJobs picks a run's jobs by ID, key or name (sel "" for all), and
-// only failed ones if failed.
+// only failed ones if failed. Jobs that call a reusable workflow have no
+// logs of their own: selecting one selects the jobs of the workflow it calls.
 func selectJobs(jobs []Job, sel string, failed bool) ([]Job, error) {
 	var out []Job
 	id, _ := strconv.ParseInt(sel, 10, 64)
 	for _, j := range jobs {
-		if sel != "" && j.ID != id && j.Key != sel && j.Name != sel && !strings.HasPrefix(j.Name, sel+" (") {
+		if j.Uses != "" {
+			continue
+		}
+		if sel != "" && j.ID != id && j.Key != sel && j.Name != sel && !strings.HasPrefix(j.Name, sel+" (") &&
+			!strings.HasPrefix(j.Name, sel+" / ") && !calledBy(jobs, j.Name, id) {
 			continue
 		}
 		if failed && (j.Status != "completed" || j.Conclusion == "success" || j.Conclusion == "skipped") {
@@ -779,6 +784,17 @@ func selectJobs(jobs []Job, sel string, failed bool) ([]Job, error) {
 		return nil, fmt.Errorf("the run has no job %q", sel)
 	}
 	return out, nil
+}
+
+// calledBy reports whether the job named name is in a workflow the calling
+// job with ID id calls.
+func calledBy(jobs []Job, name string, id int64) bool {
+	for _, c := range jobs {
+		if c.ID == id && c.Uses != "" && strings.HasPrefix(name, c.Name+" / ") {
+			return true
+		}
+	}
+	return false
 }
 
 func runLogs(ctx context.Context, a *App, args []string) error {
