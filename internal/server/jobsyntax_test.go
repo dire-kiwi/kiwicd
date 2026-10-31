@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -421,5 +422,76 @@ func TestJobConcurrencyPullRequestsApart(t *testing.T) {
 	if statusOf(st.jobs(push)["a"]) != protocol.ResultCancelled || statusOf(st.jobs(pr)["a"]) != protocol.StatusQueued ||
 		statusOf(st.jobs(pr2)["a"]) != protocol.StatusQueued {
 		t.Errorf("push: %+v, pr: %+v, second push: %+v", st.jobs(push)["a"], st.jobs(pr)["a"], st.jobs(pr2)["a"])
+	}
+}
+
+// A re-run keeps what was evaluated for its jobs: a kept job that may fail
+// doesn't fail the new attempt, and a re-queued one still may fail.
+func TestRerunKeepsContinueOnError(t *testing.T) {
+	srv, _, api := newRerunServer(t)
+	ctx := context.Background()
+	repo, _ := srv.getRepo("t/app")
+	const src = `on: push
+jobs:
+  test:
+    runs-on: x
+    continue-on-error: ${{ matrix.v == 2 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        v: [1, 2]
+    steps: [{run: echo}]
+  other:
+    runs-on: x
+    steps: [{run: echo}]
+`
+	id, err := srv.createRun(ctx, runSpec{repo: repo, file: ".github/workflows/ci.yml", yaml: src, name: "CI", event: "push",
+		payload: map[string]any{}, ref: "refs/heads/main", sha: strings.Repeat("a", 40), actor: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobsOf := func(runID int64) map[string]*Job {
+		t.Helper()
+		jobs, _ := srv.runJobs(runID)
+		out := map[string]*Job{}
+		for _, j := range jobs {
+			out[j.Name] = j
+		}
+		return out
+	}
+	jobs := jobsOf(id)
+	for name, result := range map[string]string{"test (1)": protocol.ResultSuccess, "test (2)": protocol.ResultFailure, "other": protocol.ResultFailure} {
+		if err := srv.completeJob(ctx, jobs[name].ID, result, "", nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rerun := func(body string) int64 {
+		t.Helper()
+		var res struct {
+			RunID int64 `json:"run_id"`
+		}
+		if code := api("POST", fmt.Sprintf("/api/runs/%d/rerun", id), body, &res); code != 200 {
+			t.Fatalf("rerun %s: %d", body, code)
+		}
+		return res.RunID
+	}
+
+	// Re-running other keeps test (2)'s allowed failure.
+	one := rerun(fmt.Sprintf(`{"job_id":%d}`, jobs["other"].ID))
+	again := jobsOf(one)
+	if j := again["test (2)"]; j == nil || j.CopiedFrom == 0 || !j.ContinueOnError {
+		t.Fatalf("kept test (2): %+v", j)
+	}
+	if err := srv.completeJob(ctx, again["other"].ID, protocol.ResultSuccess, "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if run, _ := srv.getRun(one); run.Conclusion != protocol.ResultSuccess {
+		t.Errorf("re-run of other: %+v", run)
+	}
+
+	// Re-running the failed jobs queues test (2) again, still allowed to fail.
+	failed := jobsOf(rerun(`{"failed":true}`))
+	if j := failed["test (2)"]; j == nil || j.Status != protocol.StatusQueued || !j.ContinueOnError {
+		t.Errorf("re-queued test (2): %+v", j)
 	}
 }

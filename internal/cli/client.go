@@ -320,10 +320,19 @@ type NewToken struct {
 
 // ---------------------------------------------------------------- calls
 
-func (c *Client) Runs(ctx context.Context, repo string, limit int) ([]Run, error) {
+// RunFilter narrows a list of runs; empty fields don't. Workflow is a
+// workflow's file (or its name in .github/workflows), Branch a branch name or
+// full ref, Status queued, in_progress, completed or a conclusion.
+type RunFilter struct {
+	Repo, Workflow, Branch, Event, Status, Actor string
+}
+
+func (c *Client) Runs(ctx context.Context, f RunFilter, limit int) ([]Run, error) {
 	q := url.Values{}
-	if repo != "" {
-		q.Set("repo", repo)
+	for k, v := range map[string]string{"repo": f.Repo, "workflow": f.Workflow, "branch": f.Branch, "event": f.Event, "status": f.Status, "actor": f.Actor} {
+		if v != "" {
+			q.Set(k, v)
+		}
 	}
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))
@@ -401,11 +410,21 @@ func (c *Client) RepositoryDispatch(ctx context.Context, repo, eventType string,
 	return out.RunIDs, err
 }
 
-func (c *Client) Rerun(ctx context.Context, id int64) (int64, error) {
+// RerunOptions picks what a re-run runs again: every job by default, the
+// failed ones, or one job (each with the jobs that need them), and whether
+// with debug logging.
+type RerunOptions struct {
+	Failed bool  `json:"failed,omitempty"`
+	JobID  int64 `json:"job_id,omitempty"`
+	// Debug turns on debug logging (ACTIONS_STEP_DEBUG, ACTIONS_RUNNER_DEBUG).
+	Debug bool `json:"debug,omitempty"`
+}
+
+func (c *Client) Rerun(ctx context.Context, id int64, opts RerunOptions) (int64, error) {
 	var out struct {
 		RunID int64 `json:"run_id"`
 	}
-	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/rerun", id), struct{}{}, &out)
+	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/rerun", id), opts, &out)
 	return out.RunID, err
 }
 

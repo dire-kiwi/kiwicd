@@ -87,6 +87,10 @@ type JobRequest struct {
 	// Warnings from the server to show in the job's log, such as why it got
 	// no secrets.
 	Notices []string `json:"notices,omitempty"`
+	// StepDebug shows ::debug:: lines; RunnerDebug shows the runner's own
+	// debug messages too (ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG).
+	StepDebug   bool `json:"step_debug,omitempty"`
+	RunnerDebug bool `json:"runner_debug,omitempty"`
 	// Extra environment, mostly GITHUB_* variables.
 	Env map[string]string `json:"env"`
 	// Permissions the job asks for (its own permissions:, else the

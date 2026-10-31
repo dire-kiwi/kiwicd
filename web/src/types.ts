@@ -50,6 +50,8 @@ export interface Repo {
   readers?: string[];
   /** Ref patterns besides the default branch whose runs get secrets: "release/*", "refs/tags/v*". */
   protected_refs?: string[];
+  /** Status badges can be fetched without signing in. */
+  public_badges?: boolean;
   /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
   protected_branches?: string[];
   /** Whether runs of its repository_push/repository_pull_request listeners and uploaded workflows are reported to GitHub as check runs. */
@@ -117,6 +119,8 @@ export interface Run {
   cancel_requested: boolean;
   /** Its ref was protected, so its jobs get secrets. */
   protected: boolean;
+  /** A re-run with debug logging. */
+  debug?: boolean;
   /** The workflow's concurrency group, of which one run of the repository runs at a time. */
   concurrency_group?: string;
   /** The workflow's permissions:, or null when not set. */
@@ -124,6 +128,14 @@ export interface Run {
   created_at: number;
   started_at: number;
   finished_at: number;
+}
+
+/** Values the runs list can be filtered by, from the latest runs. */
+export interface RunFilterValues {
+  workflows: { file: string; name: string }[];
+  refs: string[];
+  events: string[];
+  actors: string[];
 }
 
 /** A permissions: setting: read-all/write-all set all, a mapping sets scopes (the rest get none). */
@@ -169,6 +181,9 @@ export interface Job {
   /** Its permissions (its own or the workflow's), or null when not set. */
   permissions: Permissions | null;
   log_seq: number;
+  /** Kept by a re-run from an earlier attempt: the job that ran, and its attempt. */
+  copied_from?: number;
+  copied_attempt?: number;
   created_at: number;
   started_at: number;
   finished_at: number;
