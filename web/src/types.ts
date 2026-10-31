@@ -32,6 +32,8 @@ export interface Repo {
   readers?: string[];
   /** Ref patterns besides the default branch whose runs get secrets: "release/*", "refs/tags/v*". */
   protected_refs?: string[];
+  /** Status badges can be fetched without signing in. */
+  public_badges?: boolean;
   /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
   protected_branches?: string[];
 }

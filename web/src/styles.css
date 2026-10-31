@@ -613,6 +613,10 @@ textarea.input {
   align-items: center;
 }
 
+.badge-preview {
+  display: block;
+  height: 20px;
+}
 .run-filters {
   display: flex;
   flex-wrap: wrap;

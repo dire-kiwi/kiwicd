@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { del, errorMessage, get, patch, post, put, repoPath } from "../api";
+import { useMe } from "../App";
 import { RunList } from "../components/RunList";
 import { SettingsTable } from "../components/SettingsTable";
 import { isSSHURL, KnownHostsField, SSHKeyField, sshHost, type SSHAuth } from "../components/SSHFields";
@@ -996,6 +997,68 @@ function ProtectedRefsSettings({ repo, onChanged }: { repo: Repo; onChanged: () 
   );
 }
 
+/** The badge of a workflow file: ci.yml for .github/workflows/ci.yml. */
+function badgeName(file: string): string {
+  return file.replace(/^\.github\/workflows\//, "");
+}
+
+function BadgeSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const me = useMe();
+  const workflows = useFetch<Workflow[]>(`${repoPath(repo.name)}/workflows`);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const base = me?.public_url ?? window.location.origin;
+
+  const setPublic = async (on: boolean) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { public_badges: on });
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Status badges</h3>
+          <p className="muted small">
+            A badge shows how the latest finished run of a workflow on the default branch ended; add{" "}
+            <span className="mono">?branch=NAME</span> for another branch or <span className="mono">&amp;event=push</span> for one event.
+            Badges need signing in unless they're public, so to show one in a README elsewhere make them public: then anyone can see this
+            repository's workflow names and whether their runs pass.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv kv-pad">
+        <span className="label">Public</span>
+        <label className="check">
+          <input type="checkbox" checked={repo.public_badges ?? false} disabled={busy} onChange={(e) => setPublic(e.target.checked)} />
+          Anyone can see this repository's status badges
+        </label>
+        {(workflows.data ?? []).map((w) => {
+          const url = `${base}${repoPath(repo.name)}/badge/${encodeURIComponent(badgeName(w.file))}.svg`;
+          const runs = `${base}/repos/${repo.name}?workflow=${encodeURIComponent(w.file)}`;
+          return (
+            <Fragment key={w.file}>
+              <span className="label">
+                <img src={url} alt={`${w.name || w.file} status`} className="badge-preview" />
+              </span>
+              <CopyField value={`[![${w.name || badgeName(w.file)}](${url})](${runs})`} />
+            </Fragment>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
   const navigate = useNavigate();
   const [confirm, setConfirm] = useState(false);
@@ -1041,6 +1104,7 @@ function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => voi
       {repo.kind === "mirror" && <MirrorSettings repo={repo} onChanged={onChanged} />}
       <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />
+      <BadgeSettings repo={repo} onChanged={onChanged} />
       <section className="box box-danger">
         <div className="box-header">
           <div>

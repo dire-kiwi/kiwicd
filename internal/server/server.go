@@ -234,6 +234,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/repos/{owner}/{name}", ui(s.handleDeleteRepo))
 	mux.Handle("POST /api/repos/{owner}/{name}/sync", ui(s.handleSyncRepo))
 	mux.Handle("GET /api/repos/{owner}/{name}/workflows", ui(s.handleListWorkflows))
+	mux.HandleFunc("GET /api/repos/{owner}/{name}/badge/{file...}", s.handleBadge)
 	mux.Handle("POST /api/repos/{owner}/{name}/dispatch", ui(s.handleDispatch))
 	mux.Handle("GET /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handleGetUploadedWorkflow))
 	mux.Handle("PUT /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handlePutUploadedWorkflow))

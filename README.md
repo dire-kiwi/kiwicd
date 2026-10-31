@@ -56,6 +56,11 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   logging* ticked, or with a secret or variable `ACTIONS_STEP_DEBUG` (shows `::debug::` messages)
   or `ACTIONS_RUNNER_DEBUG` (also act's own debug messages) set to `true`; jobs then get
   `RUNNER_DEBUG=1`.
+- **Status badges**: `https://SERVER/api/repos/OWNER/NAME/badge/ci.yml.svg` shows how the latest
+  finished run of `.github/workflows/ci.yml` on the default branch ended (`?branch=` for
+  another, `&event=` for one event; `kiwicd:NAME.yml.svg` for an uploaded workflow). Badges
+  need signing in unless the repository's **Settings → Status badges** makes them public, which
+  shows its workflows' names and results to anyone; that page also has each badge's Markdown.
 - **Protected refs**: only runs from a repository's protected refs get its secrets and the global
   ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
   collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The

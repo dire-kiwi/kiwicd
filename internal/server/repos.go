@@ -39,6 +39,9 @@ type Repo struct {
 	SSHHostKeys   []string          `json:"ssh_host_keys,omitempty"`
 	Readers       []string          `json:"readers"`        // see jobtoken.go
 	ProtectedRefs []string          `json:"protected_refs"` // see protectedrefs.go
+	// PublicBadges serves the status badges of the repository's workflows
+	// without signing in (see badge.go).
+	PublicBadges bool `json:"public_badges"`
 	// Branches whose runs get secrets, for the UI.
 	ProtectedBranches []string `json:"protected_branches,omitempty"`
 	CloneURL          string   `json:"clone_url,omitempty"`
@@ -46,13 +49,13 @@ type Repo struct {
 }
 
 const repoCols = `id, name, kind, url, default_branch, webhook_secret, refs, last_sync_at, last_sync_error, created_at,
-	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs`
+	synced_at, ssh_key, ssh_public_key, ssh_known_hosts, readers, protected_refs, public_badges`
 
 func scanRepo(row interface{ Scan(...any) error }) (*Repo, error) {
 	var r Repo
 	var refs, readers, protectedRefs string
 	if err := row.Scan(&r.ID, &r.Name, &r.Kind, &r.URL, &r.DefaultBranch, &r.WebhookSecret, &refs, &r.LastSyncAt, &r.LastSyncError, &r.CreatedAt,
-		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs); err != nil {
+		&r.SyncedAt, &r.SSHKey, &r.SSHPublicKey, &r.SSHKnownHosts, &readers, &protectedRefs, &r.PublicBadges); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(refs), &r.Refs)
@@ -253,6 +256,7 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		SSHKnownHosts  *string   `json:"ssh_known_hosts"`
 		Readers        *[]string `json:"readers"`
 		ProtectedRefs  *[]string `json:"protected_refs"`
+		PublicBadges   *bool     `json:"public_badges"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		httpError(w, 400, "bad request: %v", err)
@@ -304,6 +308,9 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		repo.SSHKey, repo.SSHPublicKey = s.sealSSHKey(ssh.key), ssh.public
 	}
+	if req.PublicBadges != nil {
+		repo.PublicBadges = *req.PublicBadges
+	}
 	if req.SSHKnownHosts != nil {
 		ssh, err := newSSHSettings(repo.Name, "", false, *req.SSHKnownHosts)
 		if err != nil {
@@ -315,9 +322,9 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 	// Under the sync lock, so a fetch never runs with half-applied settings.
 	lock := s.repoLock(repo.ID)
 	lock.Lock()
-	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ?, protected_refs = ?
-		WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers),
-		mustJSON(repo.ProtectedRefs), repo.ID)
+	_, err = s.db.Exec(`UPDATE repos SET url = ?, default_branch = ?, ssh_key = ?, ssh_public_key = ?, ssh_known_hosts = ?, readers = ?, protected_refs = ?,
+		public_badges = ? WHERE id = ?`, repo.URL, repo.DefaultBranch, repo.SSHKey, repo.SSHPublicKey, repo.SSHKnownHosts, mustJSON(repo.Readers),
+		mustJSON(repo.ProtectedRefs), repo.PublicBadges, repo.ID)
 	if err == nil && req.SSHKnownHosts != nil && repo.SSHKnownHosts == "" {
 		// Forget pinned host keys: the next connection trusts the host again.
 		err = os.Remove(s.knownHostsPath(repo.ID))
