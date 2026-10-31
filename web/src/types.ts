@@ -105,6 +105,11 @@ export interface Job {
   run_id: number;
   key: string;
   name: string;
+  /** The calling job's row, for a job of a reusable workflow; 0 otherwise. */
+  parent_id?: number;
+  /** The workflow a calling job calls, and the inputs it gives it. */
+  uses?: string;
+  inputs?: Record<string, unknown> | null;
   matrix: Record<string, unknown> | null;
   runs_on: string[] | null;
   status: Status;
@@ -125,12 +130,28 @@ export interface PlanEntry {
   key: string;
   name: string;
   needs: string[] | null;
+  /** For a job that calls a reusable workflow: what it calls, and its jobs. */
+  uses?: string;
+  jobs?: PlanEntry[];
+}
+
+/** A reusable workflow the run calls, as read when the run was created. */
+export interface CalledWorkflow {
+  /** The calling jobs' keys from the run's workflow down: build/deploy. */
+  path: string;
+  uses: string;
+  source: "kiwicd" | "github";
+  repo: string;
+  file: string;
+  sha: string;
+  yaml: string;
 }
 
 export interface RunDetail {
   run: Run;
   jobs: Job[] | null;
   plan: PlanEntry[] | null;
+  workflows?: CalledWorkflow[] | null;
   // Labels whose runners won't take this run's jobs, as its ref isn't protected.
   protected_labels?: string[];
 }

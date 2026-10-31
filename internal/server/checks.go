@@ -234,7 +234,16 @@ func (s *Server) syncChecks(ctx context.Context, runID int64) error {
 	}
 	want := map[int64]*checkRun{}
 	var order []int64
+	called := map[int64]bool{}
 	for _, j := range jobs {
+		called[j.ParentID] = true
+	}
+	for _, j := range jobs {
+		// As on GitHub, a job that calls a reusable workflow shows as the
+		// called jobs ("caller / job"), unless it finished without any.
+		if j.Uses != "" && (called[j.ID] || j.Status != protocol.StatusCompleted) {
+			continue
+		}
 		want[j.ID] = s.jobCheckRun(run, j, target)
 		order = append(order, j.ID)
 	}

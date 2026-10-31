@@ -374,3 +374,62 @@ func TestJobCheckRun(t *testing.T) {
 		t.Errorf("queued without a public URL: %+v", c)
 	}
 }
+
+// TestCalledJobChecks checks that a job calling a reusable workflow shows
+// on GitHub as the called jobs, as there, unless it runs none.
+func TestCalledJobChecks(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	g := newGitHubTest(t)
+	g.createApp()
+	ctx := context.Background()
+	work := filepath.Join(t.TempDir(), "work")
+	origin := filepath.Join(g.gh.origins, "gh", "app.git")
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("", "init", "-q", "--bare", origin)
+	git("", "init", "-q", "-b", "main", work)
+	_ = os.MkdirAll(filepath.Join(work, ".github", "workflows"), 0o755)
+	files := map[string]string{
+		"ci.yml": "name: CI\non: push\njobs:\n  call:\n    uses: ./.github/workflows/lib.yml\n" +
+			"  off:\n    if: false\n    uses: ./.github/workflows/lib.yml\n",
+		"lib.yml": "on: workflow_call\njobs:\n  a:\n    runs-on: self-hosted\n    steps:\n      - run: true\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(work, ".github", "workflows", name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(work, "add", ".")
+	git(work, "commit", "-q", "-m", "first")
+	git(work, "push", "-q", origin, "HEAD:main")
+	if resp := g.do(nil, "POST", "/api/repos", `{"name":"gh/app","url":"`+g.gh.ts.URL+`/gh/app.git"}`, nil); resp.StatusCode != 200 {
+		t.Fatalf("create mirror: %d", resp.StatusCode)
+	}
+	repo, err := g.srv.getRepo("gh/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(work, "commit", "-q", "--allow-empty", "-m", "second")
+	git(work, "push", "-q", origin, "HEAD:main")
+	if err := g.srv.syncRepo(ctx, repo.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	var checks map[string]checkReq
+	waitFor(t, "check runs", func() bool {
+		checks = g.gh.latestChecks()
+		a, off := checks["CI / call / a"], checks["CI / off"]
+		return a.Body.state() == "queued/" && off.Body.state() == "completed/skipped"
+	})
+	if _, ok := checks["CI / call"]; ok || len(checks) != 2 {
+		t.Errorf("check runs: %v", checks)
+	}
+}
