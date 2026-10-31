@@ -1,6 +1,6 @@
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { ansiToSegments } from "../ansi";
+import { ansiToSegments, stripAnsi, type Segment } from "../ansi";
 import { useNow } from "../hooks";
 import { jobState, matrixLabel } from "../runmodel";
 import type { Job, LogLine, Step } from "../types";
@@ -187,7 +187,40 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
     },
     [navigate],
   );
-  const lineView = useMemo(() => ({ showTs, onSelect }), [showTs, onSelect]);
+
+  // Search: every matching line, in the order shown; the current one is
+  // unfolded and scrolled to.
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setQuery(search), 150);
+    return () => clearTimeout(t);
+  }, [search]);
+  const matches = useMemo(() => findMatches(visible, logs.byStep, query), [visible, logs.byStep, query]);
+  const [matchIndex, setMatchIndex] = useState(0);
+  useEffect(() => setMatchIndex(0), [query]);
+  const current = matches.length ? matches[Math.min(matchIndex, matches.length - 1)] : undefined;
+  const currentKey = current && `${current.step}:${current.n}`;
+  useEffect(() => {
+    if (current) setOverrides((o) => (o[current.step] ? o : { ...o, [current.step]: true }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentKey]);
+  const scrolledToMatch = useRef<string>();
+  useLayoutEffect(() => {
+    if (!current || scrolledToMatch.current === currentKey) return;
+    const el = document.getElementById(lineID(current.step, current.n));
+    if (!el) return;
+    scrolledToMatch.current = currentKey;
+    atBottom.current = false;
+    el.scrollIntoView({ block: "center" });
+  });
+  const moveMatch = (by: number) => {
+    if (!matches.length) return;
+    scrolledToMatch.current = undefined;
+    setMatchIndex((i) => (Math.min(i, matches.length - 1) + by + matches.length) % matches.length);
+  };
+
+  const lineView = useMemo(() => ({ showTs, onSelect, query }), [showTs, onSelect, query]);
 
   const isOpen = (index: number, step: Step | null) => {
     if (index in overrides) return overrides[index];
@@ -220,6 +253,39 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
           </div>
         </div>
         <div className="job-tools">
+          <div className="log-search">
+            <Icon name="search" size={14} />
+            <input
+              type="search"
+              placeholder="Search logs"
+              aria-label="Search logs"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  setQuery(search);
+                  if (query === search) moveMatch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "Escape") {
+                  setSearch("");
+                  setQuery("");
+                }
+              }}
+            />
+            {query && (
+              <>
+                <span className="log-search-count muted small">
+                  {matches.length ? `${Math.min(matchIndex, matches.length - 1) + 1}/${matches.length}${matches.length >= maxMatches ? "+" : ""}` : "0/0"}
+                </span>
+                <button type="button" className="btn-icon log-search-btn" onClick={() => moveMatch(-1)} disabled={!matches.length} aria-label="Previous match">
+                  <Icon name="chevron-up" size={12} />
+                </button>
+                <button type="button" className="btn-icon log-search-btn" onClick={() => moveMatch(1)} disabled={!matches.length} aria-label="Next match">
+                  <Icon name="chevron-down" size={12} />
+                </button>
+              </>
+            )}
+          </div>
           <label className="check small">
             <input type="checkbox" checked={showTs} onChange={(e) => setShowTs(e.target.checked)} /> Timestamps
           </label>
@@ -315,7 +381,8 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
                   open={open}
                   onToggle={() => toggle(index, open)}
                   marked={target?.step === index && target.from ? ([target.from, target.to] as const) : undefined}
-                  reveal={target?.step === index && target.from ? target.from : undefined}
+                  reveal={current?.step === index ? current.n : target?.step === index && target.from ? target.from : undefined}
+                current={current?.step === index ? current.n : undefined}
                 />
               );
             })
@@ -351,11 +418,13 @@ function OutputRow({ k, v }: { k: string; v: string }) {
 /** What every log line needs from the view, besides its own state. */
 interface LineView {
   showTs: boolean;
+  /** Search text to highlight. */
+  query: string;
   /** A click on a line number: links to the line, or with shift to a range from the linked line. */
   onSelect: (step: number, n: number, extend: boolean) => void;
 }
 
-const LineViewContext = createContext<LineView>({ showTs: false, onSelect: () => {} });
+const LineViewContext = createContext<LineView>({ showTs: false, query: "", onSelect: () => {} });
 
 const StepSection = memo(function StepSection({
   index,
@@ -367,6 +436,7 @@ const StepSection = memo(function StepSection({
   onToggle,
   marked,
   reveal,
+  current,
 }: {
   index: number;
   name: string;
@@ -379,6 +449,8 @@ const StepSection = memo(function StepSection({
   marked?: readonly [number, number];
   /** A line to show: the group it's in is unfolded. */
   reveal?: number;
+  /** The current search match's line. */
+  current?: number;
 }) {
   const blocks = useMemo(() => logBlocks(lines ?? []), [lines]);
   const [groupOverrides, setGroupOverrides] = useState<Record<number, boolean>>({});
@@ -407,7 +479,7 @@ const StepSection = memo(function StepSection({
             <div className="log-lines">
               {blocks.map((b) =>
                 b.kind === "line" ? (
-                  <LogLineRow key={b.line.seq} step={index} n={b.n} line={b.line} marked={isMarked(b.n)} />
+                  <LogLineRow key={b.line.seq} step={index} n={b.n} line={b.line} marked={isMarked(b.n)} current={current === b.n} />
                 ) : (
                   <div key={b.header.seq} className={classes("log-group-block", groupOpen(b) && "log-group-open")}>
                     <LogLineRow
@@ -415,10 +487,13 @@ const StepSection = memo(function StepSection({
                       n={b.n}
                       line={b.header}
                       marked={isMarked(b.n)}
+                      current={current === b.n}
                       open={groupOpen(b)}
                       onToggle={() => setGroupOverrides((o) => ({ ...o, [b.header.seq]: !groupOpen(b) }))}
                     />
-                    {groupOpen(b) && b.lines.map((l) => <LogLineRow key={l.line.seq} step={index} n={l.n} line={l.line} marked={isMarked(l.n)} />)}
+                    {groupOpen(b) && b.lines.map((l) => (
+                        <LogLineRow key={l.line.seq} step={index} n={l.n} line={l.line} marked={isMarked(l.n)} current={current === l.n} />
+                      ))}
                   </div>
                 ),
               )}
@@ -526,6 +601,59 @@ function classify(text: string): { cls: string; text: string } {
   return { cls: "", text };
 }
 
+// Stop counting search matches after this many.
+const maxMatches = 10000;
+
+interface Match {
+  step: number;
+  n: number;
+}
+
+/** Lines whose shown text contains query (ignoring case), in the order shown. */
+function findMatches(steps: { index: number }[], byStep: Record<number, LogLine[]>, query: string): Match[] {
+  const q = query.toLowerCase();
+  const out: Match[] = [];
+  if (!q) return out;
+  for (const { index } of steps) {
+    const lines = byStep[index] ?? [];
+    for (let i = 0; i < lines.length; i++) {
+      const { cls, text } = classify(lines[i].text);
+      if (cls === "log-endgroup") continue;
+      if (stripAnsi(text).toLowerCase().includes(q)) {
+        out.push({ step: index, n: i + 1 });
+        if (out.length >= maxMatches) return out;
+      }
+    }
+  }
+  return out;
+}
+
+/** Splits segments where they match query (ignoring case), marking the matches. */
+function highlight(segs: Segment[], query: string): (Segment & { match?: boolean })[] {
+  if (!query) return segs;
+  const q = query.toLowerCase();
+  const plain = segs.map((s) => s.text).join("").toLowerCase();
+  const ranges: [number, number][] = [];
+  for (let i = plain.indexOf(q); i >= 0; i = plain.indexOf(q, i + q.length)) ranges.push([i, i + q.length]);
+  if (!ranges.length) return segs;
+  const out: (Segment & { match?: boolean })[] = [];
+  let pos = 0;
+  let r = 0;
+  for (const seg of segs) {
+    const end = pos + seg.text.length;
+    let at = pos;
+    while (at < end) {
+      while (r < ranges.length && ranges[r][1] <= at) r++;
+      const inMatch = r < ranges.length && ranges[r][0] <= at;
+      const stop = r >= ranges.length ? end : Math.min(end, inMatch ? ranges[r][1] : ranges[r][0]);
+      out.push({ ...seg, text: seg.text.slice(at - pos, stop - pos), match: inMatch });
+      at = stop;
+    }
+    pos = end;
+  }
+  return out;
+}
+
 function fmtTs(ts: number): string {
   const d = new Date(ts);
   return d.toLocaleTimeString(undefined, { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
@@ -536,6 +664,7 @@ const LogLineRow = memo(function LogLineRow({
   n,
   line,
   marked,
+  current,
   onToggle,
   open,
 }: {
@@ -543,16 +672,17 @@ const LogLineRow = memo(function LogLineRow({
   n: number;
   line: LogLine;
   marked: boolean;
+  current: boolean;
   /** Set for a group's header: folds or unfolds the group. */
   onToggle?: () => void;
   open?: boolean;
 }) {
-  const { showTs, onSelect } = useContext(LineViewContext);
+  const { showTs, onSelect, query } = useContext(LineViewContext);
   const { cls, text } = classify(line.text);
   if (cls === "log-endgroup") return null;
-  const segs = ansiToSegments(text);
+  const segs = highlight(ansiToSegments(text), query);
   return (
-    <div className={classes("log-line", cls, onToggle && "log-group-header", marked && "log-marked")} id={lineID(step, n)} onClick={onToggle}>
+    <div className={classes("log-line", cls, onToggle && "log-group-header", marked && "log-marked", current && "log-current")} id={lineID(step, n)} onClick={onToggle}>
       <a
         className="ln"
         href={lineHash(step, n)}
@@ -577,7 +707,11 @@ const LogLineRow = memo(function LogLineRow({
       )}
       <span className="lt">
         {segs.map((s, i) =>
-          s.cls || s.style ? (
+          s.match ? (
+            <mark key={i} className={s.cls} style={s.style}>
+              {s.text}
+            </mark>
+          ) : s.cls || s.style ? (
             <span key={i} className={s.cls} style={s.style}>
               {s.text}
             </span>
