@@ -25,6 +25,8 @@ on:
     inputs:
       target:
         required: true
+  repository_dispatch:
+    types: [deploy]
 jobs:
   deploy:
     runs-on: self-hosted
@@ -213,6 +215,19 @@ func TestCLI(t *testing.T) {
 	if out := e.ok("", "api", "runs/3"); !strings.Contains(out, `"attempt": 2`) {
 		t.Fatalf("api: %s", out)
 	}
+	// repository_dispatch events.
+	if out := e.ok("", "repo", "dispatch", "t/app", "deploy", "--payload", `{"v":1}`); !strings.Contains(out, "Started run 4") {
+		t.Fatalf("repo dispatch: %s", out)
+	}
+	if out := e.ok("", "run", "watch", "4"); !strings.Contains(out, "✓ success") {
+		t.Fatalf("watching the dispatched run: %s", out)
+	}
+	if out := e.ok("", "repo", "dispatch", "t/app", "other"); !strings.Contains(out, "No workflow") {
+		t.Fatalf("repo dispatch of another type: %s", out)
+	}
+	if code, _, errOut := e.kiwicd("", "repo", "dispatch", "t/app", "deploy", "--payload", "[1]"); code != 1 || !strings.Contains(errOut, "JSON object") {
+		t.Fatalf("repo dispatch with a bad payload: %d %s", code, errOut)
+	}
 	if out := e.ok("", "runner", "list"); !strings.Contains(out, "cli-test") {
 		t.Fatalf("runner list: %s", out)
 	}
@@ -301,7 +316,7 @@ func TestMCP(t *testing.T) {
 	for _, tool := range list {
 		names[tool.(map[string]any)["name"].(string)] = true
 	}
-	for _, n := range []string{"list_runs", "get_run", "get_job_logs", "start_run", "set_secret", "wait_for_run"} {
+	for _, n := range []string{"list_runs", "get_run", "get_job_logs", "start_run", "dispatch_event", "set_secret", "wait_for_run"} {
 		if !names[n] {
 			t.Errorf("no tool %s in %v", n, names)
 		}
@@ -353,6 +368,21 @@ func TestMCP(t *testing.T) {
 	}
 	if text, isErr := s.tool("get_run", map[string]any{"run_id": 999}); !isErr || !strings.Contains(text, "no such run") {
 		t.Fatalf("get_run of a missing run: %v %s", isErr, text)
+	}
+	text, isErr = s.tool("dispatch_event", map[string]any{"repo": "t/app", "event_type": "deploy", "client_payload": map[string]any{"v": 1}})
+	var dispatched struct {
+		Runs []struct {
+			RunID int64 `json:"run_id"`
+		}
+	}
+	if err := json.Unmarshal([]byte(text), &dispatched); isErr || err != nil || len(dispatched.Runs) != 1 || dispatched.Runs[0].RunID <= started.RunID {
+		t.Fatalf("dispatch_event: %s", text)
+	}
+	if text, _ := s.tool("wait_for_run", map[string]any{"run_id": dispatched.Runs[0].RunID, "timeout_seconds": 30}); !strings.Contains(text, `"state": "success"`) {
+		t.Fatalf("the dispatched run: %s", text)
+	}
+	if text, isErr := s.tool("dispatch_event", map[string]any{"repo": "t/app", "event_type": "other"}); isErr || !strings.Contains(text, `"runs": []`) {
+		t.Fatalf("dispatch_event of another type: %s", text)
 	}
 
 	// --read-only leaves out the tools that change things.

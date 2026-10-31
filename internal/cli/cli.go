@@ -30,6 +30,7 @@ Usage:
   kiwicd repo list
   kiwicd repo view OWNER/NAME
   kiwicd repo sync OWNER/NAME
+  kiwicd repo dispatch OWNER/NAME EVENT_TYPE [--payload JSON]
   kiwicd workflow list OWNER/NAME [--ref REF]
 
   kiwicd run list [--repo OWNER/NAME] [--limit N]
@@ -78,7 +79,7 @@ type App struct {
 type command func(ctx context.Context, a *App, args []string) error
 
 var commands = map[string]map[string]command{
-	"repo":     {"list": repoList, "view": repoView, "sync": repoSync},
+	"repo":     {"list": repoList, "view": repoView, "sync": repoSync, "dispatch": repoDispatch},
 	"workflow": {"list": workflowList},
 	"run": {"list": runList, "view": runView, "start": runStart, "watch": runWatch, "logs": runLogs,
 		"cancel": runCancel, "rerun": runRerun},
@@ -164,7 +165,7 @@ func (a *App) run(ctx context.Context, args []string) error {
 	rest := args[1:]
 	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
 		v := rest[0]
-		if a, ok := aliases[v]; ok {
+		if a, ok := aliases[v]; ok && verbs[v] == nil {
 			v = a
 		}
 		if _, ok := verbs[v]; ok || !plural {
@@ -445,6 +446,38 @@ func repoSync(ctx context.Context, a *App, args []string) error {
 		return err
 	}
 	fmt.Fprintln(a.Stdout, "Synced", pos[0])
+	return nil
+}
+
+// repoDispatch sends a repository_dispatch event, which starts the default
+// branch's workflows that listen for its type.
+func repoDispatch(ctx context.Context, a *App, args []string) error {
+	fs := flag.NewFlagSet("repo dispatch", flag.ContinueOnError)
+	raw := fs.String("payload", "", "the event's client_payload, a JSON object")
+	pos, err := flags(fs, args, 2, 2)
+	if err != nil {
+		return err
+	}
+	var payload map[string]any
+	if *raw != "" {
+		if err := json.Unmarshal([]byte(*raw), &payload); err != nil {
+			return fmt.Errorf("--payload must be a JSON object: %v", err)
+		}
+	}
+	c, err := a.api()
+	if err != nil {
+		return err
+	}
+	ids, err := c.RepositoryDispatch(ctx, pos[0], pos[1], payload)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		fmt.Fprintf(a.Stdout, "No workflow on %s's default branch listens for repository_dispatch %s\n", pos[0], pos[1])
+	}
+	for _, id := range ids {
+		fmt.Fprintf(a.Stdout, "Started run %d: %s/runs/%d\n", id, strings.TrimRight(c.URL, "/"), id)
+	}
 	return nil
 }
 
