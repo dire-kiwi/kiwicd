@@ -225,6 +225,14 @@ func flags(fs *flag.FlagSet, args []string, min, max int) ([]string, error) {
 	return pos, nil
 }
 
+// isSet says whether the flag was given, as an empty value can mean
+// something.
+func isSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
+}
+
 func flagNames(fs *flag.FlagSet) string {
 	var names []string
 	fs.VisitAll(func(f *flag.Flag) { names = append(names, "--"+f.Name) })
@@ -323,11 +331,22 @@ func logout(ctx context.Context, a *App, args []string) error {
 	if _, err := flags(flag.NewFlagSet("logout", flag.ContinueOnError), args, 0, 0); err != nil {
 		return err
 	}
-	c, err := a.api()
+	// Only the saved token is revoked: one in KIWICD_API_TOKEN may be
+	// shared with scripts or CI.
+	cfg, err := savedConfig()
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(c.Token, "kiwicd_") {
+	env := os.Getenv("KIWICD_API_TOKEN")
+	if cfg.URL == "" && cfg.Token == "" {
+		if env != "" {
+			fmt.Fprintln(a.Stderr, "kiwicd: no saved login to log out of; the token in KIWICD_API_TOKEN wasn't revoked (kiwicd token revoke does that)")
+			return nil
+		}
+		return errors.New("not logged in")
+	}
+	if strings.HasPrefix(cfg.Token, "kiwicd_") {
+		c := &Client{URL: cfg.URL, Token: cfg.Token}
 		if err := c.RevokeToken(ctx, "current"); err != nil {
 			fmt.Fprintln(a.Stderr, "kiwicd: couldn't revoke the token:", err)
 		}
@@ -335,7 +354,10 @@ func logout(ctx context.Context, a *App, args []string) error {
 	if err := removeConfig(); err != nil {
 		return err
 	}
-	fmt.Fprintln(a.Stdout, "Logged out of", c.URL)
+	fmt.Fprintln(a.Stdout, "Logged out of", cfg.URL)
+	if env != "" && env != cfg.Token {
+		fmt.Fprintln(a.Stderr, "kiwicd: KIWICD_API_TOKEN is still set; its token wasn't revoked")
+	}
 	return nil
 }
 
@@ -752,6 +774,17 @@ func selectJobs(jobs []Job, sel string, failed bool) ([]Job, error) {
 	return out, nil
 }
 
+// planned says whether the run's workflow has a job sel (its key or name),
+// which may not have been created yet.
+func planned(d *RunDetail, sel string) bool {
+	for _, p := range d.Plan {
+		if p.Key == sel || p.Name == sel {
+			return true
+		}
+	}
+	return false
+}
+
 func runLogs(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("run logs", flag.ContinueOnError)
 	job := fs.String("job", "", "only this job: its ID, key or name")
@@ -775,7 +808,30 @@ func runLogs(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	jobs, err := selectJobs(d.Jobs, *job, *failed)
+	// pick selects the jobs to print. When following, a job in the run's
+	// plan that hasn't been created yet is waited for.
+	waiting := false
+	pick := func() ([]Job, error) {
+		jobs, err := selectJobs(d.Jobs, *job, *failed)
+		if err == nil || !planned(d, *job) {
+			return jobs, err
+		}
+		if _, err := selectJobs(d.Jobs, *job, false); err == nil {
+			return nil, fmt.Errorf("job %s hasn't failed", *job) // with --failed
+		}
+		if d.Run.Status == "completed" {
+			return nil, fmt.Errorf("job %s didn't run", *job)
+		}
+		if !*follow {
+			return nil, fmt.Errorf("job %s hasn't started yet; --follow waits for it", *job)
+		}
+		if !waiting {
+			fmt.Fprintf(a.Stderr, "Waiting for job %s to start...\n", *job)
+			waiting = true
+		}
+		return nil, nil
+	}
+	jobs, err := pick()
 	if err != nil {
 		return err
 	}
@@ -845,7 +901,7 @@ func runLogs(ctx context.Context, a *App, args []string) error {
 			return err
 		}
 		// Pick up jobs that have started since, with their steps' names.
-		if jobs, err = selectJobs(d.Jobs, *job, *failed); err != nil {
+		if jobs, err = pick(); err != nil {
 			return err
 		}
 	}
@@ -904,7 +960,11 @@ func secretSet(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	v, err := a.readValue(*value, *file, "Value for "+pos[0]+": ", true)
+	var given *string // --value "" sets an empty value
+	if isSet(fs, "value") {
+		given = value
+	}
+	v, err := a.readValue(given, *file, "Value for "+pos[0]+": ", true)
 	if err != nil {
 		return err
 	}
@@ -927,9 +987,9 @@ func variableSet(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	value := ""
+	var value *string
 	if len(pos) == 2 {
-		value = pos[1]
+		value = &pos[1]
 		if *file != "" {
 			return errors.New("give a value or --from-file, not both")
 		}
@@ -949,14 +1009,15 @@ func variableSet(ctx context.Context, a *App, args []string) error {
 	return nil
 }
 
-// readValue is value, or file's contents, or what's on stdin: a line typed
-// at a prompt if it's a terminal, else all of it without a final newline.
-func (a *App) readValue(value, file, prompt string, hidden bool) (string, error) {
+// readValue is value if given (even if empty), or file's contents, or
+// what's on stdin: a line typed at a prompt if it's a terminal, else all of
+// it without a final newline.
+func (a *App) readValue(value *string, file, prompt string, hidden bool) (string, error) {
 	switch {
-	case value != "" && file != "":
+	case value != nil && file != "":
 		return "", errors.New("give --value or --from-file, not both")
-	case value != "":
-		return value, nil
+	case value != nil:
+		return *value, nil
 	case file != "":
 		b, err := os.ReadFile(file)
 		return string(b), err
