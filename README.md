@@ -191,7 +191,10 @@ jobs:
   fetching GitHub's `refs/pull/N/merge`, which GitHub updates in the background and may be stale
   when the event comes. The same head and base give the same commit. As on GitHub, a pull request
   that doesn't merge cleanly runs nothing until its conflicts are resolved. This needs git 2.38
-  or later on the server.
+  or later on the server. An event no workflow listens for (say `labeled`, when none has it in
+  `types`, at the head, the base branch or uploaded) only fetches the head. Each run keeps its
+  merge commit at `refs/kiwicd/runs/<id>` until the run is deleted, so a queued run or a re-run
+  can still fetch it after a push to the pull request moves `refs/pull/N/merge`.
 - `github.event_name` is `pull_request`, `github.ref` is `refs/pull/N/merge` (`github.ref_name`
   `N/merge`), `github.head_ref`/`GITHUB_HEAD_REF` and `github.base_ref`/`GITHUB_BASE_REF` are the
   head and base branches, and `github.event` is GitHub's `pull_request` event, except that

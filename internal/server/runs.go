@@ -230,6 +230,7 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	s.keepRunCommit(ctx, spec.repo, id, spec.ref, spec.sha)
 	s.log.Info("run created", "repo", spec.repo.Name, "run", id, "number", number, "workflow", spec.file, "event", spec.event, "ref", spec.ref,
 		"secrets", refProtected(spec.repo, spec.ref), "concurrency", conc.Group)
 	s.queueWorkflowRun(id, "requested")
