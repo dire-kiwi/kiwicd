@@ -95,6 +95,10 @@ type Server struct {
 	prOnce  sync.Once
 	prQueue chan queuedPullRequest
 
+	// Runs' workflow_run activity waiting to be handled (see triggers.go).
+	wrOnce  sync.Once
+	wrQueue chan workflowRunActivity
+
 	// The GitHub App's caches and pending setups (see github.go).
 	gh githubState
 }
@@ -235,6 +239,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/repos/{owner}/{name}/sync", ui(s.handleSyncRepo))
 	mux.Handle("GET /api/repos/{owner}/{name}/workflows", ui(s.handleListWorkflows))
 	mux.Handle("POST /api/repos/{owner}/{name}/dispatch", ui(s.handleDispatch))
+	mux.Handle("POST /api/repos/{owner}/{name}/dispatches", ui(s.handleRepositoryDispatch))
 	mux.Handle("GET /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handleGetUploadedWorkflow))
 	mux.Handle("PUT /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handlePutUploadedWorkflow))
 	mux.Handle("DELETE /api/repos/{owner}/{name}/uploaded-workflows/{file}", ui(s.handleDeleteUploadedWorkflow))

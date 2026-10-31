@@ -124,7 +124,7 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(`SELECT MAX(attempt) FROM runs WHERE repo_id = ? AND number = ?`, run.RepoID, run.Number).Scan(&attempt)
 	id, err := s.createRun(r.Context(), runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1})
+		number: run.Number, attempt: attempt + 1, depth: run.TriggerDepth})
 	if err != nil {
 		httpError(w, 500, "%v", err)
 		return

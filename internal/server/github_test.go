@@ -514,6 +514,32 @@ func TestGitHubWebhookAndFetch(t *testing.T) {
 		return err == nil && sha == head
 	})
 
+	// A repository_dispatch event fetches the mirror and runs the default
+	// branch's listeners at its new tip.
+	_ = os.MkdirAll(filepath.Join(work, ".github", "workflows"), 0o755)
+	_ = os.WriteFile(filepath.Join(work, ".github", "workflows", "d.yml"),
+		[]byte("on:\n  repository_dispatch:\n    types: [deploy]\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n"), 0o644)
+	run(work, "add", "-A")
+	third := commit("dispatch listener")
+	dispatch := `{"action":"deploy","branch":"main","client_payload":{"v":"2"},"repository":{"full_name":"gh/app"},"sender":{"login":"someone"}}`
+	if code, body := hook("repository_dispatch", dispatch, fakeWebhookSecret); code != 200 || body != `{"mirrors":["gh/app"],"ok":true}` {
+		t.Fatalf("repository_dispatch: %d %s", code, body)
+	}
+	var dispatched *Run
+	waitFor(t, "the repository_dispatch run", func() bool {
+		var runs []*Run
+		g.do(nil, "GET", "/api/runs?repo=gh/app", "", &runs)
+		for _, r := range runs {
+			if r.Event == "repository_dispatch" {
+				dispatched = r
+			}
+		}
+		return dispatched != nil
+	})
+	if dispatched.Sha != third || dispatched.Actor != "someone" || dispatched.Title != "deploy" {
+		t.Errorf("repository_dispatch run %+v", dispatched)
+	}
+
 	// Every fetch used the installation token.
 	g.gh.mu.Lock()
 	defer g.gh.mu.Unlock()

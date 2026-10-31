@@ -516,16 +516,32 @@ func (s *Server) syncRepo(ctx context.Context, id int64, baseline bool) error {
 		return err
 	}
 	if !baseline {
-		var changed []string
+		var changed, deleted []string
 		for ref, sha := range refs {
 			if repo.Refs[ref] != sha {
 				changed = append(changed, ref)
 			}
 		}
+		for ref := range repo.Refs {
+			if _, ok := refs[ref]; !ok {
+				deleted = append(deleted, ref)
+			}
+		}
 		sort.Strings(changed)
+		sort.Strings(deleted)
 		for _, ref := range changed {
 			if err := s.onPush(ctx, repo, ref, repo.Refs[ref], refs[ref]); err != nil {
 				s.log.Error("push trigger", "repo", repo.Name, "ref", ref, "err", err)
+			}
+			if _, existed := repo.Refs[ref]; !existed {
+				if err := s.onCreateRef(ctx, repo, ref, refs[ref]); err != nil {
+					s.log.Error("create trigger", "repo", repo.Name, "ref", ref, "err", err)
+				}
+			}
+		}
+		for _, ref := range deleted {
+			if err := s.onDeleteRef(ctx, repo, ref, repo.Refs[ref]); err != nil {
+				s.log.Error("delete trigger", "repo", repo.Name, "ref", ref, "err", err)
 			}
 		}
 	}
@@ -637,49 +653,62 @@ func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, 
 		listeners = append(listeners, repo)
 	}
 	rows.Close()
-	mentionsSrc := mentionsRepo(src.Name)
+	// Report broken workflows that look like they listen to src.
+	broken := mentionsRepo(src.Name).Match
 	var firstErr error
 	for _, repo := range listeners {
-		dstRef := "refs/heads/" + repo.DefaultBranch
-		sha, err := resolveRef(ctx, s.repoPath(repo.Name), dstRef)
-		if err != nil {
-			continue // no commits on the default branch yet
-		}
-		files, err := s.defaultBranchWorkflows(ctx, repo, sha)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		for _, file := range sortedKeys(files) {
-			yaml := files[file]
-			if !bytes.Contains(yaml, []byte(event)) {
-				continue // only listeners need parsing
-			}
-			w, perr := wf.Parse(yaml)
-			if perr != nil {
-				// Report broken workflows that look like they listen to src.
-				if mentionsSrc.Match(yaml) {
-					_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: file, event: event,
-						payload: payload, ref: dstRef, sha: sha, actor: actor, title: title, parseErr: perr})
-				}
-				continue
-			}
-			if !matches(w) {
-				continue
-			}
-			name := w.Name
-			if name == "" {
-				name = file
-			}
-			if _, err := s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: name, event: event,
-				payload: payload, ref: dstRef, sha: sha, actor: actor, title: title}); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		spec := runSpec{event: event, payload: payload, actor: actor, title: title}
+		if _, err := s.startDefaultBranchRuns(ctx, repo, spec, broken, matches); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 	return firstErr
+}
+
+// startDefaultBranchRuns starts the workflows on repo's default branch that
+// listen for spec.event and that matches accepts, at the branch's tip, and
+// returns their runs. Workflows that don't parse get a failed run if broken
+// says they look like listeners (broken may be nil).
+func (s *Server) startDefaultBranchRuns(ctx context.Context, repo *Repo, spec runSpec, broken func([]byte) bool,
+	matches func(*model.Workflow) bool) ([]int64, error) {
+	ref := "refs/heads/" + repo.DefaultBranch
+	sha, err := resolveRef(ctx, s.repoPath(repo.Name), ref)
+	if err != nil {
+		return nil, nil // no commits on the default branch yet
+	}
+	files, err := s.defaultBranchWorkflows(ctx, repo, sha)
+	if err != nil {
+		return nil, err
+	}
+	spec.repo, spec.ref, spec.sha = repo, ref, sha
+	var ids []int64
+	for _, file := range sortedKeys(files) {
+		yaml := files[file]
+		if !bytes.Contains(yaml, []byte(spec.event)) {
+			continue // only listeners need parsing
+		}
+		spec.file, spec.yaml, spec.name, spec.parseErr = file, string(yaml), file, nil
+		w, perr := wf.Parse(yaml)
+		if perr != nil {
+			if broken != nil && broken(yaml) {
+				spec.parseErr = perr
+				_, _ = s.createRun(ctx, spec)
+			}
+			continue
+		}
+		if !matches(w) {
+			continue
+		}
+		if w.Name != "" {
+			spec.name = w.Name
+		}
+		id, err := s.createRun(ctx, spec)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // mentionsRepo matches text that names the repository: name as a whole,

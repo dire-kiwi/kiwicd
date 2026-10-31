@@ -208,6 +208,8 @@ var migrations = []struct{ table, column, sql string }{
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
+	// How many workflow_run events led to a run: 0 for others (see triggers.go).
+	{"runs", "trigger_depth", `ALTER TABLE runs ADD COLUMN trigger_depth INTEGER NOT NULL DEFAULT 0`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

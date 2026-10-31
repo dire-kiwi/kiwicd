@@ -192,15 +192,7 @@ func MatchesRepositoryPullRequest(w *model.Workflow, pr PullRequest) bool {
 	if pr.Fork && cfg["forks"] != true {
 		return false
 	}
-	types := defaultPullRequestTypes
-	if _, ok := cfg["types"]; ok {
-		types = stringList(cfg["types"])
-	}
-	matched := false
-	for _, t := range types {
-		matched = matched || t == pr.Action
-	}
-	if !matched {
+	if !matchesTypes(cfg, pr.Action, defaultPullRequestTypes) {
 		return false
 	}
 	// Only branch filters apply, to the base branch.
@@ -211,6 +203,93 @@ func MatchesRepositoryPullRequest(w *model.Workflow, pr PullRequest) bool {
 		}
 	}
 	return matchesPushFilters(branches, "refs/heads/"+pr.Base, nil)
+}
+
+// matchesTypes reports whether an event's activity type is in the event's
+// on.<event>.types, or in defaults (all types if nil) without one.
+func matchesTypes(cfg map[string]any, action string, defaults []string) bool {
+	types := defaults
+	if _, ok := cfg["types"]; ok {
+		types = stringList(cfg["types"])
+	} else if defaults == nil {
+		return true
+	}
+	return slices.Contains(types, action)
+}
+
+// matchesBranchFilters applies an event's branches and branches-ignore to a
+// branch name (or a tag's, for runs of tags), as GitHub does for
+// workflow_run's head branch.
+func matchesBranchFilters(cfg map[string]any, branch string) bool {
+	tw := &workflowpattern.EmptyTraceWriter{}
+	for _, k := range []string{"branches", "branches-ignore"} {
+		if _, ok := cfg[k]; !ok {
+			continue
+		}
+		patterns, err := workflowpattern.CompilePatterns(stringList(cfg[k])...)
+		if err != nil {
+			return false
+		}
+		if k == "branches" {
+			return !workflowpattern.Skip(patterns, []string{branch}, tw)
+		}
+		return !workflowpattern.Filter(patterns, []string{branch}, tw)
+	}
+	return true
+}
+
+// WorkflowRun is the run a workflow_run event is about:
+//
+//	on:
+//	  workflow_run:
+//	    workflows: [CI]
+//	    types: [completed]
+//	    branches: [main]
+//
+// workflows names the workflows (by their name, or file if they have none)
+// of the same repository; types are requested, in_progress and completed
+// (all by default); branches and branches-ignore filter the run's branch.
+type WorkflowRun struct {
+	Workflow string // the workflow's name
+	Action   string // requested, in_progress or completed
+	Branch   string // the run's branch (or tag) name
+}
+
+// WorkflowRunTypes are workflow_run's activity types.
+var WorkflowRunTypes = []string{"requested", "in_progress", "completed"}
+
+// MatchesWorkflowRun reports whether a run's activity triggers the
+// workflow's workflow_run.
+func MatchesWorkflowRun(w *model.Workflow, run WorkflowRun) bool {
+	cfg, ok := eventConfig(w, "workflow_run")
+	if !ok || !slices.Contains(stringList(cfg["workflows"]), run.Workflow) {
+		return false
+	}
+	return matchesTypes(cfg, run.Action, nil) && matchesBranchFilters(cfg, run.Branch)
+}
+
+// WorkflowRunSources returns the workflows the workflow's workflow_run
+// listens to.
+func WorkflowRunSources(w *model.Workflow) []string {
+	cfg, _ := eventConfig(w, "workflow_run")
+	return stringList(cfg["workflows"])
+}
+
+// MatchesRepositoryDispatch reports whether a repository_dispatch of
+// eventType triggers the workflow: on.repository_dispatch.types lists the
+// event types it takes, all without one.
+func MatchesRepositoryDispatch(w *model.Workflow, eventType string) bool {
+	cfg, ok := eventConfig(w, "repository_dispatch")
+	return ok && matchesTypes(cfg, eventType, nil)
+}
+
+// EventTypes returns the workflow's on.<event>.types, nil if it has none.
+func EventTypes(w *model.Workflow, event string) []string {
+	cfg, _ := eventConfig(w, event)
+	if _, ok := cfg["types"]; !ok {
+		return nil
+	}
+	return stringList(cfg["types"])
 }
 
 // ListenedRepositories returns the repositories the workflow listens to with
