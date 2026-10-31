@@ -16,8 +16,19 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `workflow_dispatch` with inputs,
-  `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`,
-  `defaults`, `timeout-minutes`, `secrets`, `vars`.
+  `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast, `max-parallel`), job
+  `outputs`, `env`, `defaults`, `timeout-minutes`, `secrets`, `vars`, `run-name` (the run's
+  title, from `github`, `inputs` and `vars`).
+- **Job `continue-on-error`**, also from an expression such as `${{ matrix.experimental }}`: the
+  job still shows as failed, but its failure doesn't fail the run or cancel the rest of its
+  matrix, and jobs that need it see it as successful, as on GitHub.
+- **`permissions:`** (workflow and job) are checked, stored and shown on the run and job pages,
+  and sent to agents with each job, but have no effect yet: `KIWICD_TOKEN` can only read.
+- **Invalid workflows**: a workflow that fails to parse or validate gets a failed run showing
+  the error, as on GitHub, when its triggers would have run it (or can't be read at all). That
+  includes uploaded workflows, which are also checked on upload, and `repository_push`
+  listeners. Errors found when the run starts (a `concurrency` group or `run-name` that can't be
+  evaluated) fail the run the same way.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
   commands, `::add-mask::`, `hashFiles()`. `actions/checkout` of the workflow's own repository is
@@ -50,6 +61,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   expressions can use `github`, `inputs` and `vars`) lets one run of a repository's group run at
   a time, as on GitHub. A new run waits for the group's running one, which it cancels with
   `cancel-in-progress`, and cancels any other that's waiting. A run's page says when it waits.
+  A job's `concurrency` (`jobs.<id>.concurrency`; expressions can also use `needs` and
+  `matrix`) does the same for the repository's jobs: a job waits as *pending* while another of
+  its group is queued or running. Job groups are separate from workflow groups, unlike on
+  GitHub, so a job doesn't wait for a run whose workflow group has the same name.
 - **Protected refs**: only runs from a repository's protected refs get its secrets and the global
   ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
   collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The
@@ -82,7 +97,7 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   [Command line](#command-line)).
 
 Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
-artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
+artifacts and caches, a repository's own `pull_request` workflows
 (only other repositories' `repository_pull_request`), commit statuses on GitHub.
 
 ## Deploy a public repository from a private one

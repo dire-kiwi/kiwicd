@@ -8,7 +8,7 @@ import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../compon
 import { useDocumentTitle, useEventSource, useFetch, useNow } from "../hooks";
 import { buildGroups, jobState, type PlanGroup } from "../runmodel";
 import type { Job, Run, RunDetail } from "../types";
-import { absoluteTime, classes, elapsed, eventLabel, refName, relativeTime, shortSha, stateLabel, visualState } from "../util";
+import { absoluteTime, classes, elapsed, eventLabel, permissionsLabel, refName, relativeTime, shortSha, stateLabel, visualState } from "../util";
 
 export function RunPage() {
   const { id = "", jobId } = useParams();
@@ -179,6 +179,14 @@ export function RunPage() {
             {run.attempt > 1 && <span className="muted"> · attempt {run.attempt}</span>}
           </span>
         </div>
+        {run.permissions && (
+          <div className="meta-item">
+            <span className="meta-label">Permissions</span>
+            <span className="meta-value mono small" title="Not enforced yet: kiwicd's job token can only read">
+              {permissionsLabel(run.permissions)}
+            </span>
+          </div>
+        )}
       </div>
       {run.error && (
         <ErrorBox>

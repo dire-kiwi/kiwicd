@@ -3,7 +3,7 @@ import { ansiToSegments } from "../ansi";
 import { useNow } from "../hooks";
 import { jobState, matrixLabel } from "../runmodel";
 import type { Job, LogLine, Step } from "../types";
-import { absoluteTime, classes, elapsed, relativeTime, visualState } from "../util";
+import { absoluteTime, classes, elapsed, permissionsLabel, relativeTime, visualState } from "../util";
 import { StatusIcon } from "./StatusIcon";
 import { Chip, ErrorBox, Icon } from "./ui";
 
@@ -170,7 +170,10 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
       ? `${verb[st] ?? "completed"} ${relativeTime(job.finished_at, now)}${job.started_at ? ` in ${elapsed(job.started_at, job.finished_at)}` : ""}`
       : job.status === "in_progress"
         ? `started ${relativeTime(job.started_at, now)}`
-        : "waiting for a runner";
+        : job.status === "pending"
+          ? "waiting for its concurrency group"
+          : "waiting for a runner";
+  const mayFail = job.continue_on_error && job.status === "completed" && job.conclusion === "failure";
 
   return (
     <div className="job-view">
@@ -216,6 +219,21 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
             <span className="muted">matrix</span> <span className="mono">{matrix}</span>
           </span>
         )}
+        {job.concurrency_group && (
+          <span>
+            <span className="muted">concurrency</span> <span className="mono">{job.concurrency_group}</span>
+          </span>
+        )}
+        {job.continue_on_error && (
+          <span>
+            <span className="muted">continue-on-error</span>
+          </span>
+        )}
+        {job.permissions && (
+          <span title="Not enforced yet: kiwicd's job token can only read">
+            <span className="muted">permissions</span> <span className="mono">{permissionsLabel(job.permissions)}</span>
+          </span>
+        )}
         {job.started_at > 0 && (
           <span>
             <Icon name="clock" size={13} /> {elapsed(job.started_at, job.finished_at, now)}
@@ -227,13 +245,18 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
           <span className="pre-wrap">{job.error}</span>
         </ErrorBox>
       )}
+      {mayFail && <div className="flash">This job has continue-on-error, so its failure doesn't fail the run and the jobs that need it see it as successful.</div>}
       {job.cancel_requested && job.status !== "completed" && <div className="flash flash-warn">Cancellation requested…</div>}
       {streamError && <div className="flash flash-warn">Lost connection to the log stream — retrying…</div>}
 
       <div className="log-box">
         {visible.length === 0 ? (
           <div className="log-empty muted">
-            {job.status === "queued" ? (
+            {job.status === "pending" && job.concurrency_group ? (
+              <>
+                Waiting for the running job of the concurrency group <code>{job.concurrency_group}</code> to finish…
+              </>
+            ) : job.status === "queued" ? (
               <>
                 Waiting for a runner with labels{" "}
                 {(job.runs_on ?? []).map((l) => (

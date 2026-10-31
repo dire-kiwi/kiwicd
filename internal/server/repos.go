@@ -584,8 +584,9 @@ func (s *Server) runPushWorkflows(ctx context.Context, repo *Repo, ref, after st
 		src := files[file]
 		w, perr := wf.Parse(src)
 		if perr != nil {
-			// Only report broken workflows that look like they listen for pushes.
-			if strings.Contains(string(src), "push") {
+			// As on GitHub, an invalid workflow gets a failed run showing
+			// the error: if its triggers can be read, when they'd run it.
+			if t := wf.Triggers(src); t == nil || wf.MatchesPush(t, ref, changed) {
 				_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: file, event: "push",
 					payload: event, ref: ref, sha: after, actor: commit.Author, title: commit.Subject, parseErr: perr})
 			}
@@ -659,8 +660,9 @@ func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, 
 			}
 			w, perr := wf.Parse(yaml)
 			if perr != nil {
-				// Report broken workflows that look like they listen to src.
-				if mentionsSrc.Match(yaml) {
+				// Report invalid workflows that listen to src, or, if
+				// their triggers can't be read, look like they do.
+				if t := wf.Triggers(yaml); (t != nil && matches(t)) || (t == nil && mentionsSrc.Match(yaml)) {
 					_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(yaml), name: file, event: event,
 						payload: payload, ref: dstRef, sha: sha, actor: actor, title: title, parseErr: perr})
 				}

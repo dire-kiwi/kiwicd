@@ -21,7 +21,10 @@ import (
 
 const workflow = `
 name: CI
+run-name: CI of ${{ github.ref_name }}
 on: [push, workflow_dispatch]
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: self-hosted
@@ -36,11 +39,16 @@ jobs:
   test:
     needs: build
     runs-on: [self-hosted, linux]
+    # n=3 fails, but may: the run still succeeds and after-failure is skipped.
+    continue-on-error: ${{ matrix.n == 3 }}
+    concurrency: test-${{ matrix.n }}
+    permissions: read-all
     strategy:
+      max-parallel: 1
       matrix:
-        n: [1, 2]
+        n: [1, 2, 3]
     steps:
-      - run: test "${{ needs.build.outputs.v }}" = "hi" && echo "matrix ${{ matrix.n }}"
+      - run: test "${{ needs.build.outputs.v }}" = "hi" && echo "matrix ${{ matrix.n }}" && test ${{ matrix.n }} != 3
   missing-label:
     if: false
     runs-on: nope
@@ -56,7 +64,7 @@ jobs:
 
 type runResp struct {
 	Run struct {
-		Status, Conclusion, Error string
+		Status, Conclusion, Error, Title string
 	} `json:"run"`
 	Jobs []struct {
 		ID                int64
@@ -150,14 +158,15 @@ func TestPushRunsWorkflow(t *testing.T) {
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	if r.Run.Conclusion != "success" {
+	if r.Run.Conclusion != "success" || r.Run.Title != "CI of main" {
 		t.Fatalf("run %+v", r)
 	}
 	got := map[string]string{}
 	for _, j := range r.Jobs {
 		got[j.Name] = j.Conclusion
 	}
-	want := map[string]string{"build": "success", "test (1)": "success", "test (2)": "success", "missing-label": "skipped", "after-failure": "skipped"}
+	want := map[string]string{"build": "success", "test (1)": "success", "test (2)": "success", "test (3)": "failure",
+		"missing-label": "skipped", "after-failure": "skipped"}
 	for k, v := range want {
 		if got[k] != v {
 			t.Errorf("job %s: got %q want %q (all: %v)", k, got[k], v, got)

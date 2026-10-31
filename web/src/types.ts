@@ -85,9 +85,17 @@ export interface Run {
   protected: boolean;
   /** The workflow's concurrency group, of which one run of the repository runs at a time. */
   concurrency_group?: string;
+  /** The workflow's permissions:, or null when not set. */
+  permissions: Permissions | null;
   created_at: number;
   started_at: number;
   finished_at: number;
+}
+
+/** A permissions: setting: read-all/write-all set all, a mapping sets scopes (the rest get none). */
+export interface Permissions {
+  all?: "read" | "write";
+  scopes?: Record<string, string>;
 }
 
 export interface Step {
@@ -113,6 +121,14 @@ export interface Job {
   outputs: Record<string, string> | null;
   steps: Step[] | null;
   cancel_requested: boolean;
+  /** Job-level concurrency group; a pending job waits for the group's running one. */
+  concurrency_group?: string;
+  /** Its failure doesn't fail the run. */
+  continue_on_error: boolean;
+  /** strategy.max-parallel of its matrix. */
+  max_parallel?: number;
+  /** Its permissions (its own or the workflow's), or null when not set. */
+  permissions: Permissions | null;
   log_seq: number;
   created_at: number;
   started_at: number;

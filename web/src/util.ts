@@ -1,4 +1,4 @@
-import type { Conclusion, Status } from "./types";
+import type { Conclusion, Permissions, Status } from "./types";
 
 export function formatDuration(ms: number): string {
   if (!isFinite(ms) || ms < 0) ms = 0;
@@ -123,4 +123,12 @@ export function eventLabel(ev: string): string {
 
 export function classes(...xs: (string | false | null | undefined)[]): string {
   return xs.filter(Boolean).join(" ");
+}
+
+/** Describes a permissions: setting, e.g. "read-all" or "contents: read, packages: write". */
+export function permissionsLabel(p: Permissions): string {
+  if (p.all) return `${p.all}-all`;
+  const scopes = Object.entries(p.scopes ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  if (scopes.length === 0) return "none";
+  return scopes.map(([k, v]) => `${k}: ${v}`).join(", ");
 }

@@ -176,7 +176,8 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // assignJob gives the oldest queued job whose runs-on labels the runner has
-// and whose run may use the runner's reserved and protected labels.
+// and whose run may use the runner's reserved and protected labels, leaving
+// a matrix's jobs queued while max-parallel of them run.
 func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*protocol.JobRequest, error) {
 	s.mu.Lock()
 	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE status = ? ORDER BY id`, protocol.StatusQueued)
@@ -203,7 +204,20 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 	// forever: fail them.
 	denied := map[int64]string{}
 	limited := s.reserved.reservesAny(rn.Labels) || len(s.protectedLabels.of(rn.Labels)) > 0
+	running := map[string]int{} // of a matrix with max-parallel, by run and job key
 	for _, j := range candidates {
+		if j.MaxParallel > 0 {
+			k := fmt.Sprintf("%d/%s", j.RunID, j.Key)
+			n, ok := running[k]
+			if !ok {
+				_ = s.db.QueryRow(`SELECT count(*) FROM jobs WHERE run_id = ? AND job_key = ? AND status = ?`,
+					j.RunID, j.Key, protocol.StatusInProgress).Scan(&n)
+				running[k] = n
+			}
+			if n >= j.MaxParallel {
+				continue
+			}
+		}
 		if limited {
 			run, err := s.getRun(j.RunID)
 			if err != nil {
@@ -333,6 +347,7 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		Vars:           s.varsFor(run.RepoID),
 		Notices:        notices,
 		Env:            env,
+		Permissions:    j.Permissions,
 		TimeoutMinutes: 360,
 		ServerURL:      server,
 		SourcePath:     fmt.Sprintf("/api/runner/jobs/%d/source", j.ID),

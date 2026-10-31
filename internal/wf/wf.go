@@ -40,6 +40,9 @@ func Parse(src []byte) (*model.Workflow, error) {
 	if _, err := Order(w); err != nil {
 		return nil, err
 	}
+	if err := validateExtras(src); err != nil {
+		return nil, err
+	}
 	return w, nil
 }
 
@@ -236,44 +239,11 @@ type Concurrency struct {
 // the workflow file, since act's model doesn't keep it). Expressions can use
 // github, inputs and vars. It returns a zero Concurrency if there is none.
 func WorkflowConcurrency(src []byte, e *Env) (Concurrency, error) {
-	var doc struct {
-		Concurrency yaml.Node `yaml:"concurrency"`
-	}
-	if err := yaml.Unmarshal(src, &doc); err != nil {
+	x, err := ReadExtras(src)
+	if err != nil {
 		return Concurrency{}, err
 	}
-	node := doc.Concurrency
-	var out Concurrency
-	switch node.Kind {
-	case 0:
-		return out, nil
-	case yaml.ScalarNode:
-		v, err := e.Interpolate(node.Value)
-		if err != nil {
-			return out, fmt.Errorf("concurrency: %w", err)
-		}
-		out.Group = ToString(v)
-	case yaml.MappingNode:
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			key, val := node.Content[i].Value, node.Content[i+1]
-			v, err := e.Interpolate(val.Value)
-			if err != nil {
-				return out, fmt.Errorf("concurrency.%s: %w", key, err)
-			}
-			switch key {
-			case "group":
-				out.Group = ToString(v)
-			case "cancel-in-progress":
-				out.CancelInProgress = exprparser.IsTruthy(v) && ToString(v) != "false"
-			}
-		}
-		if out.Group == "" {
-			return Concurrency{}, fmt.Errorf("concurrency: the group is empty")
-		}
-	default:
-		return out, fmt.Errorf("concurrency must be a group name or a mapping")
-	}
-	return out, nil
+	return e.EvalConcurrency(x.Concurrency)
 }
 
 func matchesPushFilters(cfg map[string]any, ref string, changedFiles []string) bool {
