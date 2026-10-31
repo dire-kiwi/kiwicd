@@ -367,6 +367,7 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditRepoChanges(r, &before, repo, req.SSHKey != nil || req.GenerateSSHKey, req.SSHKnownHosts != nil)
+	s.schedulesChanged(repo.ID) // the default branch may have changed
 	repo, _ = s.getRepoByID(repo.ID)
 	s.decorateRepo(r, repo)
 	writeJSON(w, repo)
@@ -498,6 +499,7 @@ func (s *Server) deleteRepo(id int64, name string) error {
 	s.tipMu.Lock()
 	delete(s.tipWorkflows, id)
 	s.tipMu.Unlock()
+	s.schedulesChanged(id)
 	for _, dir := range []string{s.repoPath(name), s.sshDir(id)} {
 		if err := removeAll(dir); err != nil {
 			s.log.Warn("remove repository files", "dir", dir, "err", err)
@@ -630,6 +632,9 @@ func (s *Server) syncRepo(ctx context.Context, id int64, baseline bool) error {
 		}
 	}
 	_, err = s.db.Exec(`UPDATE repos SET refs = ?, last_sync_at = ?, synced_at = ?, last_sync_error = '' WHERE id = ?`, mustJSON(refs), nowMS(), nowMS(), id)
+	if defaultRef := "refs/heads/" + repo.DefaultBranch; refs[defaultRef] != repo.Refs[defaultRef] {
+		s.schedulesChanged(id)
+	}
 	return err
 }
 
@@ -818,6 +823,7 @@ type workflowInfo struct {
 	EventDetails map[string]string  `json:"event_details,omitempty"`
 	Dispatch     bool               `json:"dispatch"`
 	Inputs       []wf.DispatchInput `json:"inputs"`
+	Schedules    []scheduleInfo     `json:"schedules,omitempty"`
 	Error        string             `json:"error,omitempty"`
 	Uploaded     bool               `json:"uploaded,omitempty"`
 }
@@ -835,6 +841,9 @@ func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
 	out := []workflowInfo{}
 	// Uploaded workflows are listed even before the repository has commits.
 	sha, _ := resolveRef(r.Context(), s.repoPath(repo.Name), ref)
+	// Schedules run from the default branch's workflows only.
+	defaultSHA, _ := resolveRef(r.Context(), s.repoPath(repo.Name), "refs/heads/"+repo.DefaultBranch)
+	onDefault := sha != "" && sha == defaultSHA
 	files, err := s.workflowsAt(r.Context(), repo, sha)
 	if err != nil {
 		httpError(w, 500, "%v", err)
@@ -860,6 +869,9 @@ func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
 			}
 			info.Dispatch = wf.HasEvent(parsed, "workflow_dispatch")
 			info.Inputs = wf.DispatchInputs(parsed)
+			if list := wf.Schedules(parsed); len(list) > 0 {
+				info.Schedules = s.workflowSchedules(repo.ID, file, list, onDefault, s.sched.now())
+			}
 		}
 		out = append(out, info)
 	}

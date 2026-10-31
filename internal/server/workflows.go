@@ -142,9 +142,16 @@ func (s *Server) handlePutUploadedWorkflow(w http.ResponseWriter, r *http.Reques
 		httpError(w, 400, "the workflow is empty")
 		return
 	}
-	if _, err := wf.Parse([]byte(content)); err != nil {
+	parsed, err := wf.Parse([]byte(content))
+	if err != nil {
 		httpError(w, 400, "invalid workflow: %v", err)
 		return
+	}
+	for _, sch := range wf.Schedules(parsed) {
+		if _, err := sch.Parse(); err != nil {
+			httpError(w, 400, "invalid workflow: schedule: %v", err)
+			return
+		}
 	}
 	u := uploadedWorkflow{File: file, Content: content, UpdatedAt: nowMS()}
 	_, err = s.db.Exec(`INSERT INTO uploaded_workflows (repo_id, file, content, updated_at) VALUES (?, ?, ?, ?)
@@ -154,6 +161,7 @@ func (s *Server) handlePutUploadedWorkflow(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	s.audit(r, "workflow.upload", repo.Name, u.File, "")
+	s.schedulesChanged(repo.ID)
 	writeJSON(w, u)
 }
 
@@ -173,5 +181,6 @@ func (s *Server) handleDeleteUploadedWorkflow(w http.ResponseWriter, r *http.Req
 		return
 	}
 	s.audit(r, "workflow.delete", repo.Name, r.PathValue("file"), "")
+	s.schedulesChanged(repo.ID)
 	writeJSON(w, map[string]bool{"ok": true})
 }

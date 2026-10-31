@@ -1,9 +1,9 @@
 # kiwicd
 
 kiwicd runs GitHub Actions workflows on your own machines. A Go server hosts (or mirrors) git
-repositories, triggers workflows on push or by hand, schedules jobs and shows live logs in a
-React UI. Agents connect to it the way self-hosted GitHub runners do and run each job with
-[act](https://github.com/nektos/act), through our fork
+repositories, triggers workflows on push, on a schedule or by hand, schedules jobs and shows
+live logs in a React UI. Agents connect to it the way self-hosted GitHub runners do and run each
+job with [act](https://github.com/nektos/act), through our fork
 [dire-kiwi/act](https://github.com/dire-kiwi/act) (the `act/` submodule).
 
 ```
@@ -17,10 +17,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `on: pull_request` with `types`,
   `branches` and `paths` (see [Pull requests](#pull-requests)), `workflow_dispatch` with inputs,
-  `workflow_run`, `repository_dispatch`, `create` and `delete` (see [More events](#more-events)),
-  `types` for the events that have activity types, `needs`, job `if`, `strategy.matrix`
-  (include/exclude, fail-fast), job `outputs`, `env`,
-  `defaults`, `timeout-minutes`, `secrets`, `vars`.
+  `schedule` (see below), `workflow_run`, `repository_dispatch`, `create` and `delete` (see
+  [More events](#more-events)), `types` for the events that have activity types, `needs`, job
+  `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`, `defaults`,
+  `timeout-minutes`, `secrets`, `vars`.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
   commands, `::add-mask::`, `hashFiles()`. `actions/checkout` of the workflow's own repository is
@@ -50,6 +50,17 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   same repository or another one, with typed `with:` inputs, `secrets:` (or `secrets: inherit`),
   outputs for `needs.<id>.outputs`, and `strategy.matrix`, `needs` and `if` on the calling job,
   nested up to four levels (see [Reusable workflows](#reusable-workflows)).
+- **Schedules**: `on: schedule` with `- cron: '30 5 * * 1-5'` entries runs a workflow as on
+  GitHub: five POSIX cron fields (minute, hour, day of month, month, day of week; `*/15`, ranges,
+  lists and names like `MON` work; `@daily` and the like don't), in UTC or in the entry's
+  `timezone` (`timezone: Pacific/Auckland`). Workflows on the default branch, committed or
+  uploaded, run at its latest commit with `github.event_name` `schedule` and
+  `github.event.schedule` set to the cron string, and get secrets, as runs from the default
+  branch do. A schedule runs at most every five minutes, and from when kiwicd first sees it on
+  the default branch: pushing it there, uploading it or making its branch the default. A
+  restart doesn't run a slot twice; a slot missed while the server was down runs when it starts,
+  but after a longer outage only the latest one does. The *Workflows* tab shows each schedule
+  and when it next runs.
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)). One with
@@ -77,9 +88,9 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   behind that reads a later protected job's secrets. Keep runners for protected refs with the
   server's `--protected-label`, or isolate jobs (see [Isolating jobs](#isolating-jobs)).
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
-  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request` and dispatched
-  runs from a protected ref, the repositories its workflow listens to that list it as a reader). It
-  can't push or use the API.
+  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request`, scheduled and
+  dispatched runs from a protected ref, the repositories its workflow listens to that list it as a
+  reader). It can't push or use the API.
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
@@ -319,11 +330,11 @@ curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/
   `github.event.ref`, `github.event.after` (the pushed commit), `github.event.head_commit`. The
   run's title is `owner/app: <commit subject>`, and its page shows the pushed commit.
 - `secrets.KIWICD_TOKEN` fetches the repositories the workflow lists under `repository_push` that
-  list the listening repository as a reader, in runs started by `repository_push` or by hand. The
-  repository being read has to agree, since any repository's default branch can listen to any
-  other, including a public one's where outside contributions land. Runs started by a push to the
-  listening repository only get that repository, since their workflow can come from any branch,
-  and so do dispatches on refs that aren't protected.
+  list the listening repository as a reader, in runs started by `repository_push`, a schedule or
+  by hand. The repository being read has to agree, since any repository's default branch can
+  listen to any other, including a public one's where outside contributions land. Runs started by
+  a push to the listening repository only get that repository, since their workflow can come from
+  any branch, and so do dispatches on refs that aren't protected.
 - GitHub doesn't know `repository_push`, so turn off GitHub Actions on the private repository if
   it's on GitHub, or GitHub reports the workflow as invalid.
 

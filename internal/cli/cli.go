@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -531,7 +532,22 @@ func workflowList(ctx context.Context, a *App, args []string) error {
 	}
 	var rows [][]string
 	for _, w := range ws {
-		on := strings.Join(w.Events, ", ")
+		events := slices.Clone(w.Events)
+		for i, e := range events {
+			if e != "schedule" || len(w.Schedules) == 0 {
+				continue
+			}
+			var crons []string
+			for _, sch := range w.Schedules {
+				c := sch.Cron
+				if sch.Timezone != "" {
+					c += " " + sch.Timezone
+				}
+				crons = append(crons, c)
+			}
+			events[i] = "schedule (" + strings.Join(crons, "; ") + ")"
+		}
+		on := strings.Join(events, ", ")
 		if w.Error != "" {
 			on = "invalid: " + truncate(w.Error, 60)
 		}
