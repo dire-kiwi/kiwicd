@@ -73,10 +73,15 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
 - **GitHub App**: one app, created from *Settings → GitHub*, sends kiwicd the pushes and pull
   requests of every repository it's installed on (no webhook per repository), lets mirrors of
-  private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
+  private ones fetch without a deploy key, and lets GitHub users, organizations' and teams'
   members sign in (see [GitHub App](#github-app)).
+- **Roles and audit log**: admin, maintainer (of all or some repositories) and viewer, given to
+  GitHub logins, organizations and teams; API tokens limited to a role and repositories; a log
+  of who changed secrets, variables, settings, runners, roles and tokens (see
+  [Access](#access)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
-  dispatch, runners, secrets and variables (global or per repository), API tokens.
+  dispatch, runners, secrets and variables (global or per repository), roles, API tokens and the
+  audit log.
 - **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
@@ -224,7 +229,7 @@ the app's webhook and sign-in URLs are made from it, and GitHub has to reach the
 is private, so it can only be installed on the account that owns it; create it in the
 organization whose repositories you mirror. An existing app can be entered by hand instead
 (*Use an existing app*), or with `PUT /api/github/app` (`app_id`, `client_id`, `client_secret`,
-`private_key`, `webhook_secret`, `allowed_users`, `allowed_orgs`).
+`private_key`, `webhook_secret`).
 
 Then **install the app** on the repositories kiwicd mirrors (*Install on repositories*). For
 each of them:
@@ -245,13 +250,57 @@ push and pull request events.
 ### Sign in with GitHub
 
 Once the app is set up, the sign-in page offers *Sign in with GitHub*, through the app's OAuth
-client. Who may sign in is set under **Settings → GitHub**: GitHub logins, and organizations whose
-members may (checked through the app, which has to be installed on the organization). The app's
-owner is allowed when it's created. Everyone signed in can do what the admin can; runs they start
-by hand show their login. Membership is checked when someone signs in, and GitHub sessions last a
-week. Removing a user or organization from the list signs out everyone signed in with GitHub,
-and revokes their API tokens; so does removing the app. The admin password keeps working, for
-the API and git too.
+client. People may sign in if they have a [role](#access): their login has one, or an
+organization or team they're a member of does (checked through the app, which has to be
+installed on the organization). The app's owner (the user, or the organization's members) is
+made an admin when the app is created. Runs they start by hand show their login. Membership is
+checked when someone signs in, and GitHub sessions last a week. The admin password keeps
+working, for the API and git too.
+
+## Access
+
+Everyone signed in has a role:
+
+| Role | May |
+| --- | --- |
+| **viewer** | see repositories, workflows, runs and their logs, and runners; fetch repositories over `/git/` |
+| **maintainer** of every repository, or of some (`owner/name` or `owner/*`) | also, for those repositories: secrets and variables, protected refs, readers, mirror settings, uploaded workflows, syncing, starting, re-running and cancelling runs, and pushing to hosted ones |
+| **admin** | everything, including global secrets and variables, adding and removing repositories, runners, the GitHub App, roles, everyone's API tokens and the audit log |
+
+The admin password is always an admin. Roles are given under **Settings → GitHub** (or
+`PUT /api/roles` with `{"kind": "user"|"org"|"team", "name": "LOGIN"|"ORG"|"ORG/TEAM-SLUG",
+"role": ..., "repos": [...]}`, and `DELETE /api/roles?kind=&name=`) to GitHub logins, to an
+organization's members and to a team's; someone matched by several gets the most they give, so
+an organization can be viewers and one team maintainers. Changing a role applies at once, to
+sessions and tokens too; people left without one are signed out and their API tokens revoked.
+Organization and team membership is only checked when someone signs in, so a new organization
+or team role reaches its members when they next sign in. Under it, *People who have signed in*
+shows everyone's role now.
+
+The server enforces roles on every API route and on git: what someone can't use is refused
+(`403`), and repositories a token can't see don't exist (`404`). The UI, `kiwicd` and
+`kiwicd mcp` leave out what the user or token can't use; `GET /api/me` says what that is
+(`access`).
+
+**API tokens** act as whoever made them, limited by their scope: a role no higher than the
+maker's (`viewer` makes a read-only token) and, optionally, some repositories, which are then
+the only ones the token sees and of which it is at most a maintainer, for a system that starts
+runs or an agent's `kiwicd mcp`. A token never has more than its maker has now, so lowering
+someone's role lowers their tokens'. Tokens without a scope, including all made before scopes
+existed, have their maker's full rights. Tokens with a scope can't make or revoke other tokens
+(except themselves, for `kiwicd logout`). Everyone sees and revokes their own tokens; admins
+see everyone's.
+
+**The audit log** (*Audit* in the menu, or `GET /api/audit?repo=&before=&limit=`) records who
+changed secrets and variables (never their values), repositories (created, deleted, protected
+refs, readers, mirror URL, default branch, SSH key and known hosts), uploaded workflows,
+runners (registered, removed, registration tokens made), roles, API tokens and the GitHub App,
+with the API token and client address used. Changes kiwicd makes itself, such as revoking
+tokens after the admin password changes, show as `kiwicd`. Entries are kept for good.
+
+Upgrading from before roles turns the GitHub sign-in allow list into admin roles, as it gave
+everyone the admin's access. People allowed through an organization keep their sessions if
+there was only one organization; otherwise they sign in again.
 
 ## Command line
 
@@ -259,6 +308,8 @@ the API and git too.
 for the admin password, makes a token with it and saves the server and token in
 `~/.config/kiwicd/cli.json` (mode 0600); the password itself isn't kept. People who sign in
 with GitHub make a token under **Settings → API tokens** and pass it with `--token`.
+`--role` and `--repo` (with the password) limit the token login makes; `kiwicd whoami` shows
+your role.
 `KIWICD_URL` and `KIWICD_API_TOKEN` override the saved ones, e.g. in scripts.
 
 ```sh
@@ -277,12 +328,13 @@ kiwicd api GET repos/owner/app               # any other API call
 Secrets and variables without `--repo` are the global ones. `--watch` exits non-zero unless the
 run succeeds, and list and view commands take `--json`. `kiwicd help` lists every command.
 
-API tokens act as whoever made them, as a `Bearer` token or a Basic password, for the API and
-git over `/git/`. The admin's can last forever; those of people signed in with GitHub last at
+API tokens act as whoever made them, limited by their [scope](#access), as a `Bearer` token or
+a Basic password, for the API and git over `/git/`. The admin's can last forever; those of people signed in with GitHub last at
 most 90 days, since organization membership is only checked when they sign in. Changing the
 admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
 revoked under **Settings → API tokens**, or with `kiwicd token list` and `kiwicd token revoke`;
-`kiwicd logout` revokes its own.
+`kiwicd logout` revokes its own. `kiwicd token create NAME --role viewer --repo owner/app` makes
+a read-only token that sees only `owner/app`.
 
 ### MCP
 
@@ -295,8 +347,10 @@ claude mcp add kiwicd -- kiwicd mcp              # or: kiwicd mcp --read-only
 Its tools list repositories, workflows, runs and runners, get a run with its jobs and steps,
 read the end of a job's log (or one step's), wait for a run to finish, start, re-run and cancel
 runs, and list, set and delete secrets and variables. Secrets stay write-only: the agent can set
-them but not read them back. `--read-only` leaves out the tools that change anything. Give it
-its own token (`KIWICD_API_TOKEN`) to revoke it separately from yours.
+them but not read them back. `--read-only` leaves out the tools that change anything, as does a
+viewer's or read-only token; the server says in its instructions what the token may do. Give it
+its own token (`KIWICD_API_TOKEN`), perhaps limited to a few repositories, to revoke it
+separately from yours.
 
 ## Layout
 
@@ -386,7 +440,7 @@ keeps them all for protected refs and jobs from other refs don't run at all.
 
 | Flag / variable | |
 |---|---|
-| `KIWICD_ADMIN_PASSWORD` | Required. UI login (user `admin`), git push and API basic auth. People can also [sign in with GitHub](#sign-in-with-github) |
+| `KIWICD_ADMIN_PASSWORD` | Required. UI login (user `admin`), git push and API basic auth, as an admin. People can also [sign in with GitHub](#sign-in-with-github), with a [role](#access) |
 | `--data` / `KIWICD_DATA` | Database and repositories |
 | `--public-url` / `KIWICD_PUBLIC_URL` | URL used in clone URLs, `github.server_url` and links |
 | `--retention-days` / `KIWICD_RETENTION_DAYS` | Days to keep completed runs and their logs (default 30, 0 keeps them forever); also passed to jobs as `GITHUB_RETENTION_DAYS` |
