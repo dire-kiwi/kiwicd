@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,17 @@ type fakeGitHub struct {
 	mu        sync.Mutex
 	gitAuth   []string // Authorization headers of git requests
 	tokenReqs []map[string]any
+	// The Checks API: requests to it, and whether the installation lacks
+	// the checks permission or check runs fail.
+	checkReqs  []checkReq
+	noChecks   bool
+	checksFail bool
+}
+
+type checkReq struct {
+	Method string
+	ID     string // the check run's, for updates
+	Body   checkRun
 }
 
 const (
@@ -121,8 +133,15 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			"owner": map[string]string{"login": "owner", "type": "User"}})
 	case p == "/app":
 		if app() {
+			f.mu.Lock()
+			perms := map[string]string{"contents": "read", "checks": "write"}
+			if f.noChecks {
+				delete(perms, "checks")
+			}
+			f.mu.Unlock()
 			reply(200, map[string]any{"slug": "kiwicd-test", "name": "kiwicd test", "html_url": f.ts.URL + "/apps/kiwicd-test",
-				"client_id": fakeClientID, "owner": map[string]string{"login": "owner"}})
+				"client_id": fakeClientID, "owner": map[string]string{"login": "owner", "type": "User"},
+				"permissions": perms, "events": []string{"push", "pull_request"}})
 		}
 	case p == "/repos/gh/app/installation":
 		if app() {
@@ -144,7 +163,12 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.mu.Lock()
 		f.tokenReqs = append(f.tokenReqs, body)
+		noChecks := f.noChecks
 		f.mu.Unlock()
+		if perms, _ := body["permissions"].(map[string]any); perms["checks"] != nil && noChecks {
+			reply(422, map[string]string{"message": "The permissions requested are not granted to this installation."})
+			return
+		}
 		token := fakeRepoToken
 		if p == "/app/installations/8/access_tokens" {
 			token = fakeOrgToken
@@ -152,7 +176,40 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		reply(201, map[string]any{"token": token, "expires_at": time.Now().Add(time.Hour)})
 	case p == "/app/installations":
 		if app() {
-			reply(200, []map[string]int{{"id": 7}})
+			f.mu.Lock()
+			perms := map[string]string{"contents": "read", "checks": "write"}
+			if f.noChecks {
+				delete(perms, "checks")
+			}
+			f.mu.Unlock()
+			reply(200, []map[string]any{{"id": 7, "account": map[string]string{"login": "gh"},
+				"html_url": f.ts.URL + "/settings/installations/7", "permissions": perms}})
+		}
+	case strings.HasPrefix(p, "/repos/gh/app/check-runs"):
+		if r.Header.Get("Authorization") != "token "+fakeRepoToken {
+			reply(401, map[string]string{"message": "bad token"})
+			return
+		}
+		var c checkReq
+		c.Method, c.ID = r.Method, strings.TrimPrefix(strings.TrimPrefix(p, "/repos/gh/app/check-runs"), "/")
+		if err := json.NewDecoder(r.Body).Decode(&c.Body); err != nil {
+			reply(400, map[string]string{"message": err.Error()})
+			return
+		}
+		f.mu.Lock()
+		f.checkReqs = append(f.checkReqs, c)
+		n, fail := len(f.checkReqs), f.checksFail
+		f.mu.Unlock()
+		switch {
+		case fail:
+			reply(500, map[string]string{"message": "Server Error"})
+		case r.Method == "POST" && c.ID == "":
+			reply(201, map[string]any{"id": 1000 + n, "check_suite": map[string]int{"id": 500}})
+		case r.Method == "PATCH" && c.ID != "":
+			id, _ := strconv.Atoi(c.ID)
+			reply(200, map[string]any{"id": id, "check_suite": map[string]int{"id": 500}})
+		default:
+			reply(404, map[string]string{"message": "Not Found"})
 		}
 	case p == "/installation/repositories":
 		reply(200, map[string]any{"repositories": []map[string]any{
@@ -232,6 +289,24 @@ func noRedirects(jar http.CookieJar) *http.Client {
 	return &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
+// hook delivers an app webhook signed with secret.
+func (g *githubTest) hook(event, body, secret string) (int, string) {
+	g.t.Helper()
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(body))
+	req, _ := http.NewRequest("POST", g.ts.URL+"/api/github/webhook", strings.NewReader(body))
+	req.Header.Set("X-GitHub-Event", event)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, strings.TrimSpace(string(b))
+}
+
 // createApp sets up the app with the manifest flow.
 func (g *githubTest) createApp() {
 	g.t.Helper()
@@ -248,8 +323,12 @@ func (g *githubTest) createApp() {
 		RedirectURL    string               `json:"redirect_url"`
 		CallbackURLs   []string             `json:"callback_urls"`
 		DefaultEvents  []string             `json:"default_events"`
+		Permissions    map[string]string    `json:"default_permissions"`
 	}
 	_ = json.Unmarshal([]byte(m.Manifest), &manifest)
+	if manifest.Permissions["checks"] != "write" || !containsFold(manifest.DefaultEvents, "check_run") || !containsFold(manifest.DefaultEvents, "check_suite") {
+		g.t.Errorf("manifest asks for %v and %v", manifest.Permissions, manifest.DefaultEvents)
+	}
 	if manifest.HookAttributes.URL != g.ts.URL+"/api/github/webhook" || manifest.RedirectURL != g.ts.URL+"/api/github/app/callback" ||
 		len(manifest.CallbackURLs) != 1 || manifest.CallbackURLs[0] != g.ts.URL+"/api/auth/github/callback" {
 		g.t.Fatalf("manifest %s", m.Manifest)
@@ -462,22 +541,7 @@ func TestGitHubWebhookAndFetch(t *testing.T) {
 		t.Errorf("token request %v", req)
 	}
 
-	hook := func(event, body, secret string) (int, string) {
-		t.Helper()
-		mac := hmac.New(sha256.New, []byte(secret))
-		mac.Write([]byte(body))
-		req, _ := http.NewRequest("POST", g.ts.URL+"/api/github/webhook", strings.NewReader(body))
-		req.Header.Set("X-GitHub-Event", event)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, strings.TrimSpace(string(b))
-	}
+	hook := g.hook
 	if code, _ := hook("push", `{"repository":{"full_name":"gh/app"}}`, "wrong"); code != 401 {
 		t.Errorf("wrongly signed webhook: %d", code)
 	}

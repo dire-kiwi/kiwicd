@@ -1,7 +1,10 @@
 package server
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -115,21 +118,29 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 404, "no such run")
 		return
 	}
-	repo, err := s.getRepoByID(run.RepoID)
-	if err != nil {
+	id, err := s.rerun(r.Context(), run)
+	if errors.Is(err, sql.ErrNoRows) {
 		httpError(w, 404, "repository is gone")
 		return
 	}
-	var attempt int64
-	_ = s.db.QueryRow(`SELECT MAX(attempt) FROM runs WHERE repo_id = ? AND number = ?`, run.RepoID, run.Number).Scan(&attempt)
-	id, err := s.createRun(r.Context(), runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
-		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1})
 	if err != nil {
 		httpError(w, 500, "%v", err)
 		return
 	}
 	writeJSON(w, map[string]int64{"run_id": id})
+}
+
+// rerun starts the next attempt of run.
+func (s *Server) rerun(ctx context.Context, run *Run) (int64, error) {
+	repo, err := s.getRepoByID(run.RepoID)
+	if err != nil {
+		return 0, err
+	}
+	var attempt int64
+	_ = s.db.QueryRow(`SELECT MAX(attempt) FROM runs WHERE repo_id = ? AND number = ?`, run.RepoID, run.Number).Scan(&attempt)
+	return s.createRun(ctx, runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
+		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
+		number: run.Number, attempt: attempt + 1})
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
