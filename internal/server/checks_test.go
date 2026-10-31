@@ -265,6 +265,35 @@ func TestGitHubChecks(t *testing.T) {
 		}
 	}
 
+	// A report GitHub won't take doesn't leave the check run in progress:
+	// it's sent again without it.
+	g.gh.mu.Lock()
+	g.gh.rejectReports = true
+	g.gh.mu.Unlock()
+	_, run = push("rejected")
+	jobs = jobsOf(run.ID)
+	waitChecks("queued check runs", map[string]string{"CI / build (1.22)": "queued/", "CI / build (1.23)": "queued/"})
+	j = jobs["build (1.22)"]
+	if err := g.srv.saveJobReport(j.ID, []protocol.StepSummary{{Step: 1, Markdown: "## Tests"}},
+		[]protocol.Annotation{{Level: protocol.AnnotationNotice, Message: "slow"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range jobs {
+		if j.Status != protocol.StatusCompleted {
+			if err := g.srv.completeJob(ctx, j.ID, protocol.ResultSuccess, "", nil, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	checks = waitChecks("check runs without their report", map[string]string{"CI / build (1.22)": "completed/success"})
+	if out := checks["CI / build (1.22)"].Body.Output; out == nil || out.Text != "" || out.Annotations != nil ||
+		!strings.Contains(out.Summary, "GitHub didn't accept this job's step summaries and annotations") {
+		t.Errorf("check run without its report %+v", out)
+	}
+	g.gh.mu.Lock()
+	g.gh.rejectReports = false
+	g.gh.mu.Unlock()
+
 	// Settings → GitHub says what the app and its installations lack.
 	var settings struct {
 		App struct {
@@ -382,6 +411,41 @@ func TestJobCheckRun(t *testing.T) {
 	if c.Output.Title != "Cancelled" || !strings.HasPrefix(c.Output.Summary, "**test (linux)** cancelled after 1m23s.") ||
 		!strings.Contains(c.Output.Summary, `| a \| b | in progress |`) {
 		t.Errorf("output %+v", c.Output)
+	}
+	// Without a report (an old job, or one from an agent that doesn't send
+	// them), the output is kiwicd's summary alone.
+	if c.Output.Text != "" || c.Output.Annotations != nil {
+		t.Errorf("output without a report %+v", c.Output)
+	}
+	// With one, the step summaries are the text, after the summary.
+	for _, q := range []string{
+		`INSERT INTO repos (id, name, kind, webhook_secret, created_at) VALUES (1, 't/r', 'hosted', 'x', 0)`,
+		`INSERT INTO runs (id, repo_id, number, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor, status, created_at)
+			VALUES (3, 1, 1, 'ci.yml', 'CI', '', 't', 'push', '{}', 'refs/heads/main', 'abc', 'me', 'completed', 0)`,
+		`INSERT INTO jobs (id, run_id, job_key, name, status, created_at) VALUES (9, 3, 'test', 'test (linux)', 'completed', 0)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := srv.saveJobReport(j.ID, []protocol.StepSummary{{Step: 2, Markdown: "## Coverage\n91%\n"}},
+		[]protocol.Annotation{{Level: protocol.AnnotationWarning, Message: "deprecated", File: "a.go", Line: 4, Col: 2, EndCol: 9},
+			{Level: protocol.AnnotationError, Message: "The operation was canceled.", Step: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	c = srv.jobCheckRun(run, j, target)
+	want := []checkAnnotation{
+		{Path: "a.go", StartLine: 4, EndLine: 4, StartColumn: 2, EndColumn: 9, AnnotationLevel: "warning", Message: "deprecated"},
+		{Path: ".github", StartLine: 1, EndLine: 1, AnnotationLevel: "failure", Message: "The operation was canceled."},
+	}
+	if !strings.HasPrefix(c.Output.Summary, "**test (linux)** cancelled after 1m23s.") || c.Output.Text != "## Coverage\n91%" ||
+		fmt.Sprint(c.Output.Annotations) != fmt.Sprint(want) {
+		t.Errorf("output with a report %+v", c.Output)
+	}
+	// A report is only sent once the job has finished.
+	j.Status = protocol.StatusInProgress
+	if c := srv.jobCheckRun(run, j, target); c.Output.Text != "" || c.Output.Annotations != nil {
+		t.Errorf("in progress output %+v", c.Output)
 	}
 	srv.cfg.PublicURL = ""
 	if c := srv.jobCheckRun(run, &Job{ID: 1, Name: "x", Status: protocol.StatusQueued}, target); c.DetailsURL != "" || c.Status != "queued" {

@@ -45,6 +45,9 @@ type fakeGitHub struct {
 	checkReqs  []checkReq
 	noChecks   bool
 	checksFail bool
+	// rejectReports makes check runs with text or annotations fail with a
+	// 422, as GitHub does when it doesn't like one.
+	rejectReports bool
 }
 
 type checkReq struct {
@@ -198,11 +201,13 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		f.checkReqs = append(f.checkReqs, c)
-		n, fail := len(f.checkReqs), f.checksFail
+		n, fail, reject := len(f.checkReqs), f.checksFail, f.rejectReports
 		f.mu.Unlock()
 		switch {
 		case fail:
 			reply(500, map[string]string{"message": "Server Error"})
+		case reject && c.Body.Output != nil && (c.Body.Output.Text != "" || len(c.Body.Output.Annotations) > 0):
+			reply(422, map[string]string{"message": "Invalid request."})
 		case r.Method == "POST" && c.ID == "":
 			reply(201, map[string]any{"id": 1000 + n, "check_suite": map[string]int{"id": 500}})
 		case r.Method == "PATCH" && c.ID != "":

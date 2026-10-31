@@ -305,13 +305,27 @@ func (s *Server) syncChecks(ctx context.Context, runID int64) error {
 				ID int64 `json:"id"`
 			} `json:"check_suite"`
 		}
-		if exists {
-			// The name, commit and link stay as they were created.
-			upd := *c
-			upd.Name, upd.HeadSHA, upd.DetailsURL, upd.ExternalID = "", "", "", ""
-			err = s.githubAPI(ctx, "PATCH", fmt.Sprintf("/repos/%s/check-runs/%d", target.repo, old.id), auth, &upd, &res)
-		} else {
-			err = s.githubAPI(ctx, "POST", "/repos/"+target.repo+"/check-runs", auth, c, &res)
+		send := func(c *checkRun) error {
+			if exists {
+				// The name, commit and link stay as they were created.
+				upd := *c
+				upd.Name, upd.HeadSHA, upd.DetailsURL, upd.ExternalID = "", "", "", ""
+				return s.githubAPI(ctx, "PATCH", fmt.Sprintf("/repos/%s/check-runs/%d", target.repo, old.id), auth, &upd, &res)
+			}
+			return s.githubAPI(ctx, "POST", "/repos/"+target.repo+"/check-runs", auth, c, &res)
+		}
+		err = send(c)
+		if isGitHubStatus(err, 422) && c.Output != nil && (c.Output.Text != "" || len(c.Output.Annotations) > 0) {
+			// GitHub didn't take the job's report. Retrying wouldn't help,
+			// and the check run would stay in progress: send it without.
+			s.log.Warn("GitHub rejected a check run's step summaries or annotations; sending it without them",
+				"repo", target.repo, "check", c.Name, "err", err)
+			out := *c.Output
+			out.Text, out.Annotations = "", nil
+			out.Summary = limitSummary(out.Summary + "\n\n*GitHub didn't accept this job's step summaries and annotations; kiwicd shows them.*")
+			bare := *c
+			bare.Output = &out
+			err = send(&bare)
 		}
 		if err != nil {
 			return fmt.Errorf("check run %q: %w", c.Name, err)
