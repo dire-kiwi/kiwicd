@@ -1,9 +1,9 @@
 # kiwicd
 
 kiwicd runs GitHub Actions workflows on your own machines. A Go server hosts (or mirrors) git
-repositories, triggers workflows on push or by hand, schedules jobs and shows live logs in a
-React UI. Agents connect to it the way self-hosted GitHub runners do and run each job with
-[act](https://github.com/nektos/act), through our fork
+repositories, triggers workflows on push, on a schedule or by hand, schedules jobs and shows
+live logs in a React UI. Agents connect to it the way self-hosted GitHub runners do and run each
+job with [act](https://github.com/nektos/act), through our fork
 [dire-kiwi/act](https://github.com/dire-kiwi/act) (the `act/` submodule).
 
 ```
@@ -17,14 +17,17 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `on: pull_request` with `types`,
   `branches` and `paths` (see [Pull requests](#pull-requests)), `workflow_dispatch` with inputs,
-  `workflow_run`, `repository_dispatch`, `create` and `delete` (see [More events](#more-events)),
-  `types` for the events that have activity types, `needs`, job `if`, `strategy.matrix`
-  (include/exclude, fail-fast), job `outputs`, `env`,
-  `defaults`, `timeout-minutes`, `secrets`, `vars`.
+  `schedule` (see below), `workflow_run`, `repository_dispatch`, `create` and `delete` (see
+  [More events](#more-events)), `types` for the events that have activity types, `needs`, job
+  `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`, `defaults`,
+  `timeout-minutes`, `secrets`, `vars`.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
   commands, `::add-mask::`, `hashFiles()`. `actions/checkout` of the workflow's own repository is
   served from the source archive the agent downloads.
+- **Services and job containers**: `jobs.<id>.services` (`image`, `env`, `ports`, `options`,
+  `credentials`, `volumes`) and `jobs.<id>.container` on every runner, e.g. a database for tests
+  (see [Services](#services)).
 - **Repositories**: *hosted* (push to `https://SERVER/git/OWNER/NAME.git`, which triggers
   workflows immediately) or *mirror* (a remote URL fetched every minute or on a webhook,
   `POST /api/hooks/OWNER/NAME` with GitHub's `X-Hub-Signature-256`, or through the
@@ -47,6 +50,17 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   same repository or another one, with typed `with:` inputs, `secrets:` (or `secrets: inherit`),
   outputs for `needs.<id>.outputs`, and `strategy.matrix`, `needs` and `if` on the calling job,
   nested up to four levels (see [Reusable workflows](#reusable-workflows)).
+- **Schedules**: `on: schedule` with `- cron: '30 5 * * 1-5'` entries runs a workflow as on
+  GitHub: five POSIX cron fields (minute, hour, day of month, month, day of week; `*/15`, ranges,
+  lists and names like `MON` work; `@daily` and the like don't), in UTC or in the entry's
+  `timezone` (`timezone: Pacific/Auckland`). Workflows on the default branch, committed or
+  uploaded, run at its latest commit with `github.event_name` `schedule` and
+  `github.event.schedule` set to the cron string, and get secrets, as runs from the default
+  branch do. A schedule runs at most every five minutes, and from when kiwicd first sees it on
+  the default branch: pushing it there, uploading it or making its branch the default. A
+  restart doesn't run a slot twice; a slot missed while the server was down runs when it starts,
+  but after a longer outage only the latest one does. The *Workflows* tab shows each schedule
+  and when it next runs.
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)). One with
@@ -86,9 +100,9 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   behind that reads a later protected job's secrets. Keep runners for protected refs with the
   server's `--protected-label`, or isolate jobs (see [Isolating jobs](#isolating-jobs)).
 - **Job tokens**: every job gets `secrets.KIWICD_TOKEN`, which can fetch its repository over
-  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request` and dispatched
-  runs from a protected ref, the repositories its workflow listens to that list it as a reader). It
-  can't push or use the API.
+  `/git/` while the job runs (and, for `repository_push`, `repository_pull_request`, scheduled and
+  dispatched runs from a protected ref, the repositories its workflow listens to that list it as a
+  reader). It can't push or use the API.
 - **Agents** register with a one-hour registration token, then use a long-lived runner token.
   `runs-on` labels must all match the agent's labels; every agent also has `self-hosted`,
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
@@ -106,15 +120,24 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   durations of jobs and steps on a timeline, re-run and cancel, filters on the runs list,
   repositories and workflows, manual dispatch, runners, secrets and variables (global or per
   repository), roles, API tokens and the audit log.
+- **Step summaries and annotations**: a run's Summary page shows what each job's steps wrote
+  to `$GITHUB_STEP_SUMMARY`, rendered from Markdown, and lists its annotations: `::error`,
+  `::warning` and `::notice` workflow commands (with `file`, `line`, `endLine`, `col` and
+  `title`) and why a job failed ("Process completed with exit code 1."), each linking to its
+  line in the job's log. As on GitHub, a step's summary may be up to 1 MiB (a larger one is
+  dropped with a warning), a job keeps up to 20 of them (and 8 MiB in all) and 50 annotations
+  from workflow commands; the rest stay in the log. Secrets are masked in both. Summaries are
+  sanitized before they're shown, since a workflow can write anything into them: no scripts,
+  styles, forms or frames, and images other than `data:` ones are shown as links. They're
+  served at `GET /api/runs/{id}/reports`.
 - **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
 
-Not yet: job `container:`/`services:` on host labels, artifacts and caches, job-level
-`concurrency`, `pull_request_target` (it runs the base branch's workflow with secrets on a pull
-request's event, which is easy to misuse by checking out the pull request's code), approval
-before a first-time contributor's pull request runs (GitHub's *approve and run*), `merge_group`,
-`issues`, `issue_comment`, `release`.
+Not yet: artifacts and caches, job-level `concurrency`, `pull_request_target` (it runs the base
+branch's workflow with secrets on a pull request's event, which is easy to misuse by checking out
+the pull request's code), approval before a first-time contributor's pull request runs (GitHub's
+*approve and run*), `merge_group`, `issues`, `issue_comment`, `release`.
 
 ## Pull requests
 
@@ -237,6 +260,52 @@ jobs:
 - Agents run called jobs from protocol 2 on: upgrade the server first, then the agents. Older
   agents keep taking other jobs.
 
+## Services
+
+Jobs can have service containers and run in a container of their own, as on GitHub, whatever
+runner they're on:
+
+```yaml
+jobs:
+  test:
+    runs-on: self-hosted
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: go test ./...
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/postgres
+```
+
+- **A job on the agent's machine** reaches its services on `localhost`, at the host port Docker
+  picked for each of their `ports` (`job.services.<id>.ports[<port>]`). kiwicd publishes them
+  on `127.0.0.1` only, unless the workflow names an address (`0.0.0.0:8080:80`). A fixed host
+  port (`5432:5432`) works too, but then two jobs using it can't run on the machine at once.
+- **A job with `container:`** runs its steps in that container, which reaches its services by
+  their IDs (`postgres:5432`) on a network the job's containers share. Without services, a
+  container job on the agent's machine uses the machine's network, as act does.
+- Steps wait for services' health checks (`--health-cmd`) before they start. The job context
+  also has `job.services.<id>.id` and `.network`, and `job.container.id` and `.network`.
+- Services and job containers run in Docker, so the agent needs it (`DOCKER_HOST`, or the
+  default socket). An agent that can't reach Docker fails such jobs at once and says why; other
+  jobs aren't affected.
+- Services never get the Docker socket, and job containers get it only from `--docker-socket`
+  (see [Isolating jobs](#isolating-jobs)).
+- The agent removes a job's service containers, job container and network when the job ends or
+  is cancelled, and those of jobs it didn't finish when it starts. They're named
+  `kiwicd-r<runner>-j<job>-...`.
+- On agents that isolate jobs (`--job-image`), services join the job's own network, and the
+  restrictions on container options and volumes apply to them as well. Their ports aren't
+  published on the machine: jobs reach them by name, and `job.services.<id>.ports[<port>]` is
+  the port itself.
+
 ## Deploy a public repository from a private one
 
 A public repository shouldn't carry its deployment: host names, addresses, users, scripts, or
@@ -285,11 +354,11 @@ curl -u admin -X PATCH -d '{"readers":["owner/app-deploy"]}' https://SERVER/api/
   `github.event.ref`, `github.event.after` (the pushed commit), `github.event.head_commit`. The
   run's title is `owner/app: <commit subject>`, and its page shows the pushed commit.
 - `secrets.KIWICD_TOKEN` fetches the repositories the workflow lists under `repository_push` that
-  list the listening repository as a reader, in runs started by `repository_push` or by hand. The
-  repository being read has to agree, since any repository's default branch can listen to any
-  other, including a public one's where outside contributions land. Runs started by a push to the
-  listening repository only get that repository, since their workflow can come from any branch,
-  and so do dispatches on refs that aren't protected.
+  list the listening repository as a reader, in runs started by `repository_push`, a schedule or
+  by hand. The repository being read has to agree, since any repository's default branch can
+  listen to any other, including a public one's where outside contributions land. Runs started by
+  a push to the listening repository only get that repository, since their workflow can come from
+  any branch, and so do dispatches on refs that aren't protected.
 - GitHub doesn't know `repository_push`, so turn off GitHub Actions on the private repository if
   it's on GitHub, or GitHub reports the workflow as invalid.
 
@@ -476,7 +545,9 @@ each of them:
   check run named `workflow / job`, with matrix values as in the job's name, e.g.
   `CI / test (1.23, linux)`. It's created when the job is queued and updated when it starts and
   finishes, with the conclusion, a short summary (duration, error, steps) and a link to the job
-  in kiwicd (made from `--public-url`). Push and dispatched runs report on their commit, pull
+  in kiwicd (made from `--public-url`). A finished job's check run also carries its step
+  summaries (cut to GitHub's limit) and its first 50 annotations, which GitHub shows on the
+  pull request's files; ones without a file go on `.github`, as GitHub Actions puts them. Push and dispatched runs report on their commit, pull
   request runs on the pull request's head. A workflow file that doesn't parse gets one failed
   check run. Branch protection can require these checks by name. **Re-run** on GitHub (one
   check, or all of a commit's) starts a new attempt of the runs they belong to, unless the
@@ -682,7 +753,8 @@ the job image. The agent needs Docker; its jobs don't get it. Also:
 - Workflows may not give their `container` or `services` options or volumes that reach outside
   the container: host paths, named volumes (they outlive the job), `--privileged`, devices,
   capabilities, other namespaces, `--env-file`. Options such as `--health-cmd`, `--user`,
-  `-e`, `--memory` and `--tmpfs` work as usual.
+  `-e`, `--memory` and `--tmpfs` work as usual. Service ports aren't published on the machine
+  (see [Services](#services)).
 - act's shared tool cache volume is left out and Docker actions are rebuilt for each job.
 - `--job-options` (`KIWICD_JOB_OPTIONS`) are `docker create` options for every job, service and
   step container, after the workflow's own, e.g. `--memory 4g --cpus 2 --pids-limit 4096`.
@@ -751,3 +823,9 @@ nektos/act. So far:
 - `Config.WorkflowCallInputs`: the `inputs` of a reusable workflow's job, which the server
   evaluates from the calling job's `with:`, since kiwicd runs called jobs itself rather than
   through act's own reusable workflow support.
+- Services for host jobs: on a network of their own, with their ports published on the host
+  (on `Config.ServicePortHostIP` unless the workflow names an address; not at all under
+  `RestrictContainers`). `job.services.<id>.id`, `.network` and `.ports`, and `job.container.id`
+  and `.network`, are filled in, and a number indexes an object (`ports[5432]`). Services don't
+  get the Docker socket, and one service's registry credentials no longer replace the job
+  container's.

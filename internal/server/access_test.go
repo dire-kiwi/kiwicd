@@ -230,6 +230,7 @@ func TestRouteAccess(t *testing.T) {
 		"GET /api/runs/{id}":                   {{"GET", "/api/runs/" + id(run), view("t/a")}, {"GET", "/api/runs/" + id(a.run["t/b"]), view("t/b")}},
 		"POST /api/runs/{id}/cancel":           {{"POST", "/api/runs/" + id(run) + "/cancel", maintain("t/a")}},
 		"POST /api/runs/{id}/rerun":            {{"POST", "/api/runs/" + id(a.run["t/b"]) + "/rerun", maintain("t/b")}},
+		"GET /api/runs/{id}/reports":           {{"GET", "/api/runs/" + id(a.run["t/b"]) + "/reports", view("t/b")}},
 		"GET /api/jobs/{id}":                   {{"GET", "/api/jobs/" + id(job), view("t/a")}},
 		"GET /api/jobs/{id}/logs":              {{"GET", "/api/jobs/" + id(a.job["t/b"]) + "/logs", view("t/b")}},
 		"GET /api/jobs/{id}/events":            {{"GET", "/api/jobs/" + id(job) + "/events", view("t/a")}},

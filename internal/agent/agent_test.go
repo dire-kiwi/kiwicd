@@ -102,7 +102,7 @@ func TestGroupCommands(t *testing.T) {
 	for _, l := range r.pending {
 		got = append(got, l.Text)
 	}
-	want := []string{"##[group]Build ***", "make", "##[endgroup]", "##[warning]🚧  ::warning::careful"}
+	want := []string{"##[group]Build ***", "make", "##[endgroup]", "##[warning]careful"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("lines = %q, want %q", got, want)
 	}

@@ -170,9 +170,9 @@ type checkRun struct {
 	Output      *checkOutput `json:"output,omitempty"`
 }
 
-// checkOutput is what GitHub shows on a check run's page. Text is for step
-// summaries and Annotations for ::error file=…:: and the like, which kiwicd
-// doesn't keep yet; GitHub takes at most 50 annotations per request.
+// checkOutput is what GitHub shows on a check run's page. Text holds a
+// finished job's step summaries and Annotations its ::error file=…:: and the
+// like (see reportCheckOutput).
 type checkOutput struct {
 	Title       string            `json:"title"`
 	Summary     string            `json:"summary"`
@@ -184,6 +184,8 @@ type checkAnnotation struct {
 	Path            string `json:"path"`
 	StartLine       int    `json:"start_line"`
 	EndLine         int    `json:"end_line"`
+	StartColumn     int    `json:"start_column,omitempty"`
+	EndColumn       int    `json:"end_column,omitempty"`
 	AnnotationLevel string `json:"annotation_level"` // notice, warning or failure
 	Message         string `json:"message"`
 	Title           string `json:"title,omitempty"`
@@ -380,6 +382,11 @@ func (s *Server) jobCheckRun(run *Run, j *Job, target checkTarget) *checkRun {
 		out.Summary += "."
 		if j.Error != "" {
 			out.Summary += "\n\n" + quoteMarkdown(j.Error)
+		}
+		if rep, err := s.jobReport(j.ID); err == nil {
+			reportCheckOutput(out, rep)
+		} else {
+			s.log.Warn("job report for its check run", "job", j.ID, "err", err)
 		}
 	}
 	if len(j.Steps) > 0 {

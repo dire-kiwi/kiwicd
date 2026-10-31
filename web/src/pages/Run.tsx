@@ -6,6 +6,7 @@ import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
 import { PlanGraph } from "../components/PlanGraph";
 import { RerunModal, type RerunWhat } from "../components/RerunModal";
+import { RunReports } from "../components/RunReports";
 import { RunTiming } from "../components/RunTiming";
 import { StatusIcon } from "../components/StatusIcon";
 import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../components/ui";
@@ -365,7 +366,8 @@ function JobNavItem({ runId, job, now }: { runId: number; job: Job; now: number 
 }
 
 function RunSummary({ run, groups, workflows, now }: { run: Run; groups: PlanGroup[]; workflows: CalledWorkflow[]; now: number }) {
-  const outputs = groups.flatMap(groupJobs).filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
+  const jobs = groups.flatMap(groupJobs);
+  const outputs = jobs.filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
   return (
     <div className="stack">
       <section className="box">
@@ -385,6 +387,7 @@ function RunSummary({ run, groups, workflows, now }: { run: Run; groups: PlanGro
           <PlanGraph runId={run.id} groups={groups} now={now} />
         )}
       </section>
+      <RunReports runId={run.id} jobs={jobs} />
       <RunTiming run={run} groups={groups} now={now} />
       {outputs.length > 0 && (
         <section className="box">

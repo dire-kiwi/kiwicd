@@ -235,6 +235,7 @@ export function JobLog({
   const lineView = useMemo(() => ({ showTs, onSelect, query }), [showTs, onSelect, query]);
 
   const isOpen = (index: number, step: Step | null) => {
+    if (target?.step === index && !(index in overrides)) return true;
     if (index in overrides) return overrides[index];
     if (!step) return true;
     return step.status === "in_progress" || (step.status === "completed" && step.conclusion === "failure");
@@ -604,6 +605,10 @@ export interface LineTarget {
 }
 
 export function parseLineHash(hash: string): LineTarget | undefined {
+  // Annotations link to lines by their element's id: #step-2-L14, with the
+  // step's index.
+  const id = /^#step-(-?\d+)-L(\d+)$/.exec(hash);
+  if (id) return { step: Number(id[1]), from: Number(id[2]), to: Number(id[2]) };
   const m = /^#step:(-?\d+)(?::(\d+)(?:-(\d+))?)?$/.exec(hash);
   if (!m) return undefined;
   const from = m[2] ? Number(m[2]) : 0;

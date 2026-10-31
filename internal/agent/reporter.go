@@ -36,13 +36,15 @@ type reporter struct {
 	cancelledStep int
 	secrets       []string
 	named         map[int]bool // steps with an explicit name: (may contain expressions)
+	report
 	// stepDebug shows ::debug:: messages, runnerDebug act's own debug
 	// messages (ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG).
 	stepDebug, runnerDebug bool
 }
 
 func newReporter(c *client, jobID int64, job *model.Job, secrets map[string]string, cancel context.CancelFunc) *reporter {
-	r := &reporter{c: c, jobID: jobID, cancel: cancel, stepIndex: map[string]int{}, postIndex: map[string]int{}, complete: -1, named: map[int]bool{}}
+	r := &reporter{c: c, jobID: jobID, cancel: cancel, stepIndex: map[string]int{}, postIndex: map[string]int{}, complete: -1, named: map[int]bool{},
+		report: newReport()}
 	for _, v := range secrets {
 		r.secrets = append(r.secrets, maskValues(v)...)
 	}
@@ -139,7 +141,15 @@ func (r *reporter) logf(step int, format string, args ...any) {
 	defer r.mu.Unlock()
 	text := r.maskSecrets(fmt.Sprintf(format, args...))
 	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-		r.pending = append(r.pending, protocol.LogLine{Step: step, TS: nowMS(), Text: line})
+		r.addLine(step, nowMS(), line)
+	}
+}
+
+// addLine queues a log line, noting it if it's an error.
+func (r *reporter) addLine(step int, ts int64, text string) {
+	n := r.queueLine(step, ts, text)
+	if msg, ok := strings.CutPrefix(text, "##[error]"); ok {
+		r.trackError(step, n, msg)
 	}
 }
 
@@ -252,9 +262,12 @@ func (r *reporter) handle(e *logrus.Entry) {
 		r.lastStep = idx
 	}
 
+	if !raw && r.handleCommand(e, idx) {
+		return
+	}
 	if text, ok := r.commandLine(e); ok {
 		if text != "" {
-			r.pending = append(r.pending, protocol.LogLine{Step: idx, TS: e.Time.UnixMilli(), Text: text})
+			r.queueLine(idx, e.Time.UnixMilli(), text)
 		}
 		return
 	}
@@ -281,7 +294,7 @@ func (r *reporter) handle(e *logrus.Entry) {
 		}
 	}
 	for _, line := range strings.Split(msg, "\n") {
-		r.pending = append(r.pending, protocol.LogLine{Step: idx, TS: e.Time.UnixMilli(), Text: line})
+		r.addLine(idx, e.Time.UnixMilli(), line)
 	}
 }
 
@@ -376,15 +389,16 @@ func (r *reporter) flushLoop(ctx context.Context) {
 			r.mu.Lock()
 			r.cancelled = true
 			r.cancelledStep = r.lastStep
-			r.pending = append(r.pending, protocol.LogLine{Step: r.lastStep, TS: nowMS(), Text: "##[error]The run was cancelled."})
+			r.addLine(r.lastStep, nowMS(), "##[error]The run was cancelled.")
 			r.mu.Unlock()
 			r.cancel()
 		}
 	}
 }
 
-// finish closes open steps and returns everything left to send.
-func (r *reporter) finish(result string) ([]protocol.LogLine, []protocol.StepState) {
+// finish closes open steps and returns everything left to send: the job's
+// result but for its outputs.
+func (r *reporter) finish(result string) protocol.JobComplete {
 	r.mu.Lock()
 	idx := r.completeIndex()
 	for i := range r.steps {
@@ -401,22 +415,19 @@ func (r *reporter) finish(result string) ([]protocol.LogLine, []protocol.StepSta
 			st.StartedAt, st.FinishedAt = 0, 0
 		}
 	}
+	r.finishReport(result)
 	logs := r.pending
 	r.pending = nil
 	var steps []protocol.StepState
-	hasLogs := map[int]bool{}
-	for _, l := range logs {
-		hasLogs[l.Step] = true
-	}
 	for i, st := range r.steps {
 		// Hide post steps that did nothing, but keep indexes stable.
-		if strings.HasPrefix(st.Name, "Post ") && st.Conclusion == protocol.ResultSkipped && !hasLogs[i] {
+		if strings.HasPrefix(st.Name, "Post ") && st.Conclusion == protocol.ResultSkipped && r.lines[i] == 0 {
 			st.Name = ""
 		}
 		steps = append(steps, st)
 	}
 	r.mu.Unlock()
-	return logs, steps
+	return protocol.JobComplete{Result: result, Logs: logs, Steps: steps, Summaries: r.summaries, Annotations: r.annotations}
 }
 
 // formatter hands entries to the reporter. act wraps it in its masking

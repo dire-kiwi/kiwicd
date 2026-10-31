@@ -187,6 +187,12 @@ type Workflow struct {
 		Type        string   `json:"type,omitempty"`
 		Options     []string `json:"options,omitempty"`
 	} `json:"inputs"`
+	Schedules []struct {
+		Cron      string `json:"cron"`
+		Timezone  string `json:"timezone,omitempty"`
+		NextRunAt int64  `json:"next_run_at,omitempty"`
+		Error     string `json:"error,omitempty"`
+	} `json:"schedules,omitempty"`
 	Error    string `json:"error,omitempty"`
 	Uploaded bool   `json:"uploaded,omitempty"`
 }

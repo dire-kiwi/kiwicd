@@ -266,7 +266,7 @@ function WorkflowsTab({ repo, maintainer }: { repo: Repo; maintainer: boolean })
         {committed && committed.length > 0 && (
           <ul className="list">
             {committed.map((w) => (
-              <WorkflowRow key={w.file} workflow={w} file={w.file} onRun={maintainer ? () => setDispatching(w) : undefined} />
+              <WorkflowRow key={w.file} workflow={w} file={w.file} defaultBranch={repo.default_branch} onRun={maintainer ? () => setDispatching(w) : undefined} />
             ))}
           </ul>
         )}
@@ -278,7 +278,8 @@ function WorkflowsTab({ repo, maintainer }: { repo: Repo; maintainer: boolean })
             <h3>Uploaded workflows</h3>
             <p className="muted small">
               Stored in kiwicd instead of the repository, for workflows you don't want to commit. They run on pushes to every
-              branch, as if they were in <code>.github/workflows/</code>, with the pushed commit checked out.
+              branch, as if they were in <code>.github/workflows/</code>, with the pushed commit checked out. Their schedules run on the
+              default branch's latest commit.
             </p>
           </div>
           {maintainer && (
@@ -306,7 +307,7 @@ function WorkflowsTab({ repo, maintainer }: { repo: Repo; maintainer: boolean })
             {uploaded.map((w) => {
               const file = w.file.slice(uploadedPrefix.length);
               return (
-                <WorkflowRow key={w.file} workflow={w} file={file} onRun={maintainer ? () => setDispatching(w) : undefined}>
+                <WorkflowRow key={w.file} workflow={w} file={file} defaultBranch={repo.default_branch} onRun={maintainer ? () => setDispatching(w) : undefined}>
                   {maintainer && (
                     <div className="row-actions">
                       <button className="btn btn-sm" onClick={() => setEditing({ file, isNew: false })}>
@@ -341,7 +342,19 @@ function WorkflowsTab({ repo, maintainer }: { repo: Repo; maintainer: boolean })
   );
 }
 
-function WorkflowRow({ workflow: w, file, onRun, children }: { workflow: Workflow; file: string; onRun?: () => void; children?: ReactNode }) {
+function WorkflowRow({
+  workflow: w,
+  file,
+  defaultBranch,
+  onRun,
+  children,
+}: {
+  workflow: Workflow;
+  file: string;
+  defaultBranch: string;
+  onRun?: () => void;
+  children?: ReactNode;
+}) {
   return (
     <li className="list-row workflow-row">
       <div className="workflow-main">
@@ -360,6 +373,25 @@ function WorkflowRow({ workflow: w, file, onRun, children }: { workflow: Workflo
               );
             })}
           </div>
+        )}
+        {(w.schedules ?? []).length > 0 && (
+          <ul className="schedules small">
+            {(w.schedules ?? []).map((s) => (
+              <li key={`${s.cron} ${s.timezone ?? ""}`}>
+                <Icon name="clock" size={12} /> <code>{s.cron}</code> <span className="muted">{s.timezone || "UTC"}</span>
+                {" · "}
+                {s.error ? (
+                  <span className="text-danger">{s.error}</span>
+                ) : s.next_run_at ? (
+                  <span title={absoluteTime(s.next_run_at)}>next run {relativeTime(s.next_run_at)}</span>
+                ) : (
+                  <span className="muted">
+                    runs only from <code>{defaultBranch}</code>
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
         )}
       </div>
       {onRun && w.dispatch && !w.error && (
