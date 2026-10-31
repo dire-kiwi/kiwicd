@@ -179,8 +179,16 @@ func (s *Server) copyJobLogs(from, to int64) error {
 		return err
 	}
 	if archive == "" {
-		_, err := s.db.Exec(`INSERT INTO log_lines (job_id, seq, step, ts, text) SELECT ?, seq, step, ts, text FROM log_lines WHERE job_id = ?`, to, from)
-		return err
+		if _, err := s.db.Exec(`INSERT INTO log_lines (job_id, seq, step, ts, text) SELECT ?, seq, step, ts, text FROM log_lines WHERE job_id = ?`, to, from); err != nil {
+			return err
+		}
+		// Once this returns and archiveMu is free.
+		go func() {
+			if err := s.archiveJobLogs(to); err != nil {
+				s.log.Error("archive job logs", "job", to, "err", err)
+			}
+		}()
+		return nil
 	}
 	src, dst := s.logArchivePath(from), s.logArchivePath(to)
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
