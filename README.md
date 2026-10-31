@@ -16,7 +16,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `workflow_dispatch` with inputs,
-  `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`,
+  `workflow_run`, `repository_dispatch`, `create` and `delete` (see [More events](#more-events)),
+  `types` for the events that have activity types, `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`,
   `defaults`, `timeout-minutes`, `secrets`, `vars`.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
@@ -83,7 +84,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 
 Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
 artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
-(only other repositories' `repository_pull_request`), commit statuses on GitHub.
+(only other repositories' `repository_pull_request`), `pull_request_target`, `merge_group`,
+`issues`, `issue_comment`, `release`, commit statuses on GitHub.
 
 ## Deploy a public repository from a private one
 
@@ -215,6 +217,81 @@ jobs:
   and `cancel-in-progress` stops it rather than waiting for it to finish. Since a cancelled job can
   stop part way through a deploy, the close's removal should cope with a half-deployed preview.
 
+## More events
+
+As on GitHub, a workflow can also run after another one, on request, or when a branch or tag is
+created or deleted.
+
+### After another workflow: `workflow_run`
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+on:
+  workflow_run:
+    workflows: [CI]               # names of this repository's workflows (their file without a name)
+    types: [completed]            # requested, in_progress, completed; all by default
+    branches: [main]              # the CI run's branch; branches-ignore works too
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, deploy]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - run: ./deploy.sh
+```
+
+- The workflow runs from the repository's **default branch** (its file there, at the tip), not
+  from the run it follows. `github.event.workflow_run` has the run's `id`, `name`, `run_number`,
+  `run_attempt`, `event`, `status`, `conclusion` (with `completed`: `success`, `failure`,
+  `cancelled`), `head_branch`, `head_sha`, `path` and `html_url`; `github.event.action` is the
+  activity type. Its runs page links to the run it followed.
+- **It gets the default branch's secrets, whatever ref the run it follows was for**, as on
+  GitHub. That's what makes deploy-after-CI work, and also what makes it risky: a CI run on a
+  branch that anyone can push to (a collaborator's, Dependabot's) runs code you haven't reviewed,
+  and anything it leaves behind or reports (job outputs, files on a runner that keeps state,
+  values it pushed somewhere) is under that branch's control. Treat what comes from the run you
+  follow as untrusted input: check `head_branch` and `event`, build from `head_sha` yourself rather
+  than reusing what the run built, and don't pass its values to a shell unquoted.
+- Runs that follow each other stop after three levels, as on GitHub: in A → B → C → D → E, where
+  each follows the one before with `workflow_run`, E doesn't run (the server logs that it
+  didn't). A workflow that follows itself is caught the same way.
+- Every run of the repository counts, whatever started it: pushes, dispatches, re-runs,
+  `repository_push` and the events below.
+
+### On request: `repository_dispatch`
+
+```yaml
+on:
+  repository_dispatch:
+    types: [deploy]               # event types; any by default
+```
+
+```sh
+curl -u admin -X POST -d '{"event_type":"deploy","client_payload":{"env":"prod"}}' \
+  https://SERVER/api/repos/OWNER/NAME/dispatches
+kiwicd repo dispatch OWNER/NAME deploy --payload '{"env":"prod"}'
+```
+
+The request is GitHub's *create a repository dispatch event*, authenticated like the rest of the
+API (an [API token](#command-line) works). It starts the default branch's workflows whose `types`
+include `event_type` (1 to 100 characters) and returns their runs, `{"run_ids": [...]}`, which may
+be none. `github.event.action` is the event type and `github.event.client_payload` the payload
+(a JSON object). The [GitHub App](#github-app) also takes GitHub's `repository_dispatch`
+webhook, for mirrors of the repositories it's installed on: the mirror is fetched first, so the
+run is of its default branch's latest commit. GitHub only sends that webhook to apps, for
+dispatches that a GitHub App made on GitHub (not ones made with a personal token).
+
+### Branches and tags: `create` and `delete`
+
+`on: create` runs when a push or a mirror's fetch creates a branch or tag, from the workflow file
+in its commit and at its ref, like a push to it (so an unprotected branch gets no secrets).
+`on: delete` runs when one is deleted, from the default branch. Neither takes filters, as on
+GitHub; check `github.event.ref_type` (`branch` or `tag`) and `github.event.ref` (the short name)
+in the job's `if`. A mirror's first fetch doesn't create anything.
+
 ## GitHub App
 
 kiwicd can have one GitHub App. Create it under **Settings → GitHub**: pick your account or an
@@ -233,7 +310,8 @@ each of them:
   `https://SERVER/api/github/webhook`, and kiwicd hands each to the mirrors of that repository
   (mirrors whose URL is it on GitHub, in HTTPS, SSH or `git@github.com:` form), as if it had come
   to the mirror's own webhook URL: pushes sync the mirror and pull requests start
-  `repository_pull_request` listeners. Remove any webhook you added to the repository for kiwicd,
+  `repository_pull_request` listeners. `repository_dispatch` events (GitHub sends them for
+  dispatches made by a GitHub App) start the mirror's `repository_dispatch` workflows. Remove any webhook you added to the repository for kiwicd,
   or its pull requests start runs twice. Events for repositories without a mirror are ignored.
 - **Fetching**: a mirror whose URL is `https://github.com/OWNER/NAME.git` (without credentials)
   fetches with a short-lived installation token, limited to reading that repository, so a private
@@ -269,6 +347,7 @@ kiwicd run logs 42 --failed                  # or --job build, --follow
 kiwicd run start owner/app deploy.yml --ref main -i target=prod --watch
 kiwicd run cancel 42; kiwicd run rerun 42 --watch
 kiwicd workflow list owner/app
+kiwicd repo dispatch owner/app deploy --payload '{"env":"prod"}'   # a repository_dispatch event
 echo -n "$VALUE" | kiwicd secret set DEPLOY_KEY --repo owner/app   # or type it at the prompt
 kiwicd secret list; kiwicd variable set REGION nz-north --repo owner/app
 kiwicd api GET repos/owner/app               # any other API call
@@ -294,7 +373,7 @@ claude mcp add kiwicd -- kiwicd mcp              # or: kiwicd mcp --read-only
 
 Its tools list repositories, workflows, runs and runners, get a run with its jobs and steps,
 read the end of a job's log (or one step's), wait for a run to finish, start, re-run and cancel
-runs, and list, set and delete secrets and variables. Secrets stay write-only: the agent can set
+runs, send `repository_dispatch` events, and list, set and delete secrets and variables. Secrets stay write-only: the agent can set
 them but not read them back. `--read-only` leaves out the tools that change anything. Give it
 its own token (`KIWICD_API_TOKEN`) to revoke it separately from yours.
 
