@@ -254,7 +254,9 @@ jobs:
   and anything it leaves behind or reports (job outputs, files on a runner that keeps state,
   values it pushed somewhere) is under that branch's control. Treat what comes from the run you
   follow as untrusted input: check `head_branch` and `event`, build from `head_sha` yourself rather
-  than reusing what the run built, and don't pass its values to a shell unquoted.
+  than reusing what the run built, and don't pass its values to a shell unquoted. Workflows are
+  matched by name, and a workflow added on any branch can be called `CI`: keep `branches` to the
+  protected ones for anything that deploys.
 - Runs that follow each other stop after three levels, as on GitHub: in A → B → C → D → E, where
   each follows the one before with `workflow_run`, E doesn't run (the server logs that it
   didn't). A workflow that follows itself is caught the same way.
