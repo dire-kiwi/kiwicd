@@ -109,6 +109,9 @@ const (
 	StatusQueued     = "queued"
 	StatusInProgress = "in_progress"
 	StatusCompleted  = "completed"
+	// A run from a fork's pull request that waits for someone to approve
+	// it before it starts (runs only).
+	StatusWaiting = "waiting"
 
 	ResultSuccess   = "success"
 	ResultFailure   = "failure"

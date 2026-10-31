@@ -453,6 +453,30 @@ func TestJobCheckRun(t *testing.T) {
 	}
 }
 
+// TestApprovalCheckRun: a run waiting for approval shows on GitHub as one
+// check run, which finishes once it's approved or cancelled.
+func TestApprovalCheckRun(t *testing.T) {
+	srv := &Server{cfg: Config{PublicURL: "https://ci.example"}}
+	target := checkTarget{repo: "o/r", sha: strings.Repeat("a", 40)}
+	run := &Run{ID: 3, WorkflowName: "CI", Status: protocol.StatusWaiting, Approval: approvalRequired}
+	if c := srv.approvalCheckRun(run, target); c.Name != "CI" || c.Status != "queued" || c.Conclusion != "" ||
+		c.DetailsURL != "https://ci.example/runs/3" || c.ExternalID != "run:3" || c.Output.Title != "Waiting for approval" {
+		t.Errorf("waiting: %+v %+v", c, c.Output)
+	}
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC).UnixMilli()
+	approved := &Run{ID: 3, WorkflowName: "CI", Status: protocol.StatusInProgress, Approval: approvalApproved, ApprovedBy: "maint", ApprovedAt: at}
+	if c := srv.approvalCheckRun(approved, target); c.Status != "completed" || c.Conclusion != "skipped" || c.CompletedAt != "2026-01-02T03:04:05Z" ||
+		!strings.Contains(c.Output.Summary, "Approved by maint") {
+		t.Errorf("approved: %+v %+v", c, c.Output)
+	}
+	cancelled := &Run{ID: 3, WorkflowName: "CI", Status: protocol.StatusCompleted, Conclusion: protocol.ResultCancelled, Approval: approvalRequired,
+		Error: replacedWhileWaiting, FinishedAt: at}
+	if c := srv.approvalCheckRun(cancelled, target); c.Status != "completed" || c.Conclusion != "cancelled" ||
+		!strings.Contains(c.Output.Summary, "newer event") {
+		t.Errorf("cancelled: %+v %+v", c, c.Output)
+	}
+}
+
 // TestCalledJobChecks checks that a job calling a reusable workflow shows
 // on GitHub as the called jobs, as there, unless it runs none.
 func TestCalledJobChecks(t *testing.T) {

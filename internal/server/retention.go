@@ -16,23 +16,24 @@ const (
 	pruneInterval  = time.Hour
 )
 
-// pruneLoop deletes runs older than the retention period, at startup and then
-// hourly.
+// pruneLoop cancels runs that have waited too long for approval (see
+// approval.go) and deletes runs older than the retention period, at startup
+// and then hourly.
 func (s *Server) pruneLoop(ctx context.Context) {
-	if s.cfg.RetentionDays <= 0 {
-		return
-	}
 	t := time.NewTicker(pruneInterval)
 	defer t.Stop()
 	for {
-		cutoff := time.Now().Add(-time.Duration(s.cfg.RetentionDays) * 24 * time.Hour)
-		if n, err := s.pruneRuns(ctx, cutoff); err != nil {
-			s.log.Error("prune runs", "err", err)
-		} else if n > 0 {
-			s.log.Info("pruned old runs", "runs", n, "older_than", cutoff.Format(time.DateOnly))
-		}
-		if err := s.incrementalVacuum(ctx); err != nil {
-			s.log.Error("incremental vacuum", "err", err)
+		s.expireWaitingRuns()
+		if s.cfg.RetentionDays > 0 {
+			cutoff := time.Now().Add(-time.Duration(s.cfg.RetentionDays) * 24 * time.Hour)
+			if n, err := s.pruneRuns(ctx, cutoff); err != nil {
+				s.log.Error("prune runs", "err", err)
+			} else if n > 0 {
+				s.log.Info("pruned old runs", "runs", n, "older_than", cutoff.Format(time.DateOnly))
+			}
+			if err := s.incrementalVacuum(ctx); err != nil {
+				s.log.Error("incremental vacuum", "err", err)
+			}
 		}
 		select {
 		case <-ctx.Done():

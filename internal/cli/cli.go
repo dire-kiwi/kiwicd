@@ -41,6 +41,7 @@ Usage:
   kiwicd run watch RUN
   kiwicd run logs RUN [--job JOB] [--failed] [--follow] [--timestamps]
   kiwicd run cancel RUN
+  kiwicd run approve RUN
   kiwicd run rerun RUN [--failed | --job JOB] [--debug] [--watch]
 
   kiwicd secret list [--repo OWNER/NAME]
@@ -66,7 +67,7 @@ KIWICD_API_TOKEN override them.
 
 What you may do depends on your role, which kiwicd whoami shows: viewers see
 repositories, runs, logs and runners; maintainers of a repository also start,
-re-run and cancel its runs and set its secrets and variables; admins can do
+re-run, cancel and approve its runs and set its secrets and variables; admins can do
 everything, including global secrets and variables. A token can be limited
 with --role viewer|maintainer|admin (no higher than yours) and with --repo,
 which it then sees alone.
@@ -91,7 +92,7 @@ var commands = map[string]map[string]command{
 	"repo":     {"list": repoList, "view": repoView, "sync": repoSync, "dispatch": repoDispatch},
 	"workflow": {"list": workflowList},
 	"run": {"list": runList, "view": runView, "start": runStart, "watch": runWatch, "logs": runLogs,
-		"cancel": runCancel, "rerun": runRerun},
+		"cancel": runCancel, "approve": runApprove, "rerun": runRerun},
 	"secret":   {"list": settingList("secrets"), "set": secretSet, "delete": settingDelete("secrets")},
 	"variable": {"list": settingList("variables"), "set": variableSet, "delete": settingDelete("variables")},
 	"runner":   {"list": runnerList},
@@ -573,7 +574,7 @@ func runList(ctx context.Context, a *App, args []string) error {
 	fs.StringVar(&f.Workflow, "workflow", "", "only this workflow's runs (its file, e.g. ci.yml)")
 	fs.StringVar(&f.Branch, "branch", "", "only runs of this branch (or full ref)")
 	fs.StringVar(&f.Event, "event", "", "only runs started by this event (push, workflow_dispatch, ...)")
-	fs.StringVar(&f.Status, "status", "", "only runs that are queued, in_progress or completed, or ended in success, failure, cancelled or skipped")
+	fs.StringVar(&f.Status, "status", "", "only runs that are waiting (for approval), queued, in_progress or completed, or ended in success, failure, cancelled or skipped")
 	fs.StringVar(&f.Actor, "actor", "", "only runs started by this user")
 	limit := fs.Int("limit", 20, "how many runs, newest first (at most 500)")
 	asJSON := fs.Bool("json", false, "print JSON")
@@ -787,6 +788,29 @@ func runCancel(ctx context.Context, a *App, args []string) error {
 		return err
 	}
 	fmt.Fprintf(a.Stdout, "Cancelling run %d\n", id)
+	return nil
+}
+
+// runApprove approves a run from a fork's pull request that waits for
+// approval, after you've read the pull request: its jobs run the fork's code.
+func runApprove(ctx context.Context, a *App, args []string) error {
+	pos, err := flags(flag.NewFlagSet("run approve", flag.ContinueOnError), args, 1, 1)
+	if err != nil {
+		return err
+	}
+	id, err := parseID("run", pos[0])
+	if err != nil {
+		return err
+	}
+	c, err := a.api()
+	if err != nil {
+		return err
+	}
+	ids, err := c.Approve(ctx, id)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Stdout, "Approved %d run(s) of the pull request: %v\n", len(ids), ids)
 	return nil
 }
 

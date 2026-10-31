@@ -41,21 +41,27 @@ type Run struct {
 	TriggerDepth int64 `json:"-"`
 	// The workflow's permissions:, or nil.
 	Permissions *protocol.Permissions `json:"permissions"`
-	CreatedAt   int64                 `json:"created_at"`
-	StartedAt   int64                 `json:"started_at"`
-	FinishedAt  int64                 `json:"finished_at"`
+	// For a run from a fork's pull request that had to wait for approval
+	// (see approval.go): "required" until someone approves it, then
+	// "approved"; "" for others.
+	Approval   string `json:"approval,omitempty"`
+	ApprovedBy string `json:"approved_by,omitempty"`
+	ApprovedAt int64  `json:"approved_at,omitempty"`
+	CreatedAt  int64  `json:"created_at"`
+	StartedAt  int64  `json:"started_at"`
+	FinishedAt int64  `json:"finished_at"`
 }
 
 const runCols = `r.id, r.repo_id, p.name, r.number, r.attempt, r.workflow_file, r.workflow_name, r.workflow_yaml, r.title, r.event, r.event_json,
 	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.debug, r.concurrency_group, r.trigger_depth, r.permissions,
-	r.created_at, r.started_at, r.finished_at`
+	r.approval, r.approved_by, r.approved_at, r.created_at, r.started_at, r.finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	var ev, perms string
 	if err := row.Scan(&r.ID, &r.RepoID, &r.Repo, &r.Number, &r.Attempt, &r.WorkflowFile, &r.WorkflowName, &r.WorkflowYAML, &r.Title, &r.Event, &ev,
 		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.Debug, &r.ConcurrencyGroup, &r.TriggerDepth, &perms,
-		&r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&r.Approval, &r.ApprovedBy, &r.ApprovedAt, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(ev), &r.EventJSON)
@@ -170,6 +176,8 @@ type runSpec struct {
 	// For re-runs of some jobs: what to keep from the earlier attempt.
 	reuse *reusePlan
 	debug bool
+	// The run waits for someone to approve it (see approval.go).
+	approval bool
 }
 
 func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
@@ -186,9 +194,13 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	}
 	status, conclusion, errText := protocol.StatusQueued, "", ""
 	finished := int64(0)
-	if spec.parseErr != nil {
+	approval := ""
+	switch {
+	case spec.parseErr != nil:
 		status, conclusion, errText = protocol.StatusCompleted, protocol.ResultFailure, "Invalid workflow file: "+spec.parseErr.Error()
 		finished = nowMS()
+	case spec.approval:
+		status, approval = protocol.StatusWaiting, approvalRequired
 	}
 	s.mu.Lock()
 	number := spec.number
@@ -207,10 +219,10 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 		reuse = mustJSON(spec.reuse)
 	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
-		status, conclusion, error, protected, trigger_depth, reuse_jobs, debug, created_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		status, conclusion, error, protected, trigger_depth, reuse_jobs, debug, approval, created_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
-		status, conclusion, errText, refProtected(spec.repo, spec.ref), spec.depth, reuse, spec.debug, nowMS(), finished)
+		status, conclusion, errText, refProtected(spec.repo, spec.ref), spec.depth, reuse, spec.debug, approval, nowMS(), finished)
 	var id int64
 	var conc wf.Concurrency
 	if err == nil {
@@ -232,13 +244,18 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	}
 	s.log.Info("run created", "repo", spec.repo.Name, "run", id, "number", number, "workflow", spec.file, "event", spec.event, "ref", spec.ref,
 		"secrets", refProtected(spec.repo, spec.ref), "concurrency", conc.Group)
+	if approval != "" {
+		s.log.Info("run waits for approval", "run", id, "actor", spec.actor)
+	}
 	s.queueWorkflowRun(id, "requested")
 	if run, err := s.getRun(id); err == nil && run.Status == protocol.StatusCompleted {
 		// The workflow or its concurrency was invalid.
 		s.queueWorkflowRun(id, "completed")
 		return id, nil
 	}
-	if conc.Group != "" {
+	// A run waiting for approval doesn't enter its group until it's
+	// approved: its workflow may be anyone's.
+	if conc.Group != "" && approval == "" {
 		s.supersede(ctx, spec.repo.ID, id, spec.event, conc)
 	}
 	if err := s.advance(ctx, id); err != nil {
@@ -428,6 +445,9 @@ func (s *Server) advanceLocked(ctx context.Context, runID int64) error {
 	}
 	if run.Status == protocol.StatusCompleted {
 		return nil
+	}
+	if run.Status == protocol.StatusWaiting {
+		return s.advanceWaiting(run)
 	}
 	workflow, err := wf.Parse([]byte(run.WorkflowYAML))
 	if err == nil {

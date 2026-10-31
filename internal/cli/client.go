@@ -428,6 +428,17 @@ func (c *Client) Rerun(ctx context.Context, id int64, opts RerunOptions) (int64,
 	return out.RunID, err
 }
 
+// Approve approves a run from a fork's pull request that waits for
+// approval, with the other runs of its pull request that do, and returns
+// their IDs.
+func (c *Client) Approve(ctx context.Context, id int64) ([]int64, error) {
+	var out struct {
+		Approved []int64 `json:"approved"`
+	}
+	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/approve", id), struct{}{}, &out)
+	return out.Approved, err
+}
+
 func (c *Client) Cancel(ctx context.Context, id int64) error {
 	return c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/cancel", id), struct{}{}, nil)
 }

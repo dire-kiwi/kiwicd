@@ -1,4 +1,5 @@
-export type Status = "queued" | "in_progress" | "completed" | "pending";
+/** waiting: a run from a fork's pull request that waits for approval. */
+export type Status = "queued" | "in_progress" | "completed" | "pending" | "waiting";
 export type Conclusion = "" | "success" | "failure" | "cancelled" | "skipped";
 
 export type Role = "admin" | "maintainer" | "viewer";
@@ -60,6 +61,18 @@ export interface Repo {
   report_checks?: boolean;
   /** Mirrors: whether pull requests from forks run the repository's pull_request workflows. */
   fork_pull_requests?: boolean;
+  /** Which of those wait for approval: authors new to the repository, everyone who isn't a member or collaborator, or none. */
+  fork_approval?: ForkApproval;
+}
+
+export type ForkApproval = "first_time" | "outside" | "none";
+
+/** An author of pull requests from forks whose runs no longer wait for approval. */
+export interface ApprovedContributor {
+  user_id: number;
+  login: string;
+  approved_by: string;
+  approved_at: number;
 }
 
 export interface WorkflowInput {
@@ -127,6 +140,10 @@ export interface Run {
   concurrency_group?: string;
   /** The workflow's permissions:, or null when not set. */
   permissions: Permissions | null;
+  /** A run from a fork's pull request that had to wait: "required" until someone approved it, then "approved". */
+  approval?: "required" | "approved";
+  approved_by?: string;
+  approved_at?: number;
   created_at: number;
   started_at: number;
   finished_at: number;
