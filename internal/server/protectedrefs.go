@@ -133,6 +133,10 @@ func (s *Server) labelDenied(run *Run, labels []string) string {
 		return fmt.Sprintf("runs-on: the runner label %q is reserved for other repositories or branches", l)
 	}
 	if p := s.protectedLabels.of(labels); len(p) > 0 && !s.runGetsSecrets(run) {
+		if run.Event == "pull_request" {
+			return fmt.Sprintf("runs-on: runners with the label %q take only jobs from protected refs, and pull_request "+
+				"runs never count as one: their workflow comes from the pull request.", p[0])
+		}
 		return fmt.Sprintf("runs-on: runners with the label %q take only jobs from protected refs, and %s is not a protected ref of %s. "+
 			"Protected refs are set in the repository's Settings.", p[0], run.Ref, run.Repo)
 	}
