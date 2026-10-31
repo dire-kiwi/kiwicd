@@ -38,7 +38,7 @@ Usage:
   kiwicd run watch RUN
   kiwicd run logs RUN [--job JOB] [--failed] [--follow] [--timestamps]
   kiwicd run cancel RUN
-  kiwicd run rerun RUN [--failed | --job JOB] [--watch]
+  kiwicd run rerun RUN [--failed | --job JOB] [--debug] [--watch]
 
   kiwicd secret list [--repo OWNER/NAME]
   kiwicd secret set NAME [--repo OWNER/NAME] [--value VALUE | --from-file PATH]
@@ -711,6 +711,7 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 	watch := fs.Bool("watch", false, "wait for the new run to finish, and fail if it does")
 	failed := fs.Bool("failed", false, "re-run only the jobs that failed or were cancelled, and the jobs that need them")
 	job := fs.String("job", "", "re-run only this job (its ID, key or name) and the jobs that need it")
+	debug := fs.Bool("debug", false, "turn on debug logging (ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG)")
 	pos, err := flags(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -726,7 +727,7 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	opts := RerunOptions{Failed: *failed}
+	opts := RerunOptions{Failed: *failed, Debug: *debug}
 	if *job != "" {
 		d, err := c.Run(ctx, id)
 		if err != nil {

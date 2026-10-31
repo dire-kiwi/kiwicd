@@ -327,10 +327,13 @@ func (c *Client) Dispatch(ctx context.Context, repo, workflow, ref string, input
 }
 
 // RerunOptions picks what a re-run runs again: every job by default, the
-// failed ones, or one job (each with the jobs that need them).
+// failed ones, or one job (each with the jobs that need them), and whether
+// with debug logging.
 type RerunOptions struct {
 	Failed bool  `json:"failed,omitempty"`
 	JobID  int64 `json:"job_id,omitempty"`
+	// Debug turns on debug logging (ACTIONS_STEP_DEBUG, ACTIONS_RUNNER_DEBUG).
+	Debug bool `json:"debug,omitempty"`
 }
 
 func (c *Client) Rerun(ctx context.Context, id int64, opts RerunOptions) (int64, error) {

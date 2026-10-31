@@ -211,6 +211,8 @@ var migrations = []struct{ table, column, sql string }{
 	{"runs", "reuse_jobs", `ALTER TABLE runs ADD COLUMN reuse_jobs TEXT NOT NULL DEFAULT ''`},
 	{"jobs", "copied_from", `ALTER TABLE jobs ADD COLUMN copied_from INTEGER NOT NULL DEFAULT 0`},
 	{"jobs", "copied_attempt", `ALTER TABLE jobs ADD COLUMN copied_attempt INTEGER NOT NULL DEFAULT 0`},
+	// A re-run with debug logging (see Run.Debug).
+	{"runs", "debug", `ALTER TABLE runs ADD COLUMN debug INTEGER NOT NULL DEFAULT 0`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
 }

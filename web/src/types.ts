@@ -83,6 +83,8 @@ export interface Run {
   cancel_requested: boolean;
   /** Its ref was protected, so its jobs get secrets. */
   protected: boolean;
+  /** A re-run with debug logging. */
+  debug?: boolean;
   /** The workflow's concurrency group, of which one run of the repository runs at a time. */
   concurrency_group?: string;
   created_at: number;

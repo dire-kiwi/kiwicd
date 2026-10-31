@@ -307,6 +307,17 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		notices = append(notices, fmt.Sprintf("%s is not a protected ref of %s, so this job gets no secrets except KIWICD_TOKEN. "+
 			"Protected refs are set in the repository's Settings.", run.Ref, run.Repo))
 	}
+	// Debug logging is on for a re-run with it, or with the secret or
+	// variable ACTIONS_STEP_DEBUG or ACTIONS_RUNNER_DEBUG set to true, as on
+	// GitHub.
+	vars := s.varsFor(run.RepoID)
+	debugOn := func(name string) bool {
+		return run.Debug || strings.EqualFold(secrets[name], "true") || strings.EqualFold(vars[name], "true")
+	}
+	stepDebug, runnerDebug := debugOn("ACTIONS_STEP_DEBUG"), debugOn("ACTIONS_RUNNER_DEBUG")
+	if stepDebug || runnerDebug {
+		env["RUNNER_DEBUG"] = "1"
+	}
 	token, err := s.issueJobToken(j.ID)
 	if err != nil {
 		return nil, err
@@ -330,8 +341,10 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		Event:          run.EventJSON,
 		Actor:          run.Actor,
 		Secrets:        secrets,
-		Vars:           s.varsFor(run.RepoID),
+		Vars:           vars,
 		Notices:        notices,
+		StepDebug:      stepDebug,
+		RunnerDebug:    runnerDebug,
 		Env:            env,
 		TimeoutMinutes: 360,
 		ServerURL:      server,

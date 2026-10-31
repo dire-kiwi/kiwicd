@@ -496,6 +496,15 @@ pre code {
   cursor: pointer;
   user-select: none;
 }
+.check-block {
+  align-items: flex-start;
+}
+.check-block input {
+  margin-top: 4px;
+}
+.check-block .hint {
+  display: block;
+}
 .input {
   font: inherit;
   font-size: 14px;

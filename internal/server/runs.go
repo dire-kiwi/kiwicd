@@ -32,6 +32,9 @@ type Run struct {
 	Error        string         `json:"error"`
 	Cancel       bool           `json:"cancel_requested"`
 	Protected    bool           `json:"protected"` // its ref got secrets; see protectedrefs.go
+	// Debug turns on ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG for the
+	// run's jobs (a re-run with debug logging).
+	Debug bool `json:"debug,omitempty"`
 	// Concurrency group; see concurrency.go.
 	ConcurrencyGroup string `json:"concurrency_group,omitempty"`
 	CreatedAt        int64  `json:"created_at"`
@@ -40,13 +43,13 @@ type Run struct {
 }
 
 const runCols = `r.id, r.repo_id, p.name, r.number, r.attempt, r.workflow_file, r.workflow_name, r.workflow_yaml, r.title, r.event, r.event_json,
-	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.concurrency_group, r.created_at, r.started_at, r.finished_at`
+	r.ref, r.sha, r.actor, r.status, r.conclusion, r.error, r.cancel_requested, r.protected, r.debug, r.concurrency_group, r.created_at, r.started_at, r.finished_at`
 
 func scanRun(row interface{ Scan(...any) error }) (*Run, error) {
 	var r Run
 	var ev string
 	if err := row.Scan(&r.ID, &r.RepoID, &r.Repo, &r.Number, &r.Attempt, &r.WorkflowFile, &r.WorkflowName, &r.WorkflowYAML, &r.Title, &r.Event, &ev,
-		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.ConcurrencyGroup, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&r.Ref, &r.Sha, &r.Actor, &r.Status, &r.Conclusion, &r.Error, &r.Cancel, &r.Protected, &r.Debug, &r.ConcurrencyGroup, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(ev), &r.EventJSON)
@@ -137,6 +140,7 @@ type runSpec struct {
 	number, attempt        int64
 	// For re-runs of some jobs: what to keep from the earlier attempt.
 	reuse *reusePlan
+	debug bool
 }
 
 func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
@@ -167,9 +171,9 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 		reuse = mustJSON(spec.reuse)
 	}
 	res, err := s.db.Exec(`INSERT INTO runs (repo_id, number, attempt, workflow_file, workflow_name, workflow_yaml, title, event, event_json, ref, sha, actor,
-		status, conclusion, error, protected, reuse_jobs, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		status, conclusion, error, protected, reuse_jobs, debug, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.repo.ID, number, attempt, spec.file, spec.name, spec.yaml, title, spec.event, mustJSON(spec.payload), spec.ref, spec.sha, spec.actor,
-		status, conclusion, errText, refProtected(spec.repo, spec.ref), reuse, nowMS(), finished)
+		status, conclusion, errText, refProtected(spec.repo, spec.ref), reuse, spec.debug, nowMS(), finished)
 	var id int64
 	var conc wf.Concurrency
 	if err == nil {

@@ -358,6 +358,7 @@ func mcpTools() []*mcpTool {
 				"run_id": runIDProp,
 				"failed": map[string]any{"type": "boolean", "description": "Re-run only the jobs that failed or were cancelled (the run must have finished)."},
 				"job_id": map[string]any{"type": "integer", "description": "Re-run only this job of the run (the run must have finished)."},
+				"debug":  map[string]any{"type": "boolean", "description": "Turn on debug logging: ::debug:: messages and the runner's own."},
 			}, "run_id"),
 			Annotations: map[string]any{"destructiveHint": false, "openWorldHint": true},
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
@@ -369,7 +370,7 @@ func mcpTools() []*mcpTool {
 				if err != nil {
 					return nil, err
 				}
-				newID, err := c.Rerun(ctx, id, RerunOptions{Failed: argBool(args, "failed"), JobID: jobID})
+				newID, err := c.Rerun(ctx, id, RerunOptions{Failed: argBool(args, "failed"), JobID: jobID, Debug: argBool(args, "debug")})
 				if err != nil {
 					return nil, err
 				}

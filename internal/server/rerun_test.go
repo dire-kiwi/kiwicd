@@ -41,17 +41,17 @@ jobs:
       - run: echo lint
 `
 
-// TestRerunSomeJobs: re-running failed jobs runs the failed matrix
-// combination and what needs it, keeping the other jobs' results, outputs
-// and logs; re-running one job runs it and what needs it.
-func TestRerunSomeJobs(t *testing.T) {
+// newRerunServer starts a server with a repository t/app, and returns a
+// function that calls its API.
+func newRerunServer(t *testing.T) (*Server, *httptest.Server, func(method, path, body string, out any) int) {
+	t.Helper()
 	srv, err := New(Config{DataDir: filepath.Join(t.TempDir(), "data"), AdminPassword: "pw", Version: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { srv.db.Close() })
 	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	ctx := context.Background()
+	t.Cleanup(ts.Close)
 	api := func(method, path, body string, out any) int {
 		t.Helper()
 		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
@@ -69,6 +69,15 @@ func TestRerunSomeJobs(t *testing.T) {
 	if code := api("POST", "/api/repos", `{"name":"t/app"}`, nil); code != 200 {
 		t.Fatalf("create repo: %d", code)
 	}
+	return srv, ts, api
+}
+
+// TestRerunSomeJobs: re-running failed jobs runs the failed matrix
+// combination and what needs it, keeping the other jobs' results, outputs
+// and logs; re-running one job runs it and what needs it.
+func TestRerunSomeJobs(t *testing.T) {
+	srv, ts, api := newRerunServer(t)
+	ctx := context.Background()
 	repo, err := srv.getRepo("t/app")
 	if err != nil {
 		t.Fatal(err)
@@ -214,5 +223,60 @@ func TestRerunSomeJobs(t *testing.T) {
 	// A job from another run.
 	if _, code := rerun(fourth, fmt.Sprintf(`{"job_id":%d}`, first["build"].ID)); code != http.StatusBadRequest {
 		t.Errorf("re-running another run's job: %d", code)
+	}
+}
+
+// TestDebugLogging: a re-run with debug logging, or the ACTIONS_STEP_DEBUG
+// variable, turns it on for the jobs the agent gets.
+func TestDebugLogging(t *testing.T) {
+	srv, ts, api := newRerunServer(t)
+	ctx := context.Background()
+	repo, err := srv.getRepo("t/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rn := &Runner{ID: 1, Name: "r", Labels: normalizeLabels(nil, "linux", "amd64")}
+	runOne := func(id int64) *protocol.JobRequest {
+		t.Helper()
+		req, err := srv.assignJob(ctx, rn, ts.URL)
+		if err != nil || req == nil {
+			t.Fatalf("assign: %v %v", req, err)
+		}
+		if err := srv.completeJob(ctx, req.JobID, protocol.ResultSuccess, "", nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+	const workflow = "on: push\njobs:\n  a:\n    runs-on: self-hosted\n    steps:\n      - run: echo\n"
+	id, err := srv.createRun(ctx, runSpec{repo: repo, file: "ci.yml", yaml: workflow, name: "CI", event: "push",
+		payload: map[string]any{}, ref: "refs/heads/main", sha: strings.Repeat("a", 40), actor: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req := runOne(id); req.StepDebug || req.RunnerDebug || req.Env["RUNNER_DEBUG"] != "" {
+		t.Errorf("debug logging without asking for it: %v %v %q", req.StepDebug, req.RunnerDebug, req.Env["RUNNER_DEBUG"])
+	}
+
+	var res struct {
+		RunID int64 `json:"run_id"`
+	}
+	if code := api("POST", fmt.Sprintf("/api/runs/%d/rerun", id), `{"debug":true}`, &res); code != 200 {
+		t.Fatalf("re-run with debug logging: %d", code)
+	}
+	if run, _ := srv.getRun(res.RunID); !run.Debug {
+		t.Errorf("re-run: %+v", run)
+	}
+	if req := runOne(res.RunID); !req.StepDebug || !req.RunnerDebug || req.Env["RUNNER_DEBUG"] != "1" {
+		t.Errorf("re-run with debug logging: %v %v %q", req.StepDebug, req.RunnerDebug, req.Env["RUNNER_DEBUG"])
+	}
+
+	if code := api("PUT", "/api/variables?repo=t/app", `{"name":"ACTIONS_STEP_DEBUG","value":"True"}`, nil); code != 200 {
+		t.Fatalf("set variable: %d", code)
+	}
+	if code := api("POST", fmt.Sprintf("/api/runs/%d/rerun", id), `{}`, &res); code != 200 {
+		t.Fatalf("re-run: %d", code)
+	}
+	if req := runOne(res.RunID); !req.StepDebug || req.RunnerDebug || req.Env["RUNNER_DEBUG"] != "1" {
+		t.Errorf("with ACTIONS_STEP_DEBUG: %v %v %q", req.StepDebug, req.RunnerDebug, req.Env["RUNNER_DEBUG"])
 	}
 }

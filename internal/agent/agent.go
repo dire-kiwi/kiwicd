@@ -288,6 +288,7 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 	ctx := common.WithJobCancelContext(forceCtx, graceful)
 
 	rep := newReporter(a.c, req.JobID, job, req.Secrets, gracefulCancel)
+	rep.stepDebug, rep.runnerDebug = req.StepDebug, req.RunnerDebug
 	flushCtx, stopFlush := context.WithCancel(parent)
 	flushDone := make(chan struct{})
 	go func() {

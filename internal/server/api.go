@@ -114,11 +114,13 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 // handleRerun starts a new attempt of a run. By default it runs every job
 // again; {"failed": true} re-runs the jobs that failed or were cancelled and
 // {"job_id": ID} that job, each with the jobs that need them, keeping the
-// other jobs' results (see rerun.go).
+// other jobs' results (see rerun.go). "debug": true turns on debug logging
+// for the jobs that run.
 func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Failed bool  `json:"failed"`
 		JobID  int64 `json:"job_id"`
+		Debug  bool  `json:"debug"`
 	}
 	if err := readJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpError(w, 400, "bad request: %v", err)
@@ -154,7 +156,7 @@ func (s *Server) handleRerun(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(`SELECT MAX(attempt) FROM runs WHERE repo_id = ? AND number = ?`, run.RepoID, run.Number).Scan(&attempt)
 	id, err := s.createRun(r.Context(), runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1, reuse: reuse})
+		number: run.Number, attempt: attempt + 1, reuse: reuse, debug: req.Debug})
 	if err != nil {
 		httpError(w, 500, "%v", err)
 		return

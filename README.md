@@ -50,6 +50,12 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   expressions can use `github`, `inputs` and `vars`) lets one run of a repository's group run at
   a time, as on GitHub. A new run waits for the group's running one, which it cancels with
   `cancel-in-progress`, and cancels any other that's waiting. A run's page says when it waits.
+- **Re-runs**: re-run all of a finished run's jobs, the ones that failed or were cancelled, or
+  one job. The last two also re-run the jobs that need them, and the new attempt keeps the other
+  jobs' results, outputs and logs. **Debug logging** is on for a re-run with *Enable debug
+  logging* ticked, or with a secret or variable `ACTIONS_STEP_DEBUG` (shows `::debug::` messages)
+  or `ACTIONS_RUNNER_DEBUG` (also act's own debug messages) set to `true`; jobs then get
+  `RUNNER_DEBUG=1`.
 - **Protected refs**: only runs from a repository's protected refs get its secrets and the global
   ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
   collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The
@@ -75,7 +81,9 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   requests of every repository it's installed on (no webhook per repository), lets mirrors of
   private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
   members sign in (see [GitHub App](#github-app)).
-- **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
+- **UI**: runs, live job logs per step with folding `::group::` sections, links to lines
+  (`#step:3:42`), search and downloads (a job's log, or a run's as a zip), re-run and cancel,
+  repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository), API tokens.
 - **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see

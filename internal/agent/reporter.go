@@ -36,6 +36,9 @@ type reporter struct {
 	cancelledStep int
 	secrets       []string
 	named         map[int]bool // steps with an explicit name: (may contain expressions)
+	// stepDebug shows ::debug:: messages, runnerDebug act's own debug
+	// messages (ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG).
+	stepDebug, runnerDebug bool
 }
 
 func newReporter(c *client, jobID int64, job *model.Job, secrets map[string]string, cancel context.CancelFunc) *reporter {
@@ -255,7 +258,7 @@ func (r *reporter) handle(e *logrus.Entry) {
 		}
 		return
 	}
-	if e.Level == logrus.DebugLevel {
+	if e.Level == logrus.DebugLevel && (!r.runnerDebug || dumpsEnv(e.Message)) {
 		return
 	}
 	msg := e.Message
@@ -271,6 +274,8 @@ func (r *reporter) handle(e *logrus.Entry) {
 			msg = "##[error]" + msg
 		case logrus.WarnLevel:
 			msg = "##[warning]" + msg
+		case logrus.DebugLevel, logrus.TraceLevel:
+			msg = "##[debug]" + msg
 		default:
 			msg = "##[act]" + msg
 		}
@@ -292,8 +297,28 @@ func (r *reporter) commandLine(e *logrus.Entry) (text string, ok bool) {
 		return "##[group]" + r.mask(e, strings.TrimRight(arg, "\r\n")), true
 	case "endgroup":
 		return "##[endgroup]", true
+	case "debug":
+		if !r.stepDebug {
+			return "", true
+		}
+		return "##[debug]" + r.mask(e, strings.TrimRight(arg, "\r\n")), true
 	}
 	return "", false
+}
+
+// envDumps start act debug messages that print a whole environment, which
+// on a host runner includes the agent's own: they aren't shown even with
+// runner debug logging.
+var envDumps = []string{"setupEnv =>", "ENV ==>", "Custom container.Config", "Merged container.Config", "Common container.Config"}
+
+func dumpsEnv(msg string) bool {
+	msg = strings.TrimSpace(msg)
+	for _, p := range envDumps {
+		if strings.HasPrefix(msg, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // take returns the pending logs (at most max) and, if changed, the steps.

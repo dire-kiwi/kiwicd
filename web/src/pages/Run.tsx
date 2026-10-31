@@ -179,6 +179,7 @@ export function RunPage() {
           <span className="meta-value mono small" title={run.workflow_file}>
             {run.workflow_file.replace(/^\.github\/workflows\//, "")}
             {run.attempt > 1 && <span className="muted"> · attempt {run.attempt}</span>}
+            {run.debug && <span className="muted"> · debug logging</span>}
           </span>
         </div>
       </div>

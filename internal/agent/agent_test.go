@@ -107,3 +107,33 @@ func TestGroupCommands(t *testing.T) {
 		t.Errorf("lines = %q, want %q", got, want)
 	}
 }
+
+func TestDebugLines(t *testing.T) {
+	for _, tc := range []struct {
+		step, runner bool
+		want         string
+	}{
+		{false, false, "out"},
+		{true, false, "##[debug]checking ***|out"},
+		{true, true, "##[debug]checking ***|##[debug]evaluating if|out"},
+	} {
+		r := newReporter(nil, 1, &model.Job{}, map[string]string{"KEY": "hunter22"}, nil)
+		r.stepDebug, r.runnerDebug = tc.step, tc.runner
+		for _, e := range []*logrus.Entry{
+			{Level: logrus.DebugLevel, Message: "  💬  ::debug::checking hunter22\n", Data: logrus.Fields{"command": "debug", "arg": "checking hunter22"}},
+			{Level: logrus.DebugLevel, Message: "evaluating if", Data: logrus.Fields{}},
+			{Level: logrus.DebugLevel, Message: "setupEnv => map[HOME:/root AGENT_ONLY:x]", Data: logrus.Fields{}},
+			{Level: logrus.InfoLevel, Message: "out", Data: logrus.Fields{"raw_output": true}},
+		} {
+			e.Time = time.Now()
+			r.handle(e)
+		}
+		var got []string
+		for _, l := range r.pending {
+			got = append(got, l.Text)
+		}
+		if strings.Join(got, "|") != tc.want {
+			t.Errorf("step debug %v, runner debug %v: lines %q, want %q", tc.step, tc.runner, got, tc.want)
+		}
+	}
+}
