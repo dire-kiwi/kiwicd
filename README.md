@@ -87,9 +87,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
   members sign in (see [GitHub App](#github-app)).
 - **UI**: runs, live job logs per step with folding `::group::` sections, links to lines
-  (`#step:3:42`), search and downloads (a job's log, or a run's as a zip), re-run and cancel,
-  repositories and workflows, manual
-  dispatch, runners, secrets and variables (global or per repository), API tokens.
+  (`#step:3:42`), search and downloads (a job's log, or a run's as a zip), queue times and
+  durations of jobs and steps on a timeline, re-run and cancel, filters on the runs list,
+  repositories and workflows, manual dispatch, runners, secrets and variables (global or per
+  repository), API tokens.
 - **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).

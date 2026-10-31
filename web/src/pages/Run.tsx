@@ -4,6 +4,7 @@ import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
 import { PlanGraph } from "../components/PlanGraph";
 import { RerunModal, type RerunWhat } from "../components/RerunModal";
+import { RunTiming } from "../components/RunTiming";
 import { StatusIcon } from "../components/StatusIcon";
 import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../components/ui";
 import { useDocumentTitle, useEventSource, useFetch, useNow } from "../hooks";
@@ -304,6 +305,7 @@ function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: 
           <PlanGraph runId={run.id} groups={groups} now={now} />
         )}
       </section>
+      <RunTiming run={run} groups={groups} now={now} />
       {outputs.length > 0 && (
         <section className="box">
           <div className="box-header">

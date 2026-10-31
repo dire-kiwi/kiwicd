@@ -5,6 +5,7 @@ import { useNow } from "../hooks";
 import { jobState, matrixLabel } from "../runmodel";
 import type { Job, LogLine, Step } from "../types";
 import { absoluteTime, classes, elapsed, relativeTime, visualState } from "../util";
+import { queuedFor } from "./RunTiming";
 import { StatusIcon } from "./StatusIcon";
 import { Chip, ErrorBox, Flash, Icon } from "./ui";
 
@@ -336,8 +337,13 @@ export function JobLog({
             <span className="muted">matrix</span> <span className="mono">{matrix}</span>
           </span>
         )}
+        {queuedFor(job, now) && (
+          <span title="How long the job waited for a runner">
+            <span className="muted">queued</span> {queuedFor(job, now)}
+          </span>
+        )}
         {job.started_at > 0 && (
-          <span>
+          <span title="How long the job ran">
             <Icon name="clock" size={13} /> {elapsed(job.started_at, job.finished_at, now)}
           </span>
         )}
