@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -109,12 +110,16 @@ func (s *Server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
+	p := requestPrincipal(r)
 	repos := []*Repo{}
 	for rows.Next() {
 		repo, err := scanRepo(rows)
 		if err != nil {
 			httpError(w, 500, "%v", err)
 			return
+		}
+		if !p.canView(repo.Name) {
+			continue
 		}
 		s.decorateRepo(r, repo)
 		repo.WebhookSecret = ""
@@ -190,6 +195,7 @@ func (s *Server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, _ := res.LastInsertId()
+	s.audit(r, "repo.create", req.Name, "", strings.TrimSpace(req.Kind+" "+redactURL(req.URL)))
 	// The first sync clones a mirror and records existing refs as a baseline,
 	// so they don't trigger runs.
 	if err := s.syncRepo(ctx, id, true); err != nil {
@@ -264,6 +270,7 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, "bad request: %v", err)
 		return
 	}
+	before := *repo
 	if req.Readers != nil {
 		if repo.Readers, err = cleanReaders(repo.Name, *req.Readers); err != nil {
 			httpError(w, 400, "%v", err)
@@ -284,11 +291,28 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.ForkPullRequests != nil {
+		// Forks' pull requests run anyone's code on the server's runners,
+		// which are the admins'.
+		if *req.ForkPullRequests && !repo.ForkPullRequests && !requestPrincipal(r).admin() {
+			httpError(w, 403, "only an admin can let pull requests from forks run workflows")
+			return
+		}
 		repo.ForkPullRequests = *req.ForkPullRequests
 	}
 	if req.URL != nil {
 		if *req.URL = strings.TrimSpace(*req.URL); *req.URL == "" {
 			httpError(w, 400, "mirror repositories need a url")
+			return
+		}
+		// Pointing a mirror elsewhere can fetch what its maintainers can't
+		// see: other repositories on the server, anything the GitHub App is
+		// installed on, internal addresses. Only admins may.
+		if *req.URL == redactURL(repo.URL) {
+			// The URL as the UI shows it, with credentials hidden: unchanged.
+			*req.URL = repo.URL
+		}
+		if *req.URL != repo.URL && !requestPrincipal(r).admin() {
+			httpError(w, 403, "only an admin can change a mirror's URL")
 			return
 		}
 		if strings.HasPrefix(*req.URL, "-") {
@@ -342,9 +366,52 @@ func (s *Server) handleUpdateRepo(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.auditRepoChanges(r, &before, repo, req.SSHKey != nil || req.GenerateSSHKey, req.SSHKnownHosts != nil)
 	repo, _ = s.getRepoByID(repo.ID)
 	s.decorateRepo(r, repo)
 	writeJSON(w, repo)
+}
+
+// auditRepoChanges records what an update changed.
+func (s *Server) auditRepoChanges(r *http.Request, old, repo *Repo, sshKey, knownHosts bool) {
+	list := func(l []string) string {
+		if len(l) == 0 {
+			return "none"
+		}
+		return strings.Join(l, ", ")
+	}
+	if !slices.Equal(old.Readers, repo.Readers) {
+		s.audit(r, "repo.readers", repo.Name, "", list(old.Readers)+" → "+list(repo.Readers))
+	}
+	if !slices.Equal(old.ProtectedRefs, repo.ProtectedRefs) {
+		s.audit(r, "repo.protected_refs", repo.Name, "", list(old.ProtectedRefs)+" → "+list(repo.ProtectedRefs))
+	}
+	if old.URL != repo.URL {
+		s.audit(r, "repo.settings", repo.Name, "url", redactURL(old.URL)+" → "+redactURL(repo.URL))
+	}
+	if old.ReportChecks != repo.ReportChecks {
+		s.audit(r, "repo.settings", repo.Name, "report checks", fmt.Sprint(repo.ReportChecks))
+	}
+	if old.ForkPullRequests != repo.ForkPullRequests {
+		s.audit(r, "repo.settings", repo.Name, "fork pull requests", fmt.Sprint(repo.ForkPullRequests))
+	}
+	if old.DefaultBranch != repo.DefaultBranch {
+		s.audit(r, "repo.settings", repo.Name, "default branch", old.DefaultBranch+" → "+repo.DefaultBranch)
+	}
+	if sshKey {
+		detail := "removed"
+		if repo.SSHPublicKey != "" {
+			detail = "set to " + repo.SSHPublicKey
+		}
+		s.audit(r, "repo.settings", repo.Name, "SSH key", detail)
+	}
+	if knownHosts {
+		detail := "trust on first connection"
+		if repo.SSHKnownHosts != "" {
+			detail = "set"
+		}
+		s.audit(r, "repo.settings", repo.Name, "SSH known hosts", detail)
+	}
 }
 
 // cleanReaders checks a repository's readers: owner/name each, without
@@ -381,6 +448,9 @@ func (s *Server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.decorateRepo(r, repo)
+	if !requestPrincipal(r).canMaintain(repo.Name) {
+		repo.WebhookSecret = ""
+	}
 	writeJSON(w, repo)
 }
 
@@ -394,6 +464,7 @@ func (s *Server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.audit(r, "repo.delete", repo.Name, "", "")
 	writeJSON(w, map[string]bool{"ok": true})
 }
 

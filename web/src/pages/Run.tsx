@@ -1,4 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
+import { useMe } from "../App";
+import { canMaintain } from "../access";
 import { Link, NavLink, useNavigate, useParams } from "react-router-dom";
 import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
@@ -13,6 +15,7 @@ import { absoluteTime, classes, elapsed, eventLabel, refName, relativeTime, shor
 export function RunPage() {
   const { id = "", jobId } = useParams();
   const navigate = useNavigate();
+  const me = useMe();
   const detail = useFetch<RunDetail>(`/api/runs/${id}`);
   const { setData, reload } = detail;
   const [actionError, setActionError] = useState<string>();
@@ -110,7 +113,7 @@ export function RunPage() {
           </h1>
         </div>
         <div className="run-actions">
-          {run.status !== "completed" ? (
+          {!canMaintain(me?.access, run.repo) ? null : run.status !== "completed" ? (
             <button className="btn btn-danger-outline" onClick={cancel} disabled={busy || run.cancel_requested}>
               {run.cancel_requested ? "Cancelling…" : "Cancel run"}
             </button>

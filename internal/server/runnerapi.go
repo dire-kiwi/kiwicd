@@ -121,6 +121,11 @@ func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	id, _ := res.LastInsertId()
 	s.log.Info("runner registered", "name", req.Name, "labels", labels)
+	how := "with a registration token"
+	if static {
+		how = "with the server's registration token"
+	}
+	s.audit(nil, "runner.register", "", fmt.Sprintf("%s (%d)", req.Name, id), how+", from "+s.clientIP(r)+", labels "+strings.Join(labels, ", "))
 	s.hub.publish("runs", "runners", nil)
 	writeJSON(w, protocol.RegisterResponse{RunnerID: id, RunnerToken: token, Name: req.Name, Labels: labels})
 }

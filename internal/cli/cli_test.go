@@ -368,6 +368,47 @@ func TestMCP(t *testing.T) {
 	}
 }
 
+// TestScopedTokens checks tokens limited to a role and repositories, and
+// that kiwicd mcp offers only the tools they can use.
+func TestScopedTokens(t *testing.T) {
+	e := newTestEnv(t)
+	e.ok("pw\n", "login", "--url", e.url, "--password-stdin")
+	if out := e.ok("", "whoami"); !strings.Contains(out, ": an admin") {
+		t.Fatalf("whoami: %s", out)
+	}
+	token := strings.TrimSpace(e.ok("", "token", "create", "agent", "--role", "viewer", "--repo", "t/app"))
+	if out := e.ok("", "token", "list"); !strings.Contains(out, "viewer of t/app") || !strings.Contains(out, "full") {
+		t.Fatalf("token list: %s", out)
+	}
+	if code, _, errOut := e.kiwicd("", "token", "create", "x", "--repo", "t/none"); code != 1 || !strings.Contains(errOut, "no such repository") {
+		t.Fatalf("token for a missing repository: %d %s", code, errOut)
+	}
+
+	t.Setenv("KIWICD_API_TOKEN", token)
+	if out := e.ok("", "whoami"); !strings.Contains(out, "a viewer, seeing only t/app") || !strings.Contains(out, "scope viewer of t/app") {
+		t.Fatalf("whoami with the scoped token: %s", out)
+	}
+	if code, _, errOut := e.kiwicd("", "variable", "set", "X", "1", "--repo", "t/app"); code != 1 || !strings.Contains(errOut, "needs a maintainer of t/app") {
+		t.Fatalf("variable set with a read-only token: %d %s", code, errOut)
+	}
+	if out := e.ok("", "repo", "list"); !strings.Contains(out, "t/app") {
+		t.Fatalf("repo list: %s", out)
+	}
+
+	s := startMCP(t, e)
+	init := s.call("initialize", map[string]any{"protocolVersion": "2025-03-26", "capabilities": map[string]any{},
+		"clientInfo": map[string]any{"name": "test", "version": "1"}})
+	if instr, _ := init["result"].(map[string]any)["instructions"].(string); !strings.Contains(instr, "You are a viewer, seeing only t/app.") {
+		t.Errorf("instructions: %s", instr)
+	}
+	for _, tool := range s.call("tools/list", nil)["result"].(map[string]any)["tools"].([]any) {
+		m := tool.(map[string]any)
+		if m["annotations"].(map[string]any)["readOnlyHint"] != true || m["name"] == "list_secrets" {
+			t.Errorf("read-only token's server lists %v", m["name"])
+		}
+	}
+}
+
 func TestSelectCalledJobs(t *testing.T) {
 	jobs := []Job{
 		{ID: 1, Key: "lint", Name: "lint"},
