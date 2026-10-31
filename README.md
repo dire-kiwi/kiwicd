@@ -18,9 +18,20 @@ job with [act](https://github.com/nektos/act), through our fork
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `on: pull_request` with `types`,
   `branches` and `paths` (see [Pull requests](#pull-requests)), `workflow_dispatch` with inputs,
   `schedule` (see below), `workflow_run`, `repository_dispatch`, `create` and `delete` (see
-  [More events](#more-events)), `types` for the events that have activity types, `needs`, job
-  `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`, `defaults`,
-  `timeout-minutes`, `secrets`, `vars`.
+  [More events](#more-events)), `types` for the events that have activity types, `needs`, job `if`, `strategy.matrix`
+  (include/exclude, fail-fast, `max-parallel`), job `outputs`, `env`, `defaults`,
+  `timeout-minutes`, `secrets`, `vars`, `run-name` (the run's title, from `github`, `inputs` and
+  `vars`).
+- **Job `continue-on-error`**, also from an expression such as `${{ matrix.experimental }}`: the
+  job still shows as failed, but its failure doesn't fail the run or cancel the rest of its
+  matrix, and jobs that need it see it as successful, as on GitHub.
+- **`permissions:`** (workflow and job) are checked, stored and shown on the run and job pages,
+  and sent to agents with each job, but have no effect yet: `KIWICD_TOKEN` can only read.
+- **Invalid workflows**: a workflow that fails to parse or validate gets a failed run showing
+  the error, as on GitHub, when its triggers would have run it (or can't be read at all). That
+  includes uploaded workflows, which are also checked on upload, and workflows that listen to
+  other repositories. Errors found when the run starts (a `concurrency` group or `run-name` that
+  can't be evaluated) fail the run the same way.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
   commands, `::add-mask::`, `hashFiles()`. `actions/checkout` of the workflow's own repository is
@@ -73,6 +84,11 @@ job with [act](https://github.com/nektos/act), through our fork
   `cancel-in-progress`, and cancels any other that's waiting. A run's page says when it waits.
   `pull_request` runs' groups are apart from other runs': their workflow comes from the pull
   request, which mustn't cancel or hold up a deploy by naming its group.
+  A job's `concurrency` (`jobs.<id>.concurrency`; expressions can also use `needs` and
+  `matrix`) does the same for the repository's jobs: a job waits as *pending* while another of
+  its group is queued or running, and `pull_request` runs' job groups are apart too. Job groups
+  are separate from workflow groups, unlike on GitHub, so a job doesn't wait for a run whose
+  workflow group has the same name.
 - **Re-runs**: re-run all of a finished run's jobs, the ones that failed or were cancelled, or
   one job. The last two also re-run the jobs that need them, and the new attempt keeps the other
   jobs' results, outputs and logs (a job that calls a reusable workflow is kept or re-run whole,
@@ -134,7 +150,7 @@ job with [act](https://github.com/nektos/act), through our fork
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
 
-Not yet: artifacts and caches, job-level `concurrency`, `pull_request_target` (it runs the base
+Not yet: artifacts and caches, `pull_request_target` (it runs the base
 branch's workflow with secrets on a pull request's event, which is easy to misuse by checking out
 the pull request's code), approval before a first-time contributor's pull request runs (GitHub's
 *approve and run*), `merge_group`, `issues`, `issue_comment`, `release`.

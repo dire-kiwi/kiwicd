@@ -125,10 +125,11 @@ func rerunPlan(run *Run, jobs []*Job, failedOnly bool, jobID int64) (*reusePlan,
 
 // reuseJobs carries out a re-run's plan when it starts: it copies the jobs it
 // keeps from the earlier attempt (with the jobs of the workflows they call)
-// and queues the matrix jobs it runs again.
+// and queues the matrix jobs it runs again, in their concurrency groups
+// (adding to others the runs whose jobs that cancelled).
 // It reports whether it queued any. s.mu is held, and the run has no jobs
 // yet. If the earlier attempt is gone (pruned), every job runs again.
-func (s *Server) reuseJobs(run *Run, planJSON string) (bool, error) {
+func (s *Server) reuseJobs(run *Run, planJSON string, others map[int64]bool) (bool, error) {
 	var plan reusePlan
 	if err := json.Unmarshal([]byte(planJSON), &plan); err != nil {
 		return false, fmt.Errorf("re-run plan: %w", err)
@@ -155,12 +156,29 @@ func (s *Server) reuseJobs(run *Run, planJSON string) (bool, error) {
 			return false, err
 		}
 	}
+	queued := false
 	for _, j := range requeue {
-		if err := s.insertJob(run.ID, newJob{key: j.Key, name: j.Name, matrix: j.Matrix, runsOn: j.RunsOn, status: protocol.StatusQueued}); err != nil {
+		// It keeps what was evaluated for it, as it keeps its matrix.
+		nj := newJob{key: j.Key, name: j.Name, matrix: j.Matrix, runsOn: j.RunsOn, status: protocol.StatusQueued,
+			continueOnError: j.ContinueOnError, maxParallel: j.MaxParallel, permissions: j.Permissions, concurrencyGroup: j.ConcurrencyGroup}
+		if nj.concurrencyGroup != "" {
+			status, affected, err := s.enterJobGroup(run, wf.Concurrency{Group: nj.concurrencyGroup})
+			if err != nil {
+				return false, err
+			}
+			nj.status = status
+			for _, id := range affected {
+				if id != run.ID {
+					others[id] = true
+				}
+			}
+		}
+		if err := s.insertJob(run.ID, nj); err != nil {
 			return false, err
 		}
+		queued = queued || nj.status == protocol.StatusQueued
 	}
-	return len(requeue) > 0, nil
+	return queued, nil
 }
 
 // copyJob copies a finished job, with its log, into the run runID, under
@@ -175,9 +193,11 @@ func (s *Server) copyJob(runID, parentID int64, j *Job) error {
 		return err
 	}
 	res, err := s.db.Exec(`INSERT INTO jobs (run_id, parent_id, job_key, name, uses, inputs, matrix, runs_on, status, conclusion, error,
-		runner_id, runner_name, outputs, steps, log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, copied_from, copied_attempt)
+		runner_id, runner_name, outputs, steps, concurrency_group, continue_on_error, max_parallel, permissions,
+		log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, copied_from, copied_attempt)
 		SELECT ?, ?, job_key, name, uses, inputs, matrix, runs_on, status, conclusion, error,
-		runner_id, runner_name, outputs, steps, log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, ?, ? FROM jobs WHERE id = ?`,
+		runner_id, runner_name, outputs, steps, concurrency_group, continue_on_error, max_parallel, permissions,
+		log_seq, log_bytes, log_truncated, created_at, started_at, finished_at, ?, ? FROM jobs WHERE id = ?`,
 		runID, parentID, from, attempt, j.ID)
 	if err != nil {
 		return err

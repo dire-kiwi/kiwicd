@@ -175,9 +175,9 @@ func (s *Server) runPullRequestWorkflows(ctx context.Context, repo *Repo, ev *pu
 		src := files[file]
 		w, perr := wf.Parse(src)
 		if perr != nil {
-			// Only report broken workflows that look like they listen for
-			// pull requests.
-			if bytes.Contains(src, []byte("pull_request")) {
+			// Report invalid workflows that listen for the pull request,
+			// or, if their triggers can't be read, look like they do.
+			if t := wf.Triggers(src); (t != nil && wf.MatchesPullRequest(t, pr)) || (t == nil && bytes.Contains(src, []byte("pull_request"))) {
 				_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: file, event: "pull_request",
 					payload: payload, ref: ref, sha: sha, actor: actor, title: title, parseErr: perr})
 			}

@@ -93,6 +93,10 @@ type JobRequest struct {
 	RunnerDebug bool `json:"runner_debug,omitempty"`
 	// Extra environment, mostly GITHUB_* variables.
 	Env map[string]string `json:"env"`
+	// Permissions the job asks for (its own permissions:, else the
+	// workflow's), or nil for the default. Nothing uses them yet: they are
+	// for a future token that can act on GitHub.
+	Permissions *Permissions `json:"permissions,omitempty"`
 
 	TimeoutMinutes int    `json:"timeout_minutes"`
 	ServerURL      string `json:"server_url"`
@@ -111,6 +115,25 @@ const (
 	ResultCancelled = "cancelled"
 	ResultSkipped   = "skipped"
 )
+
+// Permissions is a workflow's or job's permissions: setting. read-all and
+// write-all set All to read or write; a mapping sets Scopes (contents: read,
+// ...), and the scopes it doesn't list get none, as on GitHub.
+type Permissions struct {
+	All    string            `json:"all,omitempty"`
+	Scopes map[string]string `json:"scopes,omitempty"`
+}
+
+// Level returns the permission (read, write or none) for a scope.
+func (p *Permissions) Level(scope string) string {
+	if p.All != "" {
+		return p.All
+	}
+	if l := p.Scopes[scope]; l != "" {
+		return l
+	}
+	return "none"
+}
 
 type LogLine struct {
 	// Index into the job's steps.

@@ -700,8 +700,9 @@ func (s *Server) runPushWorkflows(ctx context.Context, repo *Repo, ref, after st
 		src := files[file]
 		w, perr := wf.Parse(src)
 		if perr != nil {
-			// Only report broken workflows that look like they listen for pushes.
-			if strings.Contains(string(src), "push") {
+			// As on GitHub, an invalid workflow gets a failed run showing
+			// the error: if its triggers can be read, when they'd run it.
+			if t := wf.Triggers(src); t == nil || wf.MatchesPush(t, ref, changed) {
 				_, _ = s.createRun(ctx, runSpec{repo: repo, file: file, yaml: string(src), name: file, event: "push",
 					payload: event, ref: ref, sha: after, actor: commit.Author, title: commit.Subject, parseErr: perr})
 			}
@@ -753,7 +754,8 @@ func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, 
 		listeners = append(listeners, repo)
 	}
 	rows.Close()
-	// Report broken workflows that look like they listen to src.
+	// Report invalid workflows whose triggers can't be read if they look
+	// like they listen to src.
 	broken := mentionsRepo(src.Name).Match
 	var firstErr error
 	for _, repo := range listeners {
@@ -767,8 +769,9 @@ func (s *Server) triggerListeners(ctx context.Context, src *Repo, event string, 
 
 // startDefaultBranchRuns starts the workflows on repo's default branch that
 // listen for spec.event and that matches accepts, at the branch's tip, and
-// returns their runs. Workflows that don't parse get a failed run if broken
-// says they look like listeners (broken may be nil).
+// returns their runs. Workflows that don't parse get a failed run if their
+// triggers match or, when those can't be read, if broken says they look like
+// listeners (broken may be nil).
 func (s *Server) startDefaultBranchRuns(ctx context.Context, repo *Repo, spec runSpec, broken func([]byte) bool,
 	matches func(*model.Workflow) bool) ([]int64, error) {
 	ref := "refs/heads/" + repo.DefaultBranch
@@ -790,7 +793,7 @@ func (s *Server) startDefaultBranchRuns(ctx context.Context, repo *Repo, spec ru
 		spec.file, spec.yaml, spec.name, spec.parseErr = file, string(yaml), file, nil
 		w, perr := wf.Parse(yaml)
 		if perr != nil {
-			if broken != nil && broken(yaml) {
+			if t := wf.Triggers(yaml); (t != nil && matches(t)) || (t == nil && broken != nil && broken(yaml)) {
 				spec.parseErr = perr
 				_, _ = s.createRun(ctx, spec)
 			}

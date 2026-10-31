@@ -281,6 +281,19 @@ var migrations = []struct{ table, column, sql string }{
 	// (see concurrency.go).
 	{"runs", "concurrency_group", `ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
+	// Job-level concurrency group, evaluated when the job was created; its
+	// jobs wait as pending (see concurrency.go).
+	{"jobs", "concurrency_group", `ALTER TABLE jobs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
+		CREATE INDEX IF NOT EXISTS jobs_concurrency ON jobs(concurrency_group, status) WHERE concurrency_group != ''`},
+	// The job's continue-on-error: its failure doesn't fail the run.
+	{"jobs", "continue_on_error", `ALTER TABLE jobs ADD COLUMN continue_on_error INTEGER NOT NULL DEFAULT 0`},
+	// strategy.max-parallel: how many of a matrix's jobs run at once; 0 for
+	// no limit.
+	{"jobs", "max_parallel", `ALTER TABLE jobs ADD COLUMN max_parallel INTEGER NOT NULL DEFAULT 0`},
+	// The workflow's and the job's permissions (JSON protocol.Permissions,
+	// null when not set). They have no effect yet.
+	{"runs", "permissions", `ALTER TABLE runs ADD COLUMN permissions TEXT NOT NULL DEFAULT 'null'`},
+	{"jobs", "permissions", `ALTER TABLE jobs ADD COLUMN permissions TEXT NOT NULL DEFAULT 'null'`},
 	// Re-runs of some jobs: what a run keeps from its earlier attempt, and
 	// where a kept job came from (see rerun.go).
 	{"runs", "reuse_jobs", `ALTER TABLE runs ADD COLUMN reuse_jobs TEXT NOT NULL DEFAULT ''`},
