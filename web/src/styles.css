@@ -1128,6 +1128,20 @@ textarea.input {
   flex-direction: column;
   gap: 4px;
 }
+.schedules {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.schedules li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
 .setting-row {
   flex-wrap: wrap;
 }

@@ -45,12 +45,22 @@ export interface WorkflowInput {
   options?: string[];
 }
 
+export interface WorkflowSchedule {
+  cron: string;
+  /** IANA time zone of the cron fields; UTC when absent. */
+  timezone?: string;
+  /** When it next runs; absent off the default branch, whose workflows are the ones that run on schedule. */
+  next_run_at?: number;
+  error?: string;
+}
+
 export interface Workflow {
   file: string;
   name: string;
   events: string[] | null;
   dispatch: boolean;
   inputs: WorkflowInput[] | null;
+  schedules?: WorkflowSchedule[];
   error?: string;
   /** Stored in kiwicd rather than the repository; file is "kiwicd:NAME". */
   uploaded?: boolean;

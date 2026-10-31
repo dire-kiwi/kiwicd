@@ -1,9 +1,9 @@
 # kiwicd
 
 kiwicd runs GitHub Actions workflows on your own machines. A Go server hosts (or mirrors) git
-repositories, triggers workflows on push or by hand, schedules jobs and shows live logs in a
-React UI. Agents connect to it the way self-hosted GitHub runners do and run each job with
-[act](https://github.com/nektos/act), through our fork
+repositories, triggers workflows on push, on a schedule or by hand, schedules jobs and shows
+live logs in a React UI. Agents connect to it the way self-hosted GitHub runners do and run each
+job with [act](https://github.com/nektos/act), through our fork
 [dire-kiwi/act](https://github.com/dire-kiwi/act) (the `act/` submodule).
 
 ```
@@ -16,8 +16,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
   `branches`/`tags`/`paths` filters (and their `-ignore` forms), `workflow_dispatch` with inputs,
-  `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`,
-  `defaults`, `timeout-minutes`, `secrets`, `vars`.
+  `schedule` (see below), `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job
+  `outputs`, `env`, `defaults`, `timeout-minutes`, `secrets`, `vars`.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
   `docker://` images, `GITHUB_OUTPUT`/`GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`, workflow
   commands, `::add-mask::`, `hashFiles()`. `actions/checkout` of the workflow's own repository is
@@ -40,6 +40,17 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and jobs check out the pushed commit. Runs show them as `kiwicd:deploy.yml`, separate from a
   committed file of the same name. To keep a public repository's deployment out of it, prefer a
   private repository that listens with `repository_push`.
+- **Schedules**: `on: schedule` with `- cron: '30 5 * * 1-5'` entries runs a workflow as on
+  GitHub: five POSIX cron fields (minute, hour, day of month, month, day of week; `*/15`, ranges,
+  lists and names like `MON` work; `@daily` and the like don't), in UTC or in the entry's
+  `timezone` (`timezone: Pacific/Auckland`). Workflows on the default branch, committed or
+  uploaded, run at its latest commit with `github.event_name` `schedule` and
+  `github.event.schedule` set to the cron string, and get secrets, as runs from the default
+  branch do. A schedule runs at most every five minutes, and from when kiwicd first sees it on
+  the default branch: pushing it there, uploading it or making its branch the default. A
+  restart doesn't run a slot twice; a slot missed while the server was down runs when it starts,
+  but after a longer outage only the latest one does. The *Workflows* tab shows each schedule
+  and when it next runs.
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)). One with

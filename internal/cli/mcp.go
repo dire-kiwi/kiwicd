@@ -174,7 +174,7 @@ func mcpTools() []*mcpTool {
 		},
 		{
 			Name: "list_workflows", Title: "List workflows", readOnly: true,
-			Description: "List a repository's workflows at a ref: file, name, events, and for workflow_dispatch ones their inputs. Files starting kiwicd: are stored in kiwicd rather than the repository.",
+			Description: "List a repository's workflows at a ref: file, name, events, schedules (cron entries, and when they next run on the default branch), and for workflow_dispatch ones their inputs. Files starting kiwicd: are stored in kiwicd rather than the repository.",
 			InputSchema: schema(map[string]any{"repo": repoProp, "ref": prop("string", "Branch, tag or full ref; default the default branch")}, "repo"),
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
 				repo, err := argString(args, "repo", true)
