@@ -489,10 +489,15 @@ func (s *Server) checkMemberships(ctx context.Context, a *githubApp, login strin
 			allowed = true
 		}
 	}
+	if !allowed {
+		// Forget memberships they've lost, but don't list strangers.
+		_, err = s.db.Exec(`UPDATE github_users SET memberships = '[]' WHERE login = ?`, login)
+		return false, err
+	}
 	_, err = s.db.Exec(`INSERT INTO github_users (login, memberships, signed_in_at) VALUES (?, ?, ?)
 		ON CONFLICT (login) DO UPDATE SET login = excluded.login, memberships = excluded.memberships, signed_in_at = excluded.signed_in_at`,
 		login, mustJSON(memberships), nowMS())
-	return allowed, err
+	return true, err
 }
 
 // revokeLostAccess signs out GitHub users that no grant applies to any more
