@@ -381,6 +381,20 @@ func (c *Client) Dispatch(ctx context.Context, repo, workflow, ref string, input
 	return out.RunID, err
 }
 
+// RepositoryDispatch sends a repository_dispatch event of eventType and
+// returns the runs it started.
+func (c *Client) RepositoryDispatch(ctx context.Context, repo, eventType string, payload map[string]any) ([]int64, error) {
+	p, err := repoPath(repo)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		RunIDs []int64 `json:"run_ids"`
+	}
+	err = c.Do(ctx, http.MethodPost, p+"/dispatches", map[string]any{"event_type": eventType, "client_payload": payload}, &out)
+	return out.RunIDs, err
+}
+
 func (c *Client) Rerun(ctx context.Context, id int64) (int64, error) {
 	var out struct {
 		RunID int64 `json:"run_id"`

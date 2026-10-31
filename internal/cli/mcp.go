@@ -360,6 +360,36 @@ func mcpTools() []*mcpTool {
 			},
 		},
 		{
+			Name: "dispatch_event", Title: "Send a repository_dispatch event",
+			Description: "Send a repository_dispatch event to a repository, which starts the workflows on its default branch that listen for repository_dispatch with the event type (on.repository_dispatch.types, or any type without one). Returns the runs it started, which may be none.",
+			InputSchema: schema(map[string]any{
+				"repo":           repoProp,
+				"event_type":     prop("string", "The event type, github.event.action in the runs"),
+				"client_payload": map[string]any{"type": "object", "description": "Any JSON object, github.event.client_payload in the runs"},
+			}, "repo", "event_type"),
+			Annotations: map[string]any{"destructiveHint": false, "openWorldHint": true},
+			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
+				repo, err := argString(args, "repo", true)
+				if err != nil {
+					return nil, err
+				}
+				eventType, err := argString(args, "event_type", true)
+				if err != nil {
+					return nil, err
+				}
+				payload, _ := args["client_payload"].(map[string]any)
+				ids, err := c.RepositoryDispatch(ctx, repo, eventType, payload)
+				if err != nil {
+					return nil, err
+				}
+				runs := []map[string]any{}
+				for _, id := range ids {
+					runs = append(runs, map[string]any{"run_id": id, "url": fmt.Sprintf("%s/runs/%d", strings.TrimRight(c.URL, "/"), id)})
+				}
+				return map[string]any{"runs": runs}, nil
+			},
+		},
+		{
 			Name: "rerun", Title: "Re-run a run",
 			Description: "Start a new attempt of a run, with the same workflow, commit and event. Returns the new run's ID.",
 			InputSchema: schema(map[string]any{"run_id": runIDProp}, "run_id"),

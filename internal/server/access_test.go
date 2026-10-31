@@ -218,6 +218,8 @@ func TestRouteAccess(t *testing.T) {
 			{"GET", "/api/repos/t/b/workflows", view("t/b")}},
 		"POST /api/repos/{owner}/{name}/dispatch": {{"POST", "/api/repos/t/a/dispatch", maintain("t/a")},
 			{"POST", "/api/repos/t/b/dispatch", maintain("t/b")}},
+		"POST /api/repos/{owner}/{name}/dispatches": {{"POST", "/api/repos/t/a/dispatches", maintain("t/a")},
+			{"POST", "/api/repos/t/b/dispatches", maintain("t/b")}},
 		"GET /api/repos/{owner}/{name}/uploaded-workflows/{file}":    {{"GET", "/api/repos/t/a/uploaded-workflows/x.yml", view("t/a")}},
 		"PUT /api/repos/{owner}/{name}/uploaded-workflows/{file}":    {{"PUT", "/api/repos/t/a/uploaded-workflows/x.yml", maintain("t/a")}},
 		"DELETE /api/repos/{owner}/{name}/uploaded-workflows/{file}": {{"DELETE", "/api/repos/t/b/uploaded-workflows/x.yml", maintain("t/b")}},

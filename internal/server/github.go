@@ -446,8 +446,9 @@ func (s *Server) mirrorsOf(fullName string) ([]*Repo, error) {
 
 // handleGitHubWebhook takes the app's webhook deliveries. Push events sync
 // the repository's mirrors and pull_request events go to them as through
-// their own webhook URL (see handleWebhook). Repositories without a mirror
-// are ignored. Re-requested check runs and suites re-run their runs (see
+// their own webhook URL (see handleWebhook); repository_dispatch events
+// dispatch to them (see triggers.go). Repositories without a mirror are
+// ignored. Re-requested check runs and suites re-run their runs (see
 // onCheckRerequest).
 func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	a, err := s.githubApp()
@@ -479,7 +480,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"ok": true, "runs": runs})
 		return
-	case "push", "pull_request":
+	case "push", "pull_request", "repository_dispatch":
 	default:
 		writeJSON(w, map[string]any{"ok": true, "ignored": event})
 		return
@@ -512,6 +513,10 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 				httpError(w, 503, "too many pull request events waiting; redeliver this one later")
 				return
 			}
+		}
+	} else if event == "repository_dispatch" {
+		for _, repo := range mirrors {
+			go s.githubRepositoryDispatch(repo, body)
 		}
 	} else {
 		for _, repo := range mirrors {

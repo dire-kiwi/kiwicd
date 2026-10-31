@@ -177,7 +177,7 @@ func (s *Server) rerun(ctx context.Context, run *Run) (int64, error) {
 	}
 	return s.createRun(ctx, runSpec{repo: repo, file: run.WorkflowFile, yaml: run.WorkflowYAML, name: run.WorkflowName,
 		event: run.Event, payload: run.EventJSON, ref: run.Ref, sha: run.Sha, actor: run.Actor, title: run.Title,
-		number: run.Number, attempt: attempt + 1, called: list})
+		number: run.Number, attempt: attempt + 1, called: list, depth: run.TriggerDepth})
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {

@@ -70,6 +70,9 @@ export function RunPage() {
   const pushed = run.event === "repository_push" ? pushedTo(run.event_payload) : undefined;
   const pull =
     run.event === "repository_pull_request" || run.event === "pull_request" ? pullRequestOf(run.event_payload) : undefined;
+  const after = run.event === "workflow_run" ? workflowRunOf(run.event_payload) : undefined;
+  const dispatched = run.event === "repository_dispatch" ? dispatchOf(run.event_payload) : undefined;
+  const changedRef = run.event === "create" || run.event === "delete" ? refOf(run.event_payload) : undefined;
   const waiting = !!run.concurrency_group && run.status === "queued" && !run.cancel_requested && jobs.length === 0;
 
   const cancel = async () => {
@@ -169,6 +172,36 @@ export function RunPage() {
                 <Icon name="commit" size={14} /> {shortSha(pull.sha)}
               </span>
               {pull.fork && <span className="muted small">from {pull.headRepo || "a deleted fork"}</span>}
+            </span>
+          </div>
+        )}
+        {after && (
+          <div className="meta-item">
+            <span className="meta-label">After</span>
+            <span className="meta-value meta-inline">
+              <Link to={`/runs/${after.id}`}>
+                {after.name} #{after.number}
+              </Link>
+              <span>{after.action === "completed" && after.conclusion ? after.conclusion : eventLabel(after.action)}</span>
+              <BranchChip name={after.branch} />
+              <span className="mono" title={after.sha}>
+                <Icon name="commit" size={14} /> {shortSha(after.sha)}
+              </span>
+            </span>
+          </div>
+        )}
+        {dispatched && (
+          <div className="meta-item">
+            <span className="meta-label">Event type</span>
+            <span className="meta-value mono">{dispatched}</span>
+          </div>
+        )}
+        {changedRef && (
+          <div className="meta-item">
+            <span className="meta-label">{run.event === "create" ? "Created" : "Deleted"}</span>
+            <span className="meta-value meta-inline">
+              <span>{changedRef.type}</span>
+              <BranchChip name={changedRef.name} />
             </span>
           </div>
         )}
@@ -429,4 +462,39 @@ function pullRequestOf(
     headRepo,
     fork: !headRepo || !baseRepo || headRepo.toLowerCase() !== baseRepo.toLowerCase(),
   };
+}
+
+// workflowRunOf reads the run a workflow_run run followed from its event.
+function workflowRunOf(
+  payload: unknown,
+): { id: number; name: string; number: number; action: string; conclusion: string; branch: string; sha: string } | undefined {
+  const p = payload as
+    | {
+        action?: string;
+        workflow_run?: { id?: number; name?: string; run_number?: number; conclusion?: string | null; head_branch?: string; head_sha?: string };
+      }
+    | undefined;
+  const r = p?.workflow_run;
+  if (!r?.id) return undefined;
+  return {
+    id: r.id,
+    name: r.name ?? "",
+    number: r.run_number ?? 0,
+    action: p?.action ?? "",
+    conclusion: r.conclusion ?? "",
+    branch: r.head_branch ?? "",
+    sha: r.head_sha ?? "",
+  };
+}
+
+// dispatchOf reads a repository_dispatch run's event type.
+function dispatchOf(payload: unknown): string | undefined {
+  return (payload as { action?: string } | undefined)?.action || undefined;
+}
+
+// refOf reads the branch or tag a create or delete run is for.
+function refOf(payload: unknown): { name: string; type: string } | undefined {
+  const p = payload as { ref?: string; ref_type?: string } | undefined;
+  if (!p?.ref) return undefined;
+  return { name: p.ref, type: p.ref_type ?? "" };
 }
