@@ -298,6 +298,9 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
           <a className="btn btn-sm" href={`/api/jobs/${job.id}/logs?format=text`} target="_blank" rel="noreferrer">
             View raw logs
           </a>
+          <a className="btn btn-sm" href={`/api/jobs/${job.id}/logs?format=text&download=1`} download title="Download this job's log">
+            <Icon name="download" size={14} /> Download
+          </a>
         </div>
       </div>
       <div className="job-info small">

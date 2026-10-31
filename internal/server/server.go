@@ -243,6 +243,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/runs/{id}", ui(s.handleGetRun))
 	mux.Handle("POST /api/runs/{id}/cancel", ui(s.handleCancelRun))
 	mux.Handle("POST /api/runs/{id}/rerun", ui(s.handleRerun))
+	mux.Handle("GET /api/runs/{id}/logs", ui(s.handleRunLogs))
 	mux.Handle("GET /api/jobs/{id}", ui(s.handleGetJob))
 	mux.Handle("GET /api/jobs/{id}/logs", ui(s.handleJobLogs))
 	mux.Handle("GET /api/jobs/{id}/events", ui(s.handleJobEvents))

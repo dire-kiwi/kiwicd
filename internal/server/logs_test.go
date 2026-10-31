@@ -1,7 +1,9 @@
 package server
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -264,5 +266,46 @@ func TestLogCap(t *testing.T) {
 	appendN(t, srv, job, 3, func(i int) string { return "x" })
 	if lines, _ := fetchAll(t, ts, "/api/jobs/1/logs"); len(lines) != 3 {
 		t.Fatalf("unlimited: %d lines", len(lines))
+	}
+}
+
+func TestDownloadLogs(t *testing.T) {
+	srv, ts, id := newLogServer(t, Config{})
+	if _, err := srv.db.Exec(`INSERT INTO jobs (id, run_id, job_key, name, status, created_at) VALUES (2, 1, 'b', 'test (linux/amd64)', 'completed', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	appendN(t, srv, id, 3, func(i int) string { return fmt.Sprintf("a%d", i) })
+	if _, err := srv.db.Exec(`INSERT INTO log_lines (job_id, seq, step, ts, text) VALUES (2, 1, 0, 0, 'b0')`); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := get(t, ts, fmt.Sprintf("/api/jobs/%d/logs?format=text&download=1", id))
+	if cd := resp.Header.Get("Content-Disposition"); cd != `attachment; filename=t-r-run-1-a.log` {
+		t.Errorf("Content-Disposition = %q", cd)
+	}
+	if lines := strings.Split(strings.TrimSpace(string(body)), "\n"); len(lines) != 3 || !strings.HasSuffix(lines[2], " a2") {
+		t.Errorf("log = %q", body)
+	}
+
+	resp, body = get(t, ts, "/api/runs/1/logs")
+	if ct := resp.Header.Get("Content-Type"); ct != "application/zip" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(rc)
+		rc.Close()
+		got[f.Name] = string(b)
+	}
+	if len(got) != 2 || strings.Count(got["1_a.txt"], "\n") != 3 || !strings.HasSuffix(got["2_test (linux_amd64).txt"], " b0\n") {
+		t.Errorf("zip = %q", got)
 	}
 }

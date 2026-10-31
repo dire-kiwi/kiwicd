@@ -109,6 +109,11 @@ export function RunPage() {
           </h1>
         </div>
         <div className="run-actions">
+          {jobs.length > 0 && (
+            <a className="btn" href={`/api/runs/${run.id}/logs`} download title="Download every job's log as a zip file">
+              <Icon name="download" size={14} /> Download logs
+            </a>
+          )}
           {run.status !== "completed" ? (
             <button className="btn btn-danger-outline" onClick={cancel} disabled={busy || run.cancel_requested}>
               {run.cancel_requested ? "Cancelling…" : "Cancel run"}
