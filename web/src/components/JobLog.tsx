@@ -1,4 +1,5 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { ansiToSegments } from "../ansi";
 import { useNow } from "../hooks";
 import { jobState, matrixLabel } from "../runmodel";
@@ -27,6 +28,8 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
   const [streamError, setStreamError] = useState(false);
   const [overrides, setOverrides] = useState<Record<number, boolean>>({});
   const [showTs, setShowTs] = useState(false);
+  // The whole log has arrived (the stream ended with the job done).
+  const [complete, setComplete] = useState(false);
   const seen = useRef(new Set<number>());
   const lastSeq = useRef(0);
   const onJobRef = useRef(onJob);
@@ -72,6 +75,7 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
     const stop = () => {
       done = true;
       es?.close();
+      setComplete(true);
     };
     const connect = () => {
       es = new EventSource(`/api/jobs/${job.id}/events?after=${lastSeq.current}`);
@@ -140,7 +144,7 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
   }, [steps, logs.byStep]);
 
   // Follow the log tail while the user is at the bottom of the page.
-  const atBottom = useRef(running);
+  const atBottom = useRef(running && !parseLineHash(window.location.hash));
   useEffect(() => {
     const onScroll = () => {
       atBottom.current = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 60;
@@ -153,6 +157,37 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
       window.scrollTo({ top: document.documentElement.scrollHeight });
     }
   }, [logs.count, running, job.steps]);
+
+  // A link to lines (#step:3:42): open their step, then scroll to them once
+  // they have arrived, which for a long log may be some pages in.
+  const location = useLocation();
+  const navigate = useNavigate();
+  const target = useMemo(() => parseLineHash(location.hash), [location.hash]);
+  const scrolledTo = useRef<string>();
+  useEffect(() => {
+    if (target) setOverrides((o) => (o[target.step] ? o : { ...o, [target.step]: true }));
+  }, [target]);
+  const targetLines = target ? (logs.byStep[target.step]?.length ?? 0) : 0;
+  const targetMissing = !!target && complete && (target.from > targetLines || !visible.some((v) => v.index === target.step));
+  useLayoutEffect(() => {
+    if (!target || scrolledTo.current === location.hash) return;
+    const el = document.getElementById(target.from ? lineID(target.step, target.from) : `step-${target.step}`);
+    if (!el) return;
+    scrolledTo.current = location.hash;
+    atBottom.current = false;
+    el.scrollIntoView({ block: target.from ? "center" : "start" });
+  });
+  const onSelect = useCallback(
+    (step: number, n: number, extend: boolean) => {
+      const cur = parseLineHash(window.location.hash);
+      const hash = extend && cur && cur.step === step && cur.from ? lineHash(step, Math.min(cur.from, n), Math.max(cur.to, n)) : lineHash(step, n);
+      // The line is already on screen: don't scroll to it.
+      scrolledTo.current = hash;
+      navigate({ hash }, { replace: true });
+    },
+    [navigate],
+  );
+  const lineView = useMemo(() => ({ showTs, onSelect }), [showTs, onSelect]);
 
   const isOpen = (index: number, step: Step | null) => {
     if (index in overrides) return overrides[index];
@@ -229,56 +264,64 @@ export function JobLog({ job, onJob, withheld = [] }: { job: Job; onJob: (j: unk
       )}
       {job.cancel_requested && job.status !== "completed" && <div className="flash flash-warn">Cancellation requested…</div>}
       {streamError && <div className="flash flash-warn">Lost connection to the log stream — retrying…</div>}
+      {targetMissing && target && (
+        <div className="flash flash-warn">
+          {target.from ? `Line ${target.from} of step ${target.step + 1}` : `Step ${target.step + 1}`} isn't in this job's log.
+        </div>
+      )}
 
-      <div className="log-box">
-        {visible.length === 0 ? (
-          <div className="log-empty muted">
-            {job.status === "queued" ? (
-              <>
-                Waiting for a runner with labels{" "}
-                {(job.runs_on ?? []).map((l) => (
-                  <code key={l}>{l}</code>
-                ))}{" "}
-                to pick up this job…
-                {withheld.length > 0 && (
-                  <div className="small">
-                    This run's ref isn't protected, so runners with the label{withheld.length > 1 ? "s" : ""}{" "}
-                    {withheld.map((l) => (
-                      <code key={l}>{l}</code>
-                    ))}{" "}
-                    won't take it.
-                  </div>
-                )}
-              </>
-            ) : job.status === "completed" ? (
-              job.conclusion === "skipped" ? (
-                "This job was skipped."
+      <LineViewContext.Provider value={lineView}>
+        <div className="log-box">
+          {visible.length === 0 ? (
+            <div className="log-empty muted">
+              {job.status === "queued" ? (
+                <>
+                  Waiting for a runner with labels{" "}
+                  {(job.runs_on ?? []).map((l) => (
+                    <code key={l}>{l}</code>
+                  ))}{" "}
+                  to pick up this job…
+                  {withheld.length > 0 && (
+                    <div className="small">
+                      This run's ref isn't protected, so runners with the label{withheld.length > 1 ? "s" : ""}{" "}
+                      {withheld.map((l) => (
+                        <code key={l}>{l}</code>
+                      ))}{" "}
+                      won't take it.
+                    </div>
+                  )}
+                </>
+              ) : job.status === "completed" ? (
+                job.conclusion === "skipped" ? (
+                  "This job was skipped."
+                ) : (
+                  "This job produced no steps."
+                )
               ) : (
-                "This job produced no steps."
-              )
-            ) : (
-              "Starting…"
-            )}
-          </div>
-        ) : (
-          visible.map(({ index, step, name }) => {
-            const open = isOpen(index, step);
-            return (
-              <StepSection
-                key={index}
-                index={index}
-                name={name}
-                state={step ? stepState(step) : st}
-                duration={step ? elapsed(step.started_at, step.finished_at, now) : ""}
-                lines={logs.byStep[index]}
-                open={open}
-                showTs={showTs}
-                onToggle={() => toggle(index, open)}
-              />
-            );
-          })
-        )}
-      </div>
+                "Starting…"
+              )}
+            </div>
+          ) : (
+            visible.map(({ index, step, name }) => {
+              const open = isOpen(index, step);
+              return (
+                <StepSection
+                  key={index}
+                  index={index}
+                  name={name}
+                  state={step ? stepState(step) : st}
+                  duration={step ? elapsed(step.started_at, step.finished_at, now) : ""}
+                  lines={logs.byStep[index]}
+                  open={open}
+                  onToggle={() => toggle(index, open)}
+                  marked={target?.step === index && target.from ? ([target.from, target.to] as const) : undefined}
+                  reveal={target?.step === index && target.from ? target.from : undefined}
+                />
+              );
+            })
+          )}
+        </div>
+      </LineViewContext.Provider>
 
       {outputs.length > 0 && (
         <section className="box">
@@ -305,6 +348,15 @@ function OutputRow({ k, v }: { k: string; v: string }) {
   );
 }
 
+/** What every log line needs from the view, besides its own state. */
+interface LineView {
+  showTs: boolean;
+  /** A click on a line number: links to the line, or with shift to a range from the linked line. */
+  onSelect: (step: number, n: number, extend: boolean) => void;
+}
+
+const LineViewContext = createContext<LineView>({ showTs: false, onSelect: () => {} });
+
 const StepSection = memo(function StepSection({
   index,
   name,
@@ -312,8 +364,9 @@ const StepSection = memo(function StepSection({
   duration,
   lines,
   open,
-  showTs,
   onToggle,
+  marked,
+  reveal,
 }: {
   index: number;
   name: string;
@@ -321,14 +374,23 @@ const StepSection = memo(function StepSection({
   duration: string;
   lines: LogLine[] | undefined;
   open: boolean;
-  showTs: boolean;
   onToggle: () => void;
+  /** Lines linked to (first and last line number). */
+  marked?: readonly [number, number];
+  /** A line to show: the group it's in is unfolded. */
+  reveal?: number;
 }) {
   const blocks = useMemo(() => logBlocks(lines ?? []), [lines]);
   const [groupOverrides, setGroupOverrides] = useState<Record<number, boolean>>({});
   // Groups start folded, except one still being written to.
-  const groupOpen = (g: Extract<LogBlock, { kind: "group" }>) =>
+  const groupOpen = (g: LogGroupBlock) =>
     groupOverrides[g.header.seq] ?? (state === "in_progress" && !g.ended && g === blocks[blocks.length - 1]);
+  // Unfold the group of a line being revealed, even if it was folded by hand.
+  const revealed = reveal !== undefined ? blocks.find((b): b is LogGroupBlock => b.kind === "group" && b.n < reveal && reveal <= b.last) : undefined;
+  useEffect(() => {
+    if (revealed) setGroupOverrides((o) => (o[revealed.header.seq] ? o : { ...o, [revealed.header.seq]: true }));
+  }, [revealed]);
+  const isMarked = (n: number) => !!marked && marked[0] <= n && n <= marked[1];
   return (
     <div className={classes("step", open && "step-open")} id={`step-${index}`}>
       <button className="step-header" onClick={onToggle} aria-expanded={open}>
@@ -345,16 +407,19 @@ const StepSection = memo(function StepSection({
             <div className="log-lines">
               {blocks.map((b) =>
                 b.kind === "line" ? (
-                  <LogLineRow key={b.line.seq} n={b.n} line={b.line} showTs={showTs} anchor={`step-${index}-L${b.n}`} />
+                  <LogLineRow key={b.line.seq} step={index} n={b.n} line={b.line} marked={isMarked(b.n)} />
                 ) : (
-                  <LogGroup
-                    key={b.header.seq}
-                    index={index}
-                    group={b}
-                    open={groupOpen(b)}
-                    showTs={showTs}
-                    onToggle={() => setGroupOverrides((o) => ({ ...o, [b.header.seq]: !groupOpen(b) }))}
-                  />
+                  <div key={b.header.seq} className={classes("log-group-block", groupOpen(b) && "log-group-open")}>
+                    <LogLineRow
+                      step={index}
+                      n={b.n}
+                      line={b.header}
+                      marked={isMarked(b.n)}
+                      open={groupOpen(b)}
+                      onToggle={() => setGroupOverrides((o) => ({ ...o, [b.header.seq]: !groupOpen(b) }))}
+                    />
+                    {groupOpen(b) && b.lines.map((l) => <LogLineRow key={l.line.seq} step={index} n={l.n} line={l.line} marked={isMarked(l.n)} />)}
+                  </div>
                 ),
               )}
             </div>
@@ -373,9 +438,17 @@ interface NumberedLine {
   n: number;
 }
 
-type LogBlock =
-  | ({ kind: "line" } & NumberedLine)
-  | { kind: "group"; header: LogLine; n: number; lines: NumberedLine[]; ended: boolean };
+interface LogGroupBlock {
+  kind: "group";
+  header: LogLine;
+  n: number;
+  lines: NumberedLine[];
+  /** Number of the group's last line (its ::endgroup:: if it has one). */
+  last: number;
+  ended: boolean;
+}
+
+type LogBlock = ({ kind: "line" } & NumberedLine) | LogGroupBlock;
 
 function isGroupStart(text: string) {
   return text.startsWith("##[group]") || text.startsWith("::group::");
@@ -392,17 +465,19 @@ function isGroupEnd(text: string) {
  */
 function logBlocks(lines: LogLine[]): LogBlock[] {
   const out: LogBlock[] = [];
-  let group: Extract<LogBlock, { kind: "group" }> | null = null;
+  let group: LogGroupBlock | null = null;
   lines.forEach((line, i) => {
     const n = i + 1;
     if (isGroupStart(line.text)) {
-      group = { kind: "group", header: line, n, lines: [], ended: false };
+      group = { kind: "group", header: line, n, lines: [], last: n, ended: false };
       out.push(group);
     } else if (group && isGroupEnd(line.text)) {
       group.ended = true;
+      group.last = n;
       group = null;
     } else if (group) {
       group.lines.push({ line, n });
+      group.last = n;
     } else {
       out.push({ kind: "line", line, n });
     }
@@ -410,25 +485,30 @@ function logBlocks(lines: LogLine[]): LogBlock[] {
   return out;
 }
 
-function LogGroup({
-  index,
-  group,
-  open,
-  showTs,
-  onToggle,
-}: {
-  index: number;
-  group: Extract<LogBlock, { kind: "group" }>;
-  open: boolean;
-  showTs: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <div className={classes("log-group-block", open && "log-group-open")}>
-      <LogLineRow n={group.n} line={group.header} showTs={showTs} anchor={`step-${index}-L${group.n}`} onToggle={onToggle} open={open} />
-      {open && group.lines.map((l) => <LogLineRow key={l.line.seq} n={l.n} line={l.line} showTs={showTs} anchor={`step-${index}-L${l.n}`} />)}
-    </div>
-  );
+/**
+ * A link to lines of a job's log: #step:S:L or #step:S:L-M, with S the
+ * step's number (from 1) and L the line's within the step, as on GitHub.
+ */
+export interface LineTarget {
+  step: number; // index into the job's steps
+  from: number;
+  to: number;
+}
+
+export function parseLineHash(hash: string): LineTarget | undefined {
+  const m = /^#step:(-?\d+)(?::(\d+)(?:-(\d+))?)?$/.exec(hash);
+  if (!m) return undefined;
+  const from = m[2] ? Number(m[2]) : 0;
+  const to = m[3] ? Number(m[3]) : from;
+  return { step: Number(m[1]) - 1, from: Math.min(from, to), to: Math.max(from, to) };
+}
+
+export function lineHash(step: number, from: number, to = from): string {
+  return `#step:${step + 1}` + (from ? `:${from}${to !== from ? `-${to}` : ""}` : "");
+}
+
+export function lineID(step: number, n: number): string {
+  return `step-${step}-L${n}`;
 }
 
 function classify(text: string): { cls: string; text: string } {
@@ -452,27 +532,38 @@ function fmtTs(ts: number): string {
 }
 
 const LogLineRow = memo(function LogLineRow({
+  step,
   n,
   line,
-  showTs,
-  anchor,
+  marked,
   onToggle,
   open,
 }: {
+  step: number;
   n: number;
   line: LogLine;
-  showTs: boolean;
-  anchor: string;
+  marked: boolean;
   /** Set for a group's header: folds or unfolds the group. */
   onToggle?: () => void;
   open?: boolean;
 }) {
+  const { showTs, onSelect } = useContext(LineViewContext);
   const { cls, text } = classify(line.text);
   if (cls === "log-endgroup") return null;
   const segs = ansiToSegments(text);
   return (
-    <div className={classes("log-line", cls, onToggle && "log-group-header")} id={anchor} onClick={onToggle}>
-      <a className="ln" href={`#${anchor}`} data-n={n} aria-label={`Line ${n}`} onClick={(e) => e.stopPropagation()} />
+    <div className={classes("log-line", cls, onToggle && "log-group-header", marked && "log-marked")} id={lineID(step, n)} onClick={onToggle}>
+      <a
+        className="ln"
+        href={lineHash(step, n)}
+        data-n={n}
+        aria-label={`Line ${n}`}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onSelect(step, n, e.shiftKey);
+        }}
+      />
       {showTs && <span className="ts">{fmtTs(line.ts)}</span>}
       {onToggle && (
         <button

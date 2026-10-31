@@ -1525,8 +1525,11 @@ a.graph-job:hover {
 .log-line:hover {
   background: rgba(255, 255, 255, 0.04);
 }
-.log-line:target {
+.log-line.log-marked {
   background: rgba(210, 153, 34, 0.18);
+}
+.log-marked .ln {
+  color: var(--log-text);
 }
 .ln {
   flex-shrink: 0;
