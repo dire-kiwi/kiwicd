@@ -331,6 +331,12 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	for _, n := range req.Notices {
 		rep.logf(0, "##[warning]%s", n)
 	}
+	if msg := a.dockerNeeded(job); msg != "" {
+		if err := pingDocker(ctx); err != nil {
+			rep.logf(0, "##[error]%s, but the agent can't reach the Docker daemon: %v", msg, err)
+			return protocol.ResultFailure, nil
+		}
+	}
 
 	jobDir := filepath.Join(a.cfg.WorkDir, "jobs", strconv.FormatInt(req.JobID, 10))
 	defer func() {
@@ -395,7 +401,7 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	env["RUNNER_NAME"] = a.cfg.Creds.Name
 
 	prefix := jobPrefix(a.cfg.Creds.RunnerID, req.JobID)
-	defer a.removeJobContainers(ctx, prefix)
+	defer a.removeJobContainers(ctx, prefix, a.dockerNeeded(job) != "")
 	cfg := &runner.Config{
 		Actor:                 req.Actor,
 		Workdir:               workspace,
@@ -407,6 +413,7 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 		Env:                   env,
 		Secrets:               req.Secrets,
 		Vars:                  req.Vars,
+		WorkflowCallInputs:    req.Inputs, // a reusable workflow's job: what its caller passed
 		Token:                 req.Secrets["GITHUB_TOKEN"],
 		Platforms:             a.platforms,
 		GitHubInstance:        "github.com",
@@ -415,7 +422,9 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 		ContainerDaemonSocket: a.cfg.ContainerDaemonSocket,
 		ContainerOptions:      a.cfg.JobOptions,
 		ContainerNamePrefix:   strings.TrimSuffix(prefix, "-"),
-		ConcurrentJobs:        1,
+		// Host jobs reach their services on localhost; nothing else should.
+		ServicePortHostIP: "127.0.0.1",
+		ConcurrentJobs:    1,
 	}
 	if a.cfg.JobImage != "" {
 		network := prefix + "net"
@@ -467,6 +476,23 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	return result, job.Outputs
 }
 
+// dockerNeeded says why a job needs Docker, or "" if it may not: an isolated
+// job always does, a host job for its services or container. Jobs on
+// docker:// labels do too, and act says so.
+func (a *Agent) dockerNeeded(job *model.Job) string {
+	switch {
+	case a.cfg.JobImage != "":
+		return "This agent runs jobs in containers (--job-image)"
+	case len(job.Services) > 0 && job.Container() != nil:
+		return "This job's container and services run in Docker"
+	case len(job.Services) > 0:
+		return "This job's services run in Docker"
+	case job.Container() != nil:
+		return "This job's container runs in Docker"
+	}
+	return ""
+}
+
 // actTempDir matches the per-job directories act makes in the action cache
 // (its tmp, RUNNER_TEMP and GITHUB_ENV files); cloned actions are named
 // owner-repo@ref.
@@ -476,7 +502,7 @@ var actTempDir = regexp.MustCompile(`^[0-9a-f]{16}$`)
 // or crashed) left in the work directory: workspaces and act's temporary
 // files, which can hold the jobs' secrets.
 func (a *Agent) removeLeftovers(ctx context.Context) {
-	a.removeJobContainers(ctx, runnerPrefix(a.cfg.Creds.RunnerID))
+	a.removeJobContainers(ctx, runnerPrefix(a.cfg.Creds.RunnerID), a.cfg.JobImage != "")
 	dirs := []string{filepath.Join(a.cfg.WorkDir, "jobs")}
 	entries, _ := os.ReadDir(filepath.Join(a.cfg.WorkDir, "actions"))
 	for _, e := range entries {
@@ -554,13 +580,14 @@ func extractTarGz(r io.Reader, dest string) error {
 }
 
 // removeJobContainers removes the Docker objects named with prefix: a job's,
-// or all of this runner's on start. Only isolated jobs need Docker, so
-// without --job-image a failure is no more than a debug message.
-func (a *Agent) removeJobContainers(ctx context.Context, prefix string) {
+// or all of this runner's on start. A failure is a warning if the jobs
+// used Docker (usedDocker), and otherwise no more than a debug message, as
+// host jobs without services or a container don't need Docker.
+func (a *Agent) removeJobContainers(ctx context.Context, prefix string, usedDocker bool) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	defer cancel()
 	if err := removeDockerObjects(ctx, prefix); err != nil {
-		if a.cfg.JobImage != "" {
+		if usedDocker {
 			a.log.Warn("remove jobs' Docker containers, networks, volumes and images", "prefix", prefix, "err", err)
 		} else {
 			a.log.Debug("remove jobs' Docker containers, networks, volumes and images", "prefix", prefix, "err", err)

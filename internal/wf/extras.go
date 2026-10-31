@@ -61,11 +61,15 @@ func validateExtras(src []byte) error {
 		default:
 			return fmt.Errorf("job %q: concurrency must be a group name or a mapping", id)
 		}
-		if k := j.ContinueOnError.Kind; k != 0 && k != yaml.ScalarNode {
+		if k := j.ContinueOnError.Kind; k != 0 && (k != yaml.ScalarNode || !boolOrExpression(j.ContinueOnError.Value)) {
 			return fmt.Errorf("job %q: continue-on-error must be a boolean or an expression", id)
 		}
 	}
 	return nil
+}
+
+func boolOrExpression(v string) bool {
+	return strings.Contains(v, "${{") || strings.EqualFold(v, "true") || strings.EqualFold(v, "false")
 }
 
 func hasKey(node yaml.Node, key string) bool {
@@ -128,9 +132,9 @@ func (e *Env) EvalConcurrency(node yaml.Node) (Concurrency, error) {
 }
 
 // truthy reads a boolean setting that may come from an expression; the
-// string "false" is false.
+// string "false", in any case, is false.
 func truthy(v any) bool {
-	return exprparser.IsTruthy(v) && ToString(v) != "false"
+	return exprparser.IsTruthy(v) && !strings.EqualFold(ToString(v), "false")
 }
 
 // JobConcurrency evaluates the job's concurrency (github, inputs, vars,

@@ -77,7 +77,7 @@ func (st *schedTest) complete(j *Job, result string) {
 
 func (st *schedTest) assign(rn *Runner) *protocol.JobRequest {
 	st.t.Helper()
-	req, err := st.srv.assignJob(st.ctx, rn, "http://kiwicd.test")
+	req, err := st.srv.assignJob(st.ctx, rn, protocol.Version, "http://kiwicd.test")
 	if err != nil {
 		st.t.Fatal(err)
 	}
@@ -395,5 +395,31 @@ func TestInvalidWorkflowRuns(t *testing.T) {
 	}
 	if len(got) != 2 || !strings.Contains(got["kiwicd:perms.yml"], "permissions") || got["kiwicd:broken.yml"] == "" {
 		t.Errorf("runs: %v", got)
+	}
+}
+
+// A pull request's workflow can't hold up or cancel other runs' jobs by naming
+// their group, as for workflow groups.
+func TestJobConcurrencyPullRequestsApart(t *testing.T) {
+	st := newSchedTest(t)
+	const deploy = "on: [push, pull_request]\njobs:\n  a:\n    runs-on: x\n    concurrency: {group: deploy, cancel-in-progress: true}\n    steps: [{run: echo}]\n"
+	push := st.start(deploy, nil)
+	id, err := st.srv.createRun(st.ctx, runSpec{repo: st.repo, file: "w.yml", yaml: deploy, name: "w", event: "pull_request",
+		payload: map[string]any{"number": 1.0}, ref: "refs/pull/1/merge", sha: "abc", actor: "fork"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := st.run(id)
+	if j := st.jobs(push)["a"]; statusOf(j) != protocol.StatusQueued {
+		t.Errorf("the pull request cancelled the push's job: %+v", j)
+	}
+	if j := st.jobs(pr)["a"]; statusOf(j) != protocol.StatusQueued {
+		t.Errorf("the pull request's job: %+v", j)
+	}
+	// Each still has a group of its own kind.
+	pr2 := st.start(deploy, nil)
+	if statusOf(st.jobs(push)["a"]) != protocol.ResultCancelled || statusOf(st.jobs(pr)["a"]) != protocol.StatusQueued ||
+		statusOf(st.jobs(pr2)["a"]) != protocol.StatusQueued {
+		t.Errorf("push: %+v, pr: %+v, second push: %+v", st.jobs(push)["a"], st.jobs(pr)["a"], st.jobs(pr2)["a"])
 	}
 }

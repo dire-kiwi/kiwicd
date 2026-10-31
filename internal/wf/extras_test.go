@@ -114,6 +114,9 @@ func TestExtras(t *testing.T) {
 	if coe, _ := env.ContinueOnError(x); coe {
 		t.Error("continue-on-error without the setting")
 	}
+	if !truthy(true) || truthy("FALSE") || truthy(false) || !truthy("true") {
+		t.Error("truthy")
+	}
 	if c, _ := env.JobConcurrency(x); c.Group != "" {
 		t.Errorf("concurrency without the setting: %+v", c)
 	}
@@ -130,6 +133,7 @@ func TestParseRejectsInvalidExtras(t *testing.T) {
 		{job: "    concurrency: {cancel-in-progress: true}\n", want: "group"},
 		{job: "    concurrency: [a, b]\n", want: "concurrency"},
 		{job: "    continue-on-error: [true]\n", want: "continue-on-error"},
+		{job: "    continue-on-error: maybe\n", want: "continue-on-error"},
 	} {
 		src := "on: push\n" + tc.extra + "jobs:\n  x:\n    runs-on: a\n" + tc.job + "    steps: [{run: echo}]\n"
 		if _, err := Parse([]byte(src)); err == nil || !strings.Contains(err.Error(), tc.want) {
