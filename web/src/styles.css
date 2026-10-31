@@ -1571,6 +1571,11 @@ a.graph-job:hover {
 .log-notice .lt {
   color: #79c0ff;
 }
+/* The line a link points at, over its level's colour. */
+.log-line.log-line-selected {
+  background: rgba(210, 153, 34, 0.22);
+  box-shadow: inset 3px 0 0 #d29922;
+}
 .log-debug .lt {
   color: #a371f7;
 }
@@ -1579,6 +1584,152 @@ a.graph-job:hover {
 }
 .log-group .lt {
   font-weight: 600;
+}
+
+/* ------------------------------------------------ annotations, summaries */
+
+.annotations {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.annotation {
+  display: flex;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border-muted);
+}
+.annotation:first-child {
+  border-top: 0;
+}
+.annotation-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.annotation-error .annotation-icon {
+  color: var(--danger);
+}
+.annotation-warning .annotation-icon {
+  color: var(--amber);
+}
+.annotation-notice .annotation-icon {
+  color: var(--accent);
+}
+.annotation-body {
+  min-width: 0;
+  flex: 1;
+}
+.annotation-file {
+  margin-left: 8px;
+  word-break: break-all;
+}
+.annotation-title {
+  font-weight: 600;
+  margin-top: 4px;
+}
+.annotation-message {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.summary-body {
+  padding: 16px;
+  overflow-x: auto;
+}
+.markdown + .markdown {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-muted);
+}
+.markdown {
+  overflow-wrap: break-word;
+  line-height: 1.5;
+}
+.markdown > :first-child {
+  margin-top: 0;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown pre,
+.markdown table,
+.markdown blockquote,
+.markdown details {
+  margin: 0 0 12px;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 20px 0 10px;
+}
+.markdown h1,
+.markdown h2 {
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-muted);
+}
+.markdown h1 {
+  font-size: 22px;
+}
+.markdown h2 {
+  font-size: 18px;
+}
+.markdown h3 {
+  font-size: 15px;
+}
+.markdown ul,
+.markdown ol {
+  padding-left: 2em;
+}
+.markdown li input[type="checkbox"] {
+  margin: 0 6px 0 -1.4em;
+  vertical-align: middle;
+}
+.markdown pre {
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-sm);
+  overflow: auto;
+}
+.markdown blockquote {
+  padding: 0 12px;
+  color: var(--muted);
+  border-left: 3px solid var(--border);
+}
+.markdown table {
+  border-collapse: collapse;
+  display: block;
+  max-width: 100%;
+  overflow: auto;
+}
+.markdown th,
+.markdown td {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+}
+.markdown th {
+  font-weight: 600;
+  background: var(--surface-2);
+}
+.markdown img {
+  max-width: 100%;
+}
+.markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 16px 0;
+}
+.markdown summary {
+  cursor: pointer;
 }
 
 /* ANSI palette (tuned for the dark log background) */

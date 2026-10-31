@@ -65,6 +65,18 @@ func TestReporterAnnotationsAndSummaries(t *testing.T) {
 	}
 }
 
+func TestFailureMessage(t *testing.T) {
+	for in, want := range map[string]string{
+		"exitcode '2': failure": "Process completed with exit code 2.",
+		"exit status 3":         "Process completed with exit code 3.",
+		"Job 'x' failed":        "Job 'x' failed",
+	} {
+		if got := failureMessage(in); got != want {
+			t.Errorf("failureMessage(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestReporterExplainsFailureWithoutStep(t *testing.T) {
 	r := testReporter()
 	r.logf(0, "##[error]Downloading source failed: boom")

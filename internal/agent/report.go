@@ -142,12 +142,13 @@ func (r *reporter) trackError(step, line int, text string) {
 	r.lastError = &logRef{step: step, line: line, text: text}
 }
 
-var exitCodeError = regexp.MustCompile(`^exitcode '(\d+)': failure$`)
+// act's error for a step that exited non-zero, in a container or on the host.
+var exitCodeError = regexp.MustCompile(`^(?:exitcode '(\d+)': failure|exit status (\d+))$`)
 
 // failureMessage turns act's error for a step into GitHub's words.
 func failureMessage(text string) string {
 	if m := exitCodeError.FindStringSubmatch(text); m != nil {
-		return "Process completed with exit code " + m[1] + "."
+		return "Process completed with exit code " + m[1] + m[2] + "."
 	}
 	return truncateUTF8(text, protocol.MaxAnnotationBytes)
 }

@@ -3,6 +3,7 @@ import { Link, NavLink, useNavigate, useParams } from "react-router-dom";
 import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
 import { PlanGraph } from "../components/PlanGraph";
+import { RunReports } from "../components/RunReports";
 import { StatusIcon } from "../components/StatusIcon";
 import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../components/ui";
 import { useDocumentTitle, useEventSource, useFetch, useNow } from "../hooks";
@@ -274,7 +275,8 @@ function JobNavItem({ runId, job, now }: { runId: number; job: Job; now: number 
 }
 
 function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: number }) {
-  const outputs = groups.flatMap((g) => g.jobs).filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
+  const jobs = groups.flatMap((g) => g.jobs);
+  const outputs = jobs.filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
   return (
     <div className="stack">
       <section className="box">
@@ -294,6 +296,7 @@ function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: 
           <PlanGraph runId={run.id} groups={groups} now={now} />
         )}
       </section>
+      <RunReports runId={run.id} jobs={jobs} />
       {outputs.length > 0 && (
         <section className="box">
           <div className="box-header">

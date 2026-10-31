@@ -77,6 +77,16 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   members sign in (see [GitHub App](#github-app)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository), API tokens.
+- **Step summaries and annotations**: a run's Summary page shows what each job's steps wrote
+  to `$GITHUB_STEP_SUMMARY`, rendered from Markdown, and lists its annotations: `::error`,
+  `::warning` and `::notice` workflow commands (with `file`, `line`, `endLine`, `col` and
+  `title`) and why a job failed ("Process completed with exit code 1."), each linking to its
+  line in the job's log. As on GitHub, a step's summary may be up to 1 MiB (a larger one is
+  dropped with a warning), a job keeps up to 20 of them (and 8 MiB in all) and 50 annotations
+  from workflow commands; the rest stay in the log. Secrets are masked in both. Summaries are
+  sanitized before they're shown, since a workflow can write anything into them: no scripts,
+  styles, forms or frames, and images other than `data:` ones are shown as links. They're
+  served at `GET /api/runs/{id}/reports`.
 - **Command line and MCP**: `kiwicd` lists, starts, watches and cancels runs, prints their logs
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
