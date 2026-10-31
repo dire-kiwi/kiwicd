@@ -41,6 +41,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and jobs check out the pushed commit. Runs show them as `kiwicd:deploy.yml`, separate from a
   committed file of the same name. To keep a public repository's deployment out of it, prefer a
   private repository that listens with `repository_push`.
+- **Reusable workflows**: `jobs.<id>.uses` calls a workflow with `on: workflow_call`, from the
+  same repository or another one, with typed `with:` inputs, `secrets:` (or `secrets: inherit`),
+  outputs for `needs.<id>.outputs`, and `strategy.matrix`, `needs` and `if` on the calling job,
+  nested up to four levels (see [Reusable workflows](#reusable-workflows)).
 - **Deploying from another repository**: a workflow with `on: repository_push` runs when
   another repository is pushed to, so a private repository can hold a public one's deployment
   (see [below](#deploy-a-public-repository-from-a-private-one)). One with
@@ -76,7 +80,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
 - **GitHub App**: one app, created from *Settings → GitHub*, sends kiwicd the pushes and pull
   requests of every repository it's installed on (no webhook per repository), lets mirrors of
-  private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
+  private ones fetch without a deploy key, shows their runs on GitHub as check runs (usable in
+  branch protection, re-run from GitHub), and lets allowed GitHub users or organizations'
   members sign in (see [GitHub App](#github-app)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository), API tokens.
@@ -84,11 +89,10 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   and sets secrets and variables; `kiwicd mcp` gives agents the same as MCP tools (see
   [Command line](#command-line)).
 
-Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
-artifacts and caches, job-level `concurrency`, `pull_request_target` (it runs the base branch's
-workflow with secrets on a pull request's event, which is easy to misuse by checking out the pull
-request's code), approval before a first-time contributor's pull request runs (GitHub's *approve
-and run*), commit statuses on GitHub.
+Not yet: job `container:`/`services:` on host labels, artifacts and caches, job-level
+`concurrency`, `pull_request_target` (it runs the base branch's workflow with secrets on a pull
+request's event, which is easy to misuse by checking out the pull request's code), approval
+before a first-time contributor's pull request runs (GitHub's *approve and run*).
 
 ## Pull requests
 
@@ -140,6 +144,76 @@ jobs:
 - `pull_request_target` isn't supported. For a job that needs secrets on a pull request, such as
   a preview deployment, use `repository_pull_request` from another repository (below), which
   runs that repository's default branch.
+
+## Reusable workflows
+
+A job with `uses:` runs the jobs of another workflow, as on GitHub:
+
+```yaml
+# .github/workflows/ci.yml
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [linux, arm]
+    uses: ./.github/workflows/build.yml           # same repository and commit
+    with:
+      target: ${{ matrix.os }}
+    secrets:
+      token: ${{ secrets.REGISTRY_TOKEN }}         # or: secrets: inherit
+  deploy:
+    needs: build
+    uses: owner/shared/.github/workflows/deploy.yml@v1
+    with:
+      image: ${{ needs.build.outputs.image }}
+```
+
+```yaml
+# .github/workflows/build.yml
+on:
+  workflow_call:
+    inputs:
+      target: { type: string, required: true }
+      push: { type: boolean, default: true }
+    secrets:
+      token: { required: true }
+    outputs:
+      image: { value: "${{ jobs.image.outputs.ref }}" }
+jobs:
+  image:
+    runs-on: self-hosted
+    outputs:
+      ref: ${{ steps.build.outputs.ref }}
+    steps: ...
+```
+
+- **Where workflows come from.** `./.github/workflows/x.yml` is read from the same repository and
+  commit as the workflow calling it. `owner/repo/.github/workflows/x.yml@ref` (a branch, tag or
+  commit) is read from the kiwicd repository `owner/repo`, hosted or mirrored, if it is the run's
+  own repository or lists it as a reader in its **Settings → Job access** (as for
+  `KIWICD_TOKEN`: the repository being read agrees, here to any run of the listed one). A name
+  kiwicd doesn't have is read from GitHub: public repositories without credentials, and private
+  ones the [GitHub App](#github-app) is installed on with its installation token, but only for runs
+  from protected refs, so that a branch anyone can push can't read them through the app. Mirror a
+  repository to use it from runs of other refs.
+- **When.** As on GitHub, a run reads every workflow it calls when it's created, down to four
+  levels (the run's own workflow and three below it), at most 50 calls; a call that can't be
+  read, a loop, an unknown or missing required input or secret fails the run as an invalid
+  workflow. The run's page shows each called workflow and the commit it was read at, and a re-run
+  uses the same ones.
+- **Jobs.** The called workflow's jobs run as part of the run, named `build (linux) / image` as on
+  GitHub, and grouped under the calling job on the run's page. The calling job (one per matrix
+  combination) finishes with their result and the workflow's `outputs`; with several
+  combinations, `needs.build.outputs` has the last one's. `inputs` are converted to their types
+  (`string`, `boolean`, `number`) and take their defaults; `github`, `vars` and `github.event`
+  are the calling run's, and `actions/checkout` checks out the run's repository, as on GitHub.
+  `strategy.fail-fast` and cancelling reach the called jobs.
+- **Secrets.** A called workflow's jobs get only what the calling job passes: the `secrets:`
+  mapping, evaluated with the caller's secrets, or all of them with `secrets: inherit`, and
+  `KIWICD_TOKEN`. Runs from refs that aren't protected still get none, so their mappings are
+  empty.
+- Agents run called jobs from protocol 2 on: upgrade the server first, then the agents. Older
+  agents keep taking other jobs.
 
 ## Deploy a public repository from a private one
 
@@ -295,8 +369,42 @@ each of them:
   fetches with a short-lived installation token, limited to reading that repository, so a private
   one needs no deploy key. The new-mirror form lists the repositories the app is installed on.
 
-The app asks for read access to contents, pull requests and organization members, and for the
-push and pull request events.
+- **Check runs**: each job of a mirror's runs shows on the commit (and its pull requests) as a
+  check run named `workflow / job`, with matrix values as in the job's name, e.g.
+  `CI / test (1.23, linux)`. It's created when the job is queued and updated when it starts and
+  finishes, with the conclusion, a short summary (duration, error, steps) and a link to the job
+  in kiwicd (made from `--public-url`). Push and dispatched runs report on their commit, pull
+  request runs on the pull request's head. A workflow file that doesn't parse gets one failed
+  check run. Branch protection can require these checks by name. **Re-run** on GitHub (one
+  check, or all of a commit's) starts a new attempt of the runs they belong to, unless the
+  latest attempt is still going; anyone who can re-run checks there can do that. Talking to
+  GitHub happens in the background and never fails or holds up a run: errors are logged and
+  retried a few times, and a later change of the run catches up.
+
+  Runs of `repository_push` and `repository_pull_request` listeners belong to the listening
+  repository, often a private one holding a public one's deployment, and uploaded workflows are
+  kept out of the repository for the same reason; reporting them would show their workflow and
+  job names and links to kiwicd to everyone who can see the repository on GitHub. So they're
+  reported only if the listening (or, for uploaded workflows, the mirror's) repository's
+  **Settings → GitHub checks** is on (or
+  `curl -u admin -X PATCH -d '{"report_checks":true}' https://SERVER/api/repos/OWNER/NAME`).
+  Listeners' check runs go on the source repository's pushed commit or pull request head, named
+  `OWNER/NAME: workflow / job` after the listener.
+
+The app also lets runs from protected refs call [reusable workflows](#reusable-workflows) in
+private repositories it's installed on.
+
+The app asks for read access to contents, pull requests and organization members, write access
+to checks, and for the push, pull request, check run and check suite events.
+
+**Apps made before kiwicd reported check runs** lack the checks permission; *Settings → GitHub*
+says so, and which installations haven't accepted it. On GitHub, open the app's settings
+(*Settings → Developer settings → GitHub Apps*, the organization's for an organization's app),
+then *Permissions & events*: set *Repository permissions → Checks* to *Read and write*, tick the
+*Check run* and *Check suite* events, and save. GitHub then asks each installation's owner to
+accept the new permissions (*Settings → Applications → Installed GitHub Apps*, or the
+organization's, *Configure*, and *Review request*); until they do, runs there aren't reported
+and kiwicd only logs a warning now and then.
 
 ### Sign in with GitHub
 
@@ -485,3 +593,6 @@ nektos/act. So far:
   options and volumes that reach the host), `ContainerOptions` applied after the workflow's own to
   job and service containers and to `docker://` steps, and a user-defined `ContainerNetworkMode`
   used for services and for building Docker actions too.
+- `Config.WorkflowCallInputs`: the `inputs` of a reusable workflow's job, which the server
+  evaluates from the calling job's `with:`, since kiwicd runs called jobs itself rather than
+  through act's own reusable workflow support.

@@ -1046,6 +1046,48 @@ function PullRequestSettings({ repo, onChanged }: { repo: Repo; onChanged: () =>
   );
 }
 
+/** Whether runs of workflows that aren't the GitHub repository's own are reported to it. */
+function ChecksSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const set = async (on: boolean) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { report_checks: on });
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>GitHub checks</h3>
+          <p className="muted small">
+            With the GitHub App installed, runs of mirrors of GitHub repositories show on their commits and pull requests as check
+            runs, one per job, linking back here. Runs of this repository's <span className="mono">repository_push</span> and{" "}
+            <span className="mono">repository_pull_request</span> workflows go on the commit of the repository they listen to, and
+            uploaded workflows' runs on this mirror's commit, only if this is on: it shows their workflow and job names, and links to
+            this server, to everyone who can see that repository on GitHub.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv-pad">
+        <label className="check">
+          <input type="checkbox" checked={!!repo.report_checks} disabled={busy} onChange={(e) => void set(e.target.checked)} />
+          Report listener and uploaded workflows' runs to GitHub
+        </label>
+      </div>
+    </section>
+  );
+}
+
 function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
   const navigate = useNavigate();
   const [confirm, setConfirm] = useState(false);
@@ -1092,6 +1134,7 @@ function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => voi
       {repo.kind === "mirror" && <PullRequestSettings repo={repo} onChanged={onChanged} />}
       <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />
+      <ChecksSettings repo={repo} onChanged={onChanged} />
       <section className="box box-danger">
         <div className="box-header">
           <div>

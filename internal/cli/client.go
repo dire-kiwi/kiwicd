@@ -196,6 +196,7 @@ type Job struct {
 	RunID      int64             `json:"run_id"`
 	Key        string            `json:"key"`
 	Name       string            `json:"name"`
+	Uses       string            `json:"uses,omitempty"` // a job calling a reusable workflow
 	RunsOn     []string          `json:"runs_on"`
 	Status     string            `json:"status"`
 	Conclusion string            `json:"conclusion"`

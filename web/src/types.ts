@@ -34,6 +34,8 @@ export interface Repo {
   protected_refs?: string[];
   /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
   protected_branches?: string[];
+  /** Whether runs of its repository_push/repository_pull_request listeners and uploaded workflows are reported to GitHub as check runs. */
+  report_checks?: boolean;
   /** Mirrors: whether pull requests from forks run the repository's pull_request workflows. */
   fork_pull_requests?: boolean;
 }
@@ -105,6 +107,11 @@ export interface Job {
   run_id: number;
   key: string;
   name: string;
+  /** The calling job's row, for a job of a reusable workflow; 0 otherwise. */
+  parent_id?: number;
+  /** The workflow a calling job calls, and the inputs it gives it. */
+  uses?: string;
+  inputs?: Record<string, unknown> | null;
   matrix: Record<string, unknown> | null;
   runs_on: string[] | null;
   status: Status;
@@ -125,12 +132,28 @@ export interface PlanEntry {
   key: string;
   name: string;
   needs: string[] | null;
+  /** For a job that calls a reusable workflow: what it calls, and its jobs. */
+  uses?: string;
+  jobs?: PlanEntry[];
+}
+
+/** A reusable workflow the run calls, as read when the run was created. */
+export interface CalledWorkflow {
+  /** The calling jobs' keys from the run's workflow down: build/deploy. */
+  path: string;
+  uses: string;
+  source: "kiwicd" | "github";
+  repo: string;
+  file: string;
+  sha: string;
+  yaml: string;
 }
 
 export interface RunDetail {
   run: Run;
   jobs: Job[] | null;
   plan: PlanEntry[] | null;
+  workflows?: CalledWorkflow[] | null;
   // Labels whose runners won't take this run's jobs, as its ref isn't protected.
   protected_labels?: string[];
 }
@@ -197,6 +220,18 @@ export interface GitHubApp {
   allowed_orgs: string[];
   created_at: number;
   install_url?: string;
+  /** What the app and its installations lack for reporting check runs, from GitHub. */
+  access?: GitHubAccess;
+  /** Why GitHub couldn't be asked for access. */
+  access_error?: string;
+}
+
+export interface GitHubAccess {
+  /** The app's permissions page on GitHub. */
+  permissions_url: string;
+  /** "checks: write" and events the app isn't subscribed to. */
+  missing: string[];
+  installations: { account: string; html_url: string; checks: boolean }[];
 }
 
 export interface GitHubSettings {

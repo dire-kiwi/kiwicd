@@ -390,6 +390,11 @@ type Env struct {
 	Matrix   map[string]any
 	// Results of finished jobs, by job ID.
 	Results map[string]JobResult
+	// Secrets is the secrets context, for a calling job's secrets: mapping.
+	Secrets map[string]string
+	// Jobs is the jobs context: the results of a reusable workflow's jobs,
+	// for its outputs.
+	Jobs map[string]JobResult
 }
 
 type JobResult struct {
@@ -416,6 +421,10 @@ func (e *Env) interpreter() exprparser.Interpreter {
 	if vars == nil {
 		vars = map[string]string{}
 	}
+	secrets := e.Secrets
+	if secrets == nil {
+		secrets = map[string]string{}
+	}
 	return exprparser.NewInterpeter(&exprparser.EvaluationEnvironment{
 		Github:   e.Github,
 		Env:      map[string]string{},
@@ -426,7 +435,8 @@ func (e *Env) interpreter() exprparser.Interpreter {
 		Strategy: map[string]any{},
 		Job:      &model.JobContext{Status: "success"},
 		Runner:   map[string]any{},
-		Secrets:  map[string]string{},
+		Secrets:  secrets,
+		Jobs:     jobsContext(e.Jobs),
 	}, exprparser.Config{Run: &model.Run{Workflow: e.Workflow, JobID: e.JobID}, Context: "job"})
 }
 
