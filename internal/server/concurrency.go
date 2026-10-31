@@ -21,6 +21,15 @@ import (
 // run is created, and stored with it. That keeps runs for one pull request in
 // order: a preview removed on close isn't brought back by a slower deploy of
 // an earlier push.
+//
+// Runs of a repository's own pull_request workflows have groups apart from
+// its other runs': their workflow comes from the pull request, perhaps from a
+// fork, which mustn't be able to cancel or hold up a deploy by naming its
+// group.
+
+// pullRequestGroup is the SQL condition that keeps the groups of
+// pull_request runs apart; its argument is whether the run is one.
+const pullRequestGroup = `(r.event = 'pull_request') = ?`
 
 // setRunConcurrency evaluates a new run's concurrency and stores its group,
 // or fails the run if the concurrency is invalid. s.mu is held.
@@ -49,9 +58,10 @@ func (s *Server) setRunConcurrency(runID int64) (wf.Concurrency, error) {
 
 // supersede cancels the earlier runs of the new run's group that are waiting, and
 // with cancel-in-progress the running one too.
-func (s *Server) supersede(ctx context.Context, repoID, newRun int64, c wf.Concurrency) {
+func (s *Server) supersede(ctx context.Context, repoID, newRun int64, event string, c wf.Concurrency) {
 	rows, err := s.db.Query(`SELECT r.id, EXISTS (SELECT 1 FROM jobs j WHERE j.run_id = r.id) FROM runs r
-		WHERE r.repo_id = ? AND r.concurrency_group = ? AND r.id < ? AND r.status != ?`, repoID, c.Group, newRun, protocol.StatusCompleted)
+		WHERE r.repo_id = ? AND r.concurrency_group = ? AND r.id < ? AND r.status != ? AND `+pullRequestGroup,
+		repoID, c.Group, newRun, protocol.StatusCompleted, event == "pull_request")
 	if err != nil {
 		s.log.Error("concurrency group", "run", newRun, "err", err)
 		return
@@ -81,9 +91,9 @@ func (s *Server) waitingForGroup(run *Run) bool {
 		return false
 	}
 	var waiting bool
-	err := s.db.QueryRow(`SELECT NOT EXISTS (SELECT 1 FROM jobs WHERE run_id = ?) AND EXISTS (SELECT 1 FROM runs
-		WHERE repo_id = ? AND concurrency_group = ? AND id < ? AND status != ?)`,
-		run.ID, run.RepoID, run.ConcurrencyGroup, run.ID, protocol.StatusCompleted).Scan(&waiting)
+	err := s.db.QueryRow(`SELECT NOT EXISTS (SELECT 1 FROM jobs WHERE run_id = ?) AND EXISTS (SELECT 1 FROM runs r
+		WHERE r.repo_id = ? AND r.concurrency_group = ? AND r.id < ? AND r.status != ? AND `+pullRequestGroup+`)`,
+		run.ID, run.RepoID, run.ConcurrencyGroup, run.ID, protocol.StatusCompleted, run.Event == "pull_request").Scan(&waiting)
 	return err == nil && waiting
 }
 
@@ -92,8 +102,8 @@ func (s *Server) waitingForGroup(run *Run) bool {
 func (s *Server) startNextInGroup(ctx context.Context, done *Run) {
 	var next int64
 	err := s.db.QueryRow(`SELECT r.id FROM runs r WHERE r.repo_id = ? AND r.concurrency_group = ? AND r.status != ?
-		AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.run_id = r.id) ORDER BY r.id LIMIT 1`,
-		done.RepoID, done.ConcurrencyGroup, protocol.StatusCompleted).Scan(&next)
+		AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.run_id = r.id) AND `+pullRequestGroup+` ORDER BY r.id LIMIT 1`,
+		done.RepoID, done.ConcurrencyGroup, protocol.StatusCompleted, done.Event == "pull_request").Scan(&next)
 	if err != nil {
 		return // none waiting
 	}
