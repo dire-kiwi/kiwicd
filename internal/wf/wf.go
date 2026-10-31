@@ -283,6 +283,22 @@ func MatchesRepositoryDispatch(w *model.Workflow, eventType string) bool {
 	return ok && matchesTypes(cfg, eventType, nil)
 }
 
+// EventDetails describes an event's filters for people, as in
+// "workflows: CI · types: completed · branches: main"; "" if it has none.
+func EventDetails(w *model.Workflow, event string) string {
+	cfg, _ := eventConfig(w, event)
+	var parts []string
+	for _, k := range []string{"workflows", "repositories", "types", "branches", "branches-ignore", "tags", "tags-ignore", "paths", "paths-ignore"} {
+		if v, ok := cfg[k]; ok {
+			parts = append(parts, k+": "+strings.Join(stringList(v), ", "))
+		}
+	}
+	if cfg["forks"] == true {
+		parts = append(parts, "forks")
+	}
+	return strings.Join(parts, " · ")
+}
+
 // EventTypes returns the workflow's on.<event>.types, nil if it has none.
 func EventTypes(w *model.Workflow, event string) []string {
 	cfg, _ := eventConfig(w, event)

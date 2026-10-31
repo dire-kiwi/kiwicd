@@ -261,6 +261,9 @@ func TestWorkflowRunAndRepositoryDispatch(t *testing.T) {
 	if got := EventTypes(deploy, "workflow_run"); len(got) != 1 || got[0] != "completed" {
 		t.Errorf("types %v", got)
 	}
+	if got := EventDetails(deploy, "workflow_run"); got != "workflows: CI, Lint · types: completed · branches: main, release/**" {
+		t.Errorf("details %q", got)
+	}
 
 	// Without types, every activity type and event type triggers it;
 	// branches-ignore excludes branches.

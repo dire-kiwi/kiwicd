@@ -319,9 +319,15 @@ function WorkflowRow({ workflow: w, file, onRun, children }: { workflow: Workflo
         {w.error && <div className="text-danger small pre-wrap">{w.error}</div>}
         {(w.events ?? []).length > 0 && (
           <div className="chips">
-            {(w.events ?? []).map((e) => (
-              <Chip key={e}>{eventLabel(e)}</Chip>
-            ))}
+            {(w.events ?? []).map((e) => {
+              const details = w.event_details?.[e];
+              return (
+                <Chip key={e} title={details}>
+                  {eventLabel(e)}
+                  {details && <span className="muted"> · {details}</span>}
+                </Chip>
+              );
+            })}
           </div>
         )}
       </div>

@@ -49,6 +49,8 @@ export interface Workflow {
   file: string;
   name: string;
   events: string[] | null;
+  /** The events' filters, e.g. "workflows: CI · types: completed", by event. */
+  event_details?: Record<string, string>;
   dispatch: boolean;
   inputs: WorkflowInput[] | null;
   error?: string;

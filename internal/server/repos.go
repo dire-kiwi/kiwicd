@@ -727,13 +727,15 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 type workflowInfo struct {
-	File     string             `json:"file"`
-	Name     string             `json:"name"`
-	Events   []string           `json:"events"`
-	Dispatch bool               `json:"dispatch"`
-	Inputs   []wf.DispatchInput `json:"inputs"`
-	Error    string             `json:"error,omitempty"`
-	Uploaded bool               `json:"uploaded,omitempty"`
+	File   string   `json:"file"`
+	Name   string   `json:"name"`
+	Events []string `json:"events"`
+	// The events' filters, e.g. workflow_run's workflows, by event.
+	EventDetails map[string]string  `json:"event_details,omitempty"`
+	Dispatch     bool               `json:"dispatch"`
+	Inputs       []wf.DispatchInput `json:"inputs"`
+	Error        string             `json:"error,omitempty"`
+	Uploaded     bool               `json:"uploaded,omitempty"`
 }
 
 func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
@@ -764,6 +766,14 @@ func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
 				info.Name = parsed.Name
 			}
 			info.Events = parsed.On()
+			for _, e := range info.Events {
+				if d := wf.EventDetails(parsed, e); d != "" {
+					if info.EventDetails == nil {
+						info.EventDetails = map[string]string{}
+					}
+					info.EventDetails[e] = d
+				}
+			}
 			info.Dispatch = wf.HasEvent(parsed, "workflow_dispatch")
 			info.Inputs = wf.DispatchInputs(parsed)
 		}

@@ -175,6 +175,12 @@ func TestWorkflowRun(t *testing.T) {
 	if deploy.TriggerDepth != 1 || deploy.Title != ci[0].Title {
 		t.Errorf("depth %d, title %q", deploy.TriggerDepth, deploy.Title)
 	}
+	var wfs []workflowInfo
+	tt.api("GET", "/api/repos/t/app/workflows", "", &wfs)
+	if len(wfs) != 3 || wfs[1].File != ".github/workflows/deploy.yml" ||
+		wfs[1].EventDetails["workflow_run"] != "workflows: CI · types: completed · branches: main" {
+		t.Errorf("workflows %+v", wfs)
+	}
 
 	// CI on another branch: watch runs, from main, but deploy's branches
 	// leave it out.
