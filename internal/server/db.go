@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS log_lines (
 	text TEXT NOT NULL,
 	PRIMARY KEY (job_id, seq)
 );
+-- What a finished job reported besides its log: step summaries and
+-- annotations, as JSON (see reports.go).
+CREATE TABLE IF NOT EXISTS job_reports (
+	job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+	summaries TEXT NOT NULL DEFAULT '[]',
+	annotations TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE IF NOT EXISTS runners (
 	id INTEGER PRIMARY KEY,
 	name TEXT NOT NULL,

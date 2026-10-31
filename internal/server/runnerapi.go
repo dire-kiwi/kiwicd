@@ -406,6 +406,12 @@ func (s *Server) handleRunnerComplete(w http.ResponseWriter, r *http.Request) {
 	default:
 		req.Result = protocol.ResultFailure
 	}
+	if j.Status != protocol.StatusCompleted {
+		if err := s.saveJobReport(j.ID, req.Summaries, req.Annotations); err != nil {
+			httpError(w, 500, "%v", err)
+			return
+		}
+	}
 	if err := s.completeJob(r.Context(), j.ID, req.Result, "", req.Outputs, req.Steps); err != nil {
 		httpError(w, 500, "%v", err)
 		return

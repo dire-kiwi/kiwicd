@@ -254,7 +254,8 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 	}
 	if err != nil {
 		_ = a.c.complete(parent, req.JobID, protocol.JobComplete{Result: protocol.ResultFailure,
-			Logs: []protocol.LogLine{{Step: 0, TS: nowMS(), Text: "##[error]" + err.Error()}}})
+			Logs:        []protocol.LogLine{{Step: 0, TS: nowMS(), Text: "##[error]" + err.Error()}},
+			Annotations: []protocol.Annotation{{Level: protocol.AnnotationError, Message: truncateUTF8(err.Error(), protocol.MaxAnnotationBytes), LogLine: 1}}})
 		return
 	}
 
@@ -305,12 +306,12 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 
 	stopFlush()
 	<-flushDone
-	logs, steps := rep.finish(result)
+	done := rep.finish(result)
 	// Outputs are stored and shown on the run page: mask secrets in them.
 	for k, v := range outputs {
 		outputs[k] = rep.maskSecrets(v)
 	}
-	done := protocol.JobComplete{Result: result, Outputs: outputs, Logs: logs, Steps: steps}
+	done.Outputs = outputs
 	for attempt := 0; ; attempt++ {
 		err := a.c.complete(parent, req.JobID, done)
 		if err == nil || attempt >= 10 {
