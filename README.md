@@ -73,7 +73,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   the OS (`Linux`) and architecture (`X64`/`ARM64`) labels.
 - **GitHub App**: one app, created from *Settings → GitHub*, sends kiwicd the pushes and pull
   requests of every repository it's installed on (no webhook per repository), lets mirrors of
-  private ones fetch without a deploy key, and lets allowed GitHub users or organizations'
+  private ones fetch without a deploy key, shows their runs on GitHub as check runs (usable in
+  branch protection, re-run from GitHub), and lets allowed GitHub users or organizations'
   members sign in (see [GitHub App](#github-app)).
 - **UI**: runs, live job logs per step, re-run and cancel, repositories and workflows, manual
   dispatch, runners, secrets and variables (global or per repository), API tokens.
@@ -83,7 +84,7 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 
 Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
 artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
-(only other repositories' `repository_pull_request`), commit statuses on GitHub.
+(only other repositories' `repository_pull_request`).
 
 ## Deploy a public repository from a private one
 
@@ -239,8 +240,39 @@ each of them:
   fetches with a short-lived installation token, limited to reading that repository, so a private
   one needs no deploy key. The new-mirror form lists the repositories the app is installed on.
 
-The app asks for read access to contents, pull requests and organization members, and for the
-push and pull request events.
+- **Check runs**: each job of a mirror's runs shows on the commit (and its pull requests) as a
+  check run named `workflow / job`, with matrix values as in the job's name, e.g.
+  `CI / test (1.23, linux)`. It's created when the job is queued and updated when it starts and
+  finishes, with the conclusion, a short summary (duration, error, steps) and a link to the job
+  in kiwicd (made from `--public-url`). Push and dispatched runs report on their commit, pull
+  request runs on the pull request's head. A workflow file that doesn't parse gets one failed
+  check run. Branch protection can require these checks by name. **Re-run** on GitHub (one
+  check, or all of a commit's) starts a new attempt of the runs they belong to, unless the
+  latest attempt is still going; anyone who can re-run checks there can do that. Talking to
+  GitHub happens in the background and never fails or holds up a run: errors are logged and
+  retried a few times, and a later change of the run catches up.
+
+  Runs of `repository_push` and `repository_pull_request` listeners belong to the listening
+  repository, often a private one holding a public one's deployment, and uploaded workflows are
+  kept out of the repository for the same reason; reporting them would show their workflow and
+  job names and links to kiwicd to everyone who can see the repository on GitHub. So they're
+  reported only if the listening (or, for uploaded workflows, the mirror's) repository's
+  **Settings → GitHub checks** is on (or
+  `curl -u admin -X PATCH -d '{"report_checks":true}' https://SERVER/api/repos/OWNER/NAME`).
+  Listeners' check runs go on the source repository's pushed commit or pull request head, named
+  `OWNER/NAME: workflow / job` after the listener.
+
+The app asks for read access to contents, pull requests and organization members, write access
+to checks, and for the push, pull request, check run and check suite events.
+
+**Apps made before kiwicd reported check runs** lack the checks permission; *Settings → GitHub*
+says so, and which installations haven't accepted it. On GitHub, open the app's settings
+(*Settings → Developer settings → GitHub Apps*, the organization's for an organization's app),
+then *Permissions & events*: set *Repository permissions → Checks* to *Read and write*, tick the
+*Check run* and *Check suite* events, and save. GitHub then asks each installation's owner to
+accept the new permissions (*Settings → Applications → Installed GitHub Apps*, or the
+organization's, *Configure*, and *Review request*); until they do, runs there aren't reported
+and kiwicd only logs a warning now and then.
 
 ### Sign in with GitHub
 
