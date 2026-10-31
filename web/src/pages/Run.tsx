@@ -65,7 +65,8 @@ export function RunPage() {
   const st = visualState(run.status, run.conclusion, run.cancel_requested);
   const selectedJob = jobId ? jobs.find((j) => String(j.id) === jobId) : undefined;
   const pushed = run.event === "repository_push" ? pushedTo(run.event_payload) : undefined;
-  const pull = run.event === "repository_pull_request" ? pullRequestOf(run.event_payload) : undefined;
+  const pull =
+    run.event === "repository_pull_request" || run.event === "pull_request" ? pullRequestOf(run.event_payload) : undefined;
   const waiting = !!run.concurrency_group && run.status === "queued" && !run.cancel_requested && jobs.length === 0;
 
   const cancel = async () => {
@@ -185,7 +186,15 @@ export function RunPage() {
           <span className="pre-wrap">{run.error}</span>
         </ErrorBox>
       )}
-      {!run.protected && !run.error && (
+      {!run.protected && !run.error && run.event === "pull_request" && (
+        <Flash kind="warn">
+          <span>
+            This run is on a pull request, whose workflow comes from the pull request, so its jobs get no secrets except{" "}
+            <span className="mono">KIWICD_TOKEN</span>, which only fetches {run.repo}.
+          </span>
+        </Flash>
+      )}
+      {!run.protected && !run.error && run.event !== "pull_request" && (
         <Flash kind="warn">
           <span>
             <span className="mono">{refName(run.ref)}</span> isn't a protected ref of {run.repo}, so this run's jobs get no secrets except{" "}
@@ -352,7 +361,7 @@ interface PullRequestPayload {
   };
 }
 
-// pullRequestOf reads the other repository's pull request from a repository_pull_request run's event.
+// pullRequestOf reads the pull request from a pull_request or repository_pull_request run's event.
 function pullRequestOf(
   payload: unknown,
 ): { repo: string; number: number; action: string; head: string; sha: string; headRepo?: string; fork: boolean } | undefined {

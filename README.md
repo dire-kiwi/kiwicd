@@ -15,7 +15,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
 ## What works
 
 - **Workflows** from `.github/workflows/*.yml`, parsed with act's model: `on: push` with
-  `branches`/`tags`/`paths` filters (and their `-ignore` forms), `workflow_dispatch` with inputs,
+  `branches`/`tags`/`paths` filters (and their `-ignore` forms), `on: pull_request` with `types`,
+  `branches` and `paths` (see [Pull requests](#pull-requests)), `workflow_dispatch` with inputs,
   `needs`, job `if`, `strategy.matrix` (include/exclude, fail-fast), job `outputs`, `env`,
   `defaults`, `timeout-minutes`, `secrets`, `vars`.
 - **Steps** run by act: `run`, local and remote actions (`composite`, `node`, `docker`),
@@ -50,6 +51,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   expressions can use `github`, `inputs` and `vars`) lets one run of a repository's group run at
   a time, as on GitHub. A new run waits for the group's running one, which it cancels with
   `cancel-in-progress`, and cancels any other that's waiting. A run's page says when it waits.
+  `pull_request` runs' groups are apart from other runs': their workflow comes from the pull
+  request, which mustn't cancel or hold up a deploy by naming its group.
 - **Protected refs**: only runs from a repository's protected refs get its secrets and the global
   ones. A run's workflow comes from its ref, so otherwise anyone who can push a branch (a
   collaborator, a bot like Dependabot) could add a workflow there that reads every secret. The
@@ -57,8 +60,8 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   refs** or with
   `curl -u admin -X PATCH -d '{"protected_refs":["release/*","refs/tags/v*"]}' https://SERVER/api/repos/OWNER/NAME`.
   Patterns are branch names as in a `push` filter (`*` doesn't match `/`, `**` does) or full refs
-  (`refs/tags/v*`). Runs from other refs, including dispatches on them, get only
-  `secrets.KIWICD_TOKEN`, and their page and job logs say so. Whether a run gets secrets is
+  (`refs/tags/v*`). Runs from other refs, including dispatches on them and runs on pull requests,
+  get only `secrets.KIWICD_TOKEN`, and their page and job logs say so. Whether a run gets secrets is
   decided when it's created (a re-run decides again), and a ref unprotected since then stops
   jobs that haven't started yet from getting them. Such runs' jobs can still use any runner
   whose labels match, and on a runner that keeps state between jobs they could leave something
@@ -82,8 +85,61 @@ React UI. Agents connect to it the way self-hosted GitHub runners do and run eac
   [Command line](#command-line)).
 
 Not yet: reusable workflows (`jobs.<id>.uses`), job `container:`/`services:` on host labels,
-artifacts and caches, job-level `concurrency`, a repository's own `pull_request` workflows
-(only other repositories' `repository_pull_request`), commit statuses on GitHub.
+artifacts and caches, job-level `concurrency`, `pull_request_target` (it runs the base branch's
+workflow with secrets on a pull request's event, which is easy to misuse by checking out the pull
+request's code), approval before a first-time contributor's pull request runs (GitHub's *approve
+and run*), commit statuses on GitHub.
+
+## Pull requests
+
+A mirror of a GitHub repository runs its own `on: pull_request` workflows, as GitHub does:
+
+```yaml
+# .github/workflows/ci.yml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]   # the default
+    branches: [main]                         # base branches; branches-ignore works too
+    paths: ['src/**']                        # files the pull request changes; paths-ignore too
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+```
+
+- **Events come from GitHub's `pull_request` webhook**, through the [GitHub App](#github-app) or
+  a webhook on the repository to the mirror's webhook URL (set up as for
+  [Pull request previews](#pull-request-previews)). kiwicd doesn't poll for pull requests.
+- **They run on a merge commit**, as on GitHub: for each event kiwicd fetches the pull request's
+  head (`refs/pull/N/head`) and its base branch, merges the head into the base branch's current
+  tip and keeps the commit at `refs/pull/N/merge` in the mirror. `github.sha` (`GITHUB_SHA`) is
+  that merge commit, not the head (which is `github.event.pull_request.head.sha`), and the
+  workflow files that run are the merge commit's. kiwicd makes the commit itself rather than
+  fetching GitHub's `refs/pull/N/merge`, which GitHub updates in the background and may be stale
+  when the event comes. The same head and base give the same commit. As on GitHub, a pull request
+  that doesn't merge cleanly runs nothing until its conflicts are resolved. This needs git 2.38
+  or later on the server.
+- `github.event_name` is `pull_request`, `github.ref` is `refs/pull/N/merge` (`github.ref_name`
+  `N/merge`), `github.head_ref`/`GITHUB_HEAD_REF` and `github.base_ref`/`GITHUB_BASE_REF` are the
+  head and base branches, and `github.event` is GitHub's `pull_request` event, except that
+  `repository` is kiwicd's mirror (as for [previews](#pull-request-previews)). The run's title is
+  `#N action: title`.
+- **No secrets**: anyone who can open a pull request writes its workflow, so its jobs get only
+  `secrets.KIWICD_TOKEN` (which fetches just this repository), whatever the repository's
+  protected refs, and [protected](#server-configuration) and reserved runner labels keep them
+  off those runners: a job that asks for one fails.
+- **Pull requests from forks don't run** unless the repository allows them, in its
+  **Settings → Pull requests** or with
+  `curl -u admin -X PATCH -d '{"fork_pull_requests":true}' https://SERVER/api/repos/OWNER/NAME`.
+  The setting is the repository's, not the workflow's, since the workflow comes from the fork.
+  Allowed fork pull requests run like the repository's own: no secrets, no protected runners,
+  but the fork's code runs on your runners, so use runners that isolate jobs
+  ([Isolating jobs](#isolating-jobs)). There's no approval step for first-time contributors yet.
+- `pull_request_target` isn't supported. For a job that needs secrets on a pull request, such as
+  a preview deployment, use `repository_pull_request` from another repository (below), which
+  runs that repository's default branch.
 
 ## Deploy a public repository from a private one
 
@@ -232,8 +288,8 @@ each of them:
 - **Webhooks**: GitHub sends their `push` and `pull_request` events to
   `https://SERVER/api/github/webhook`, and kiwicd hands each to the mirrors of that repository
   (mirrors whose URL is it on GitHub, in HTTPS, SSH or `git@github.com:` form), as if it had come
-  to the mirror's own webhook URL: pushes sync the mirror and pull requests start
-  `repository_pull_request` listeners. Remove any webhook you added to the repository for kiwicd,
+  to the mirror's own webhook URL: pushes sync the mirror and pull requests start its
+  `pull_request` workflows and `repository_pull_request` listeners. Remove any webhook you added to the repository for kiwicd,
   or its pull requests start runs twice. Events for repositories without a mirror are ignored.
 - **Fetching**: a mirror whose URL is `https://github.com/OWNER/NAME.git` (without credentials)
   fetches with a short-lived installation token, limited to reading that repository, so a private

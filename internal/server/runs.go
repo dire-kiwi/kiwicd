@@ -177,7 +177,7 @@ func (s *Server) createRun(ctx context.Context, spec runSpec) (int64, error) {
 	s.log.Info("run created", "repo", spec.repo.Name, "run", id, "number", number, "workflow", spec.file, "event", spec.event, "ref", spec.ref,
 		"secrets", refProtected(spec.repo, spec.ref), "concurrency", conc.Group)
 	if conc.Group != "" {
-		s.supersede(ctx, spec.repo.ID, id, conc)
+		s.supersede(ctx, spec.repo.ID, id, spec.event, conc)
 	}
 	if err := s.advance(ctx, id); err != nil {
 		s.log.Error("advance", "run", id, "err", err)
@@ -206,6 +206,7 @@ func (s *Server) githubContext(run *Run) *model.GithubContext {
 		ghc.Event = map[string]any{}
 	}
 	ghc.SetRefTypeAndName()
+	ghc.SetBaseAndHeadRef() // pull_request: from the event
 	return ghc
 }
 

@@ -34,6 +34,8 @@ export interface Repo {
   protected_refs?: string[];
   /** Branches whose runs get secrets: the default branch and those matching protected_refs. */
   protected_branches?: string[];
+  /** Mirrors: whether pull requests from forks run the repository's pull_request workflows. */
+  fork_pull_requests?: boolean;
 }
 
 export interface WorkflowInput {

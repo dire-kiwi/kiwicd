@@ -19,7 +19,9 @@ import (
 //
 // repository_push and repository_pull_request runs use the listener's default
 // branch, and so do dispatches unless the admin picks another ref, so they
-// keep their secrets.
+// keep their secrets. A repository's own pull_request runs are from
+// refs/pull/N/merge, which is never protected: anyone who can open a pull
+// request writes their workflow.
 //
 // A pattern is a branch name like push's branches filter (release/*, where
 // * doesn't match / and ** does), or a full ref (refs/tags/v*).
@@ -49,6 +51,9 @@ func cleanProtectedRefs(names []string) ([]string, error) {
 
 // refProtected reports whether runs from ref get repo's secrets.
 func refProtected(repo *Repo, ref string) bool {
+	if strings.HasPrefix(ref, "refs/pull/") {
+		return false // patterns can't name these, but to be sure
+	}
 	if ref == "refs/heads/"+repo.DefaultBranch {
 		return true
 	}

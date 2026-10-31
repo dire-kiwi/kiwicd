@@ -297,12 +297,17 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		"KIWICD_SERVER_URL":       server,
 		"KIWICD_RUN_URL":          fmt.Sprintf("%s/runs/%d", server, run.ID),
 	}
+	if ghc.HeadRef != "" {
+		env["GITHUB_HEAD_REF"], env["GITHUB_BASE_REF"] = ghc.HeadRef, ghc.BaseRef
+	}
 	secrets := map[string]string{}
 	var notices []string
 	if s.runGetsSecrets(run) {
 		if secrets, err = s.secretsFor(run.RepoID); err != nil {
 			return nil, err
 		}
+	} else if run.Event == "pull_request" {
+		notices = append(notices, "Jobs of pull_request runs get no secrets except KIWICD_TOKEN: their workflow comes from the pull request.")
 	} else {
 		notices = append(notices, fmt.Sprintf("%s is not a protected ref of %s, so this job gets no secrets except KIWICD_TOKEN. "+
 			"Protected refs are set in the repository's Settings.", run.Ref, run.Repo))
