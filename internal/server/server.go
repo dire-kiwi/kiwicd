@@ -436,7 +436,7 @@ func (s *Server) authenticate(r *http.Request) (*principal, error) {
 	}
 	if p, ok := requestPassword(r); ok && p != "" {
 		if strings.HasPrefix(p, apiTokenPrefix) {
-			return s.tokenPrincipal(p), nil
+			return s.tokenPrincipal(r.Context(), p), nil
 		}
 		if ok, err := s.tryPassword(r, p); !ok {
 			return nil, err

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,15 +17,20 @@ import (
 //
 // Tokens go with the sessions of whoever made them: the admin's are revoked
 // when the admin password changes, GitHub users' when they no longer have a
-// role. GitHub organization membership is only checked when someone signs
-// in, so a GitHub user's token lasts at most maxGitHubTokenDays; the admin's
-// may never expire.
+// role. A GitHub user's token lasts at most maxGitHubTokenDays (the admin's
+// may never expire), and their organization and team memberships are
+// checked again while it's used (see githubTokenPrincipal), so its role
+// follows them.
 
 const (
 	apiTokenPrefix     = "kiwicd_"
 	maxGitHubTokenDays = 90
 	// last_used_at is only written when it's this much out of date.
 	tokenUseResolution = time.Minute
+	// How often a GitHub user's memberships are checked again for their
+	// tokens, and how long the last check does when GitHub can't say.
+	memberCheckTime = time.Hour
+	memberGraceTime = 24 * time.Hour
 )
 
 type APIToken struct {
@@ -57,7 +63,7 @@ func scanToken(row interface{ Scan(...any) error }) (*APIToken, error) {
 
 // tokenPrincipal returns what the API token t may do, or nil if it isn't a
 // current token or its maker has no role any more.
-func (s *Server) tokenPrincipal(t string) *principal {
+func (s *Server) tokenPrincipal(ctx context.Context, t string) *principal {
 	tok, err := scanToken(s.db.QueryRow(`SELECT `+tokenCols+` FROM api_tokens WHERE token_hash = ?`, hashToken(t)))
 	if err != nil || tok.ExpiresAt != 0 && tok.ExpiresAt <= nowMS() {
 		return nil
@@ -69,7 +75,7 @@ func (s *Server) tokenPrincipal(t string) *principal {
 	if tok.User == "" {
 		tok.User = adminUser
 		p = adminPrincipal()
-	} else if p, err = s.githubPrincipal(tok.User); err != nil || p.role == roleNone {
+	} else if p, err = s.githubTokenPrincipal(ctx, tok.User); err != nil || p.role == roleNone {
 		return nil
 	}
 	p.limit(tok)
