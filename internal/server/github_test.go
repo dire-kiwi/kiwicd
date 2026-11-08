@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
@@ -48,6 +49,10 @@ type fakeGitHub struct {
 	// rejectReports makes check runs with text or annotations fail with a
 	// 422, as GitHub does when it doesn't like one.
 	rejectReports bool
+	// teammember has left kiwi-org/ops or kiwi-org; checking membership
+	// fails; how many times it's been checked.
+	leftTeam, leftOrg, membersDown bool
+	memberChecks                   int
 }
 
 type checkReq struct {
@@ -219,6 +224,8 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	case p == "/installation/repositories":
 		reply(200, map[string]any{"repositories": []map[string]any{
 			{"full_name": "gh/app", "clone_url": f.ts.URL + "/gh/app.git", "private": true, "default_branch": "main"}}})
+	case strings.HasPrefix(p, "/orgs/kiwi-org/") && (strings.Contains(p, "/members/") || strings.Contains(p, "/memberships/")) &&
+		f.memberCheck(w, r, reply):
 	case strings.HasPrefix(p, "/orgs/kiwi-org/teams/ops/memberships/"):
 		if r.Header.Get("Authorization") != "token "+fakeOrgToken {
 			reply(401, map[string]string{"message": "bad token"})
@@ -253,6 +260,24 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		reply(404, map[string]string{"message": "Not Found " + p})
 	}
+}
+
+// memberCheck counts a membership check and answers it if it fails or
+// teammember has left.
+func (f *fakeGitHub) memberCheck(w http.ResponseWriter, r *http.Request, reply func(int, any)) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.memberChecks++
+	team := strings.Contains(r.URL.Path, "/teams/")
+	switch {
+	case f.membersDown:
+		reply(502, map[string]string{"message": "Server Error"})
+	case strings.HasSuffix(r.URL.Path, "/teammember") && (f.leftOrg || team && f.leftTeam):
+		reply(404, map[string]string{"message": "Not Found"})
+	default:
+		return false
+	}
+	return true
 }
 
 type githubTest struct {
@@ -543,6 +568,113 @@ func TestGitHubLogin(t *testing.T) {
 	if len(log.Entries) < 2 || log.Entries[1].Action != "role.delete" || log.Entries[1].Actor != adminUser ||
 		log.Entries[0].Action != "access.revoke" || log.Entries[0].Target != "orgmember" {
 		t.Errorf("audit log: %+v", log.Entries)
+	}
+}
+
+// TestGitHubUserTokens checks that a GitHub user's API token follows their
+// memberships, checked again while it's used.
+func TestGitHubUserTokens(t *testing.T) {
+	g := newGitHubTest(t)
+	g.createApp()
+	g.do(nil, "PUT", "/api/roles", `{"kind":"org","name":"kiwi-org","role":"viewer"}`, nil)
+	g.do(nil, "PUT", "/api/roles", `{"kind":"team","name":"kiwi-org/ops","role":"maintainer"}`, nil)
+	var mu sync.Mutex
+	now := time.Now()
+	g.srv.gh.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	later := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	set := func(f func()) { g.gh.mu.Lock(); f(); g.gh.mu.Unlock() }
+	checks := func() int { g.gh.mu.Lock(); defer g.gh.mu.Unlock(); return g.gh.memberChecks }
+
+	// Sign in as teammember, and make a token.
+	a, err := g.srv.githubApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := g.srv.checkMemberships(context.Background(), a, "teammember"); !ok || err != nil {
+		t.Fatalf("sign-in check: %v %v", ok, err)
+	}
+	if _, err := g.srv.db.Exec(`INSERT INTO sessions (token_hash, created_at, expires_at, github_login) VALUES (?, 0, ?, 'teammember')`,
+		hashToken("sess"), nowMS()+86_400_000); err != nil {
+		t.Fatal(err)
+	}
+	session := &http.Cookie{Name: sessionCookie, Value: "sess"}
+	req, _ := http.NewRequest("POST", g.ts.URL+"/api/tokens", strings.NewReader(`{"name":"ci"}`))
+	req.AddCookie(session)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct{ Token string }
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+	if created.Token == "" {
+		t.Fatalf("no token: %d", resp.StatusCode)
+	}
+	// role is what /api/me says, with the token or the session; "" if it's
+	// refused.
+	role := func(withSession bool) string {
+		t.Helper()
+		req, _ := http.NewRequest("GET", g.ts.URL+"/api/me", nil)
+		if withSession {
+			req.AddCookie(session)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+created.Token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var m struct{ Access access }
+		if resp.StatusCode != 200 {
+			return ""
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&m)
+		return m.Access.Role
+	}
+
+	n := checks()
+	if role(false) != "maintainer" || role(false) != "maintainer" || checks() != n {
+		t.Fatalf("token soon after signing in: %q, %d membership checks", role(false), checks()-n)
+	}
+	// Leaving the team lowers the token's role, and the session's, once
+	// it's checked again.
+	set(func() { g.gh.leftTeam = true })
+	later(memberCheckTime - time.Minute)
+	if role(false) != "maintainer" {
+		t.Error("memberships checked again too soon")
+	}
+	later(2 * time.Minute)
+	if r := role(false); r != "viewer" || role(true) != "viewer" {
+		t.Errorf("after leaving the team: token %q, session %q", r, role(true))
+	}
+	// If GitHub can't say, the last check will do for a while; after that
+	// the token gets only what GitHub confirms, but isn't revoked.
+	set(func() { g.gh.membersDown = true })
+	later(memberCheckTime + time.Minute)
+	if r := role(false); r != "viewer" {
+		t.Errorf("token while GitHub is down, soon after a check: %q", r)
+	}
+	later(memberGraceTime)
+	if r := role(false); r != "" {
+		t.Errorf("token while GitHub has been down for a day: %q", r)
+	}
+	set(func() { g.gh.membersDown = false })
+	if r := role(false); r != "viewer" {
+		t.Errorf("token once GitHub is back: %q", r)
+	}
+	// Leaving the organization too revokes the token and ends the session.
+	set(func() { g.gh.leftOrg = true })
+	later(memberCheckTime + time.Minute)
+	if r := role(false); r != "" {
+		t.Errorf("token of someone without a role: %q", r)
+	}
+	set(func() { g.gh.leftOrg, g.gh.leftTeam = false, false })
+	var tokens, sessions int
+	_ = g.srv.db.QueryRow(`SELECT count(*) FROM api_tokens WHERE github_login = 'teammember'`).Scan(&tokens)
+	_ = g.srv.db.QueryRow(`SELECT count(*) FROM sessions WHERE github_login = 'teammember'`).Scan(&sessions)
+	if tokens != 0 || sessions != 0 || role(false) != "" {
+		t.Errorf("after losing their role: %d tokens, %d sessions", tokens, sessions)
 	}
 }
 

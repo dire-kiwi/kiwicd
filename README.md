@@ -660,9 +660,10 @@ The admin password is always an admin. Roles are given under **Settings → GitH
 organization's members and to a team's; someone matched by several gets the most they give, so
 an organization can be viewers and one team maintainers. Changing a role applies at once, to
 sessions and tokens too; people left without one are signed out and their API tokens revoked.
-Organization and team membership is only checked when someone signs in, so a new organization
-or team role reaches its members when they next sign in. Under it, *People who have signed in*
-shows everyone's role now.
+Organization and team membership is checked when someone signs in, and again at most hourly
+while their API tokens are used, so a new organization or team role reaches its members when
+they next sign in or use a token, and someone who leaves loses what it gave them. Under it,
+*People who have signed in* shows everyone's role now.
 
 The server enforces roles on every API route and on git: what someone can't use is refused
 (`403`), and repositories a token can't see don't exist (`404`). The UI, `kiwicd` and
@@ -720,12 +721,15 @@ Secrets and variables without `--repo` are the global ones. `--watch` exits non-
 run succeeds, and list and view commands take `--json`. `kiwicd help` lists every command.
 
 API tokens act as whoever made them, limited by their [scope](#access), as a `Bearer` token or
-a Basic password, for the API and git over `/git/`. The admin's can last forever; those of people signed in with GitHub last at
-most 90 days, since organization membership is only checked when they sign in. Changing the
-admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
+a Basic password, for the API and git over `/git/`. The admin's can last forever; those of people
+signed in with GitHub last at most 90 days, and while they're used kiwicd checks their owner's
+memberships again every hour, so a token's role follows them (if GitHub can't say, a check from
+the last day will do). Once its owner may not sign in at all, their tokens are revoked. Changing
+the admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
 revoked under **Settings → API tokens**, or with `kiwicd token list` and `kiwicd token revoke`;
-`kiwicd logout` revokes its own. `kiwicd token create NAME --role viewer --repo owner/app` makes
-a read-only token that sees only `owner/app`.
+`kiwicd logout` revokes the saved one, but not one in `KIWICD_API_TOKEN`, which scripts or CI
+may share. `kiwicd token create NAME --role viewer --repo owner/app` makes a read-only token
+that sees only `owner/app`.
 
 ### MCP
 

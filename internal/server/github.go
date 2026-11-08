@@ -123,6 +123,9 @@ type githubState struct {
 	noChecks map[string]time.Time
 	// Manifest flows started in the UI, by state, until they expire.
 	setups map[string]time.Time
+	// When GitHub users' memberships (by lower-case login) were last
+	// checked, for their API tokens (see githubTokenPrincipal).
+	members map[string]time.Time
 }
 
 type cachedInstall struct {
@@ -147,6 +150,7 @@ func newGitHubState() githubState {
 		tokens:   map[string]cachedToken{},
 		noChecks: map[string]time.Time{},
 		setups:   map[string]time.Time{},
+		members:  map[string]time.Time{},
 	}
 }
 
@@ -158,6 +162,7 @@ func (g *githubState) forget() {
 	g.installs = map[string]cachedInstall{}
 	g.tokens = map[string]cachedToken{}
 	g.noChecks = map[string]time.Time{}
+	g.members = map[string]time.Time{}
 }
 
 // githubError is an unexpected response from GitHub.

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -116,7 +117,7 @@ func TestAPITokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.db.Close()
-	if p := srv.tokenPrincipal(created.Token); p != nil {
+	if p := srv.tokenPrincipal(context.Background(), created.Token); p != nil {
 		t.Fatalf("token survived a password change: %+v", p)
 	}
 }

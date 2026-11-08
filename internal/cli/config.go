@@ -29,8 +29,8 @@ func configPath() (string, error) {
 	return filepath.Join(dir, "kiwicd", "cli.json"), nil
 }
 
-// loadConfig reads the saved config, if any, and applies the environment.
-func loadConfig() (Config, error) {
+// savedConfig reads the saved config, if any.
+func savedConfig() (Config, error) {
 	var c Config
 	p, err := configPath()
 	if err != nil {
@@ -45,6 +45,15 @@ func loadConfig() (Config, error) {
 		if err := json.Unmarshal(b, &c); err != nil {
 			return c, errors.New(p + ": " + err.Error())
 		}
+	}
+	return c, nil
+}
+
+// loadConfig reads the saved config, if any, and applies the environment.
+func loadConfig() (Config, error) {
+	c, err := savedConfig()
+	if err != nil {
+		return c, err
 	}
 	if v := strings.TrimRight(os.Getenv("KIWICD_URL"), "/"); v != "" {
 		if v != strings.TrimRight(c.URL, "/") {

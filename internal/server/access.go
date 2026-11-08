@@ -29,7 +29,9 @@ import (
 // the login, to an organization's members or to a team's (Settings →
 // GitHub); someone matched by several has the most they give, and someone
 // matched by none can't sign in. Organization and team membership is checked
-// when someone signs in, and kept in github_users until they next do.
+// when someone signs in, and kept in github_users until they next do, or
+// until one of their API tokens is used after memberCheckTime (see
+// githubTokenPrincipal).
 // Roles themselves are looked up on every request, so changing a grant
 // applies at once.
 //
@@ -421,15 +423,21 @@ func (s *Server) saveGrant(g RoleGrant) error {
 // githubPrincipal is what the GitHub user login may do; its role is
 // roleNone if nothing, or err is set.
 func (s *Server) githubPrincipal(login string) (*principal, error) {
-	grants, err := s.roleGrants()
-	if err != nil {
-		return nil, err
-	}
 	var ms string
 	var memberships []string
 	if err := s.db.QueryRow(`SELECT memberships FROM github_users WHERE login = ?`, login).Scan(&ms); err == nil {
 		_ = json.Unmarshal([]byte(ms), &memberships)
 	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	return s.principalFor(login, memberships)
+}
+
+// principalFor is what the GitHub user login may do as a member of the
+// organizations and teams memberships (keys of grants).
+func (s *Server) principalFor(login string, memberships []string) (*principal, error) {
+	grants, err := s.roleGrants()
+	if err != nil {
 		return nil, err
 	}
 	p := &principal{user: login, github: true}
@@ -445,16 +453,32 @@ func (s *Server) githubPrincipal(login string) (*principal, error) {
 // about organizations and teams, records the organizations and teams it's a
 // member of, and reports whether any grant applies.
 func (s *Server) checkMemberships(ctx context.Context, a *githubApp, login string) (bool, error) {
-	grants, err := s.roleGrants()
+	c, err := s.findMemberships(ctx, a, login)
 	if err != nil {
 		return false, err
 	}
-	allowed := false
-	memberships := []string{}
+	return c.allowed, s.recordMemberships(login, c, true)
+}
+
+// membershipCheck is what GitHub said about a login's memberships.
+type membershipCheck struct {
+	allowed     bool     // some grant applies
+	memberships []string // keys of the grants to organizations and teams it's a member of
+	failed      error    // some membership couldn't be checked, so memberships may be missing some
+}
+
+// findMemberships asks GitHub which organizations and teams with a role
+// login is a member of. The error is the database's.
+func (s *Server) findMemberships(ctx context.Context, a *githubApp, login string) (membershipCheck, error) {
+	c := membershipCheck{memberships: []string{}}
+	grants, err := s.roleGrants()
+	if err != nil {
+		return c, err
+	}
 	tokens := map[string]string{}
 	for _, g := range grants {
 		if g.Kind == "user" {
-			allowed = allowed || strings.EqualFold(g.Name, login)
+			c.allowed = c.allowed || strings.EqualFold(g.Name, login)
 			continue
 		}
 		org, team, _ := strings.Cut(g.Name, "/")
@@ -464,6 +488,9 @@ func (s *Server) checkMemberships(ctx context.Context, a *githubApp, login strin
 			if err != nil || token == "" {
 				s.log.Warn("can't check members of an organization with a role: is the GitHub App installed on it, with members permission?",
 					"org", org, "err", err)
+			}
+			if err != nil {
+				c.failed = err
 			}
 			tokens[strings.ToLower(org)] = token
 		}
@@ -484,21 +511,83 @@ func (s *Server) checkMemberships(ctx context.Context, a *githubApp, login strin
 		}
 		if err != nil && !isGitHubStatus(err, 404) {
 			s.log.Warn("checking membership", g.Kind, g.Name, "login", login, "err", err)
+			c.failed = err
 		}
 		if member {
-			memberships = append(memberships, g.key())
-			allowed = true
+			c.memberships = append(c.memberships, g.key())
+			c.allowed = true
 		}
 	}
-	if !allowed {
-		// Forget memberships they've lost, but don't list strangers.
-		_, err = s.db.Exec(`UPDATE github_users SET memberships = '[]' WHERE login = ?`, login)
-		return false, err
+	return c, nil
+}
+
+// recordMemberships keeps what GitHub said about login in github_users, for
+// githubPrincipal, with the time they signed in if signedIn. A check that
+// didn't fail also counts for their API tokens (see githubTokenPrincipal).
+func (s *Server) recordMemberships(login string, c membershipCheck, signedIn bool) error {
+	key := strings.ToLower(login)
+	s.gh.mu.Lock()
+	if c.allowed && c.failed == nil {
+		s.gh.members[key] = s.gh.now()
+	} else if !c.allowed {
+		delete(s.gh.members, key)
 	}
-	_, err = s.db.Exec(`INSERT INTO github_users (login, memberships, signed_in_at) VALUES (?, ?, ?)
+	s.gh.mu.Unlock()
+	if !c.allowed {
+		// Forget memberships they've lost, but don't list strangers.
+		_, err := s.db.Exec(`UPDATE github_users SET memberships = '[]' WHERE login = ?`, login)
+		return err
+	}
+	if !signedIn {
+		_, err := s.db.Exec(`INSERT INTO github_users (login, memberships, signed_in_at) VALUES (?, ?, 0)
+			ON CONFLICT (login) DO UPDATE SET memberships = excluded.memberships`, login, mustJSON(c.memberships))
+		return err
+	}
+	_, err := s.db.Exec(`INSERT INTO github_users (login, memberships, signed_in_at) VALUES (?, ?, ?)
 		ON CONFLICT (login) DO UPDATE SET login = excluded.login, memberships = excluded.memberships, signed_in_at = excluded.signed_in_at`,
-		login, mustJSON(memberships), nowMS())
-	return true, err
+		login, mustJSON(c.memberships), nowMS())
+	return err
+}
+
+// githubTokenPrincipal is what the GitHub user login may do, for one of
+// their API tokens. Unlike sessions, which last a week, tokens last up to
+// maxGitHubTokenDays, so their memberships are checked with GitHub again
+// when they're used, at most every memberCheckTime, and recorded, so that
+// their sessions follow too. If no grant applies any more, they're signed
+// out and their tokens revoked. If GitHub can't say, the last check will do
+// for memberGraceTime; after that, only the memberships GitHub confirms.
+func (s *Server) githubTokenPrincipal(ctx context.Context, login string) (*principal, error) {
+	key := strings.ToLower(login)
+	now := s.gh.now()
+	s.gh.mu.Lock()
+	at, checked := s.gh.members[key]
+	s.gh.mu.Unlock()
+	if checked && now.Sub(at) < memberCheckTime {
+		return s.githubPrincipal(login)
+	}
+	c := membershipCheck{memberships: []string{}}
+	a, err := s.githubApp()
+	if err != nil {
+		c.failed = err
+	} else if c, err = s.findMemberships(ctx, a, login); err != nil {
+		return nil, err
+	}
+	if c.failed != nil {
+		recent := checked && now.Sub(at) < memberGraceTime
+		s.log.Warn("can't check a GitHub user's memberships for their API token", "login", login, "using the last check", recent, "err", c.failed)
+		if recent {
+			return s.githubPrincipal(login)
+		}
+		return s.principalFor(login, c.memberships)
+	}
+	if err := s.recordMemberships(login, c, false); err != nil {
+		return nil, err
+	}
+	if !c.allowed {
+		s.revokeLogin(login, "they're no longer a member of an organization or team with a role")
+		return &principal{user: login, github: true}, nil
+	}
+	return s.githubPrincipal(login)
 }
 
 // revokeLostAccess signs out GitHub users that no grant applies to any more
@@ -517,19 +606,23 @@ func (s *Server) revokeLostAccess(why string) {
 	}
 	rows.Close()
 	for _, login := range logins {
-		p, err := s.githubPrincipal(login)
-		if err != nil || p.role != roleNone {
-			continue
+		if p, err := s.githubPrincipal(login); err == nil && p.role == roleNone {
+			s.revokeLogin(login, why)
 		}
-		_, _ = s.db.Exec(`DELETE FROM sessions WHERE github_login = ?`, login)
-		res, err := s.db.Exec(`DELETE FROM api_tokens WHERE github_login = ?`, login)
-		if err != nil {
-			continue
-		}
-		n, _ := res.RowsAffected()
-		s.log.Info("signed out a GitHub user without a role: "+why, "login", login, "tokens", n)
-		s.audit(nil, "access.revoke", "", login, fmt.Sprintf("signed out, %d API tokens revoked: %s", n, why))
 	}
+}
+
+// revokeLogin signs out the GitHub user login and revokes their API tokens.
+func (s *Server) revokeLogin(login, why string) {
+	_, _ = s.db.Exec(`DELETE FROM sessions WHERE github_login = ?`, login)
+	res, err := s.db.Exec(`DELETE FROM api_tokens WHERE github_login = ?`, login)
+	if err != nil {
+		s.log.Error("revoking a GitHub user's API tokens", "login", login, "err", err)
+		return
+	}
+	n, _ := res.RowsAffected()
+	s.log.Info("signed out a GitHub user without a role: "+why, "login", login, "tokens", n)
+	s.audit(nil, "access.revoke", "", login, fmt.Sprintf("signed out, %d API tokens revoked: %s", n, why))
 }
 
 // migrateAllowList turns the GitHub App's sign-in allow list, from before
