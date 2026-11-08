@@ -375,7 +375,7 @@ func (s *Server) authenticate(r *http.Request) (string, error) {
 		}
 	}
 	if p, ok := requestPassword(r); ok && p != "" {
-		if user := s.tokenUser(p); user != "" {
+		if user := s.tokenUser(r.Context(), p); user != "" {
 			return user, nil
 		}
 		if ok, err := s.tryPassword(r, p); !ok {

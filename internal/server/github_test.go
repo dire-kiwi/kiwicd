@@ -39,6 +39,10 @@ type fakeGitHub struct {
 	mu        sync.Mutex
 	gitAuth   []string // Authorization headers of git requests
 	tokenReqs []map[string]any
+	// memberLeft: orgmember has left kiwi-org. membersDown: checking
+	// membership fails.
+	memberLeft, membersDown bool
+	memberChecks            int
 }
 
 const (
@@ -158,9 +162,15 @@ func (f *fakeGitHub) serve(w http.ResponseWriter, r *http.Request) {
 		reply(200, map[string]any{"repositories": []map[string]any{
 			{"full_name": "gh/app", "clone_url": f.ts.URL + "/gh/app.git", "private": true, "default_branch": "main"}}})
 	case strings.HasPrefix(p, "/orgs/kiwi-org/members/"):
+		f.mu.Lock()
+		f.memberChecks++
+		left, down := f.memberLeft, f.membersDown
+		f.mu.Unlock()
 		if r.Header.Get("Authorization") != "token "+fakeOrgToken {
 			reply(401, map[string]string{"message": "bad token"})
-		} else if strings.TrimPrefix(p, "/orgs/kiwi-org/members/") == "orgmember" {
+		} else if down {
+			reply(502, map[string]string{"message": "Server Error"})
+		} else if strings.TrimPrefix(p, "/orgs/kiwi-org/members/") == "orgmember" && !left {
 			w.WriteHeader(204)
 		} else {
 			reply(404, map[string]string{"message": "Not Found"})
@@ -413,6 +423,82 @@ func TestGitHubLogin(t *testing.T) {
 	}
 	if me(nil) != adminUser {
 		t.Error("the admin password stopped working")
+	}
+}
+
+// TestGitHubUserTokens checks that a GitHub user's API token stops working
+// when they leave the allowed organization.
+func TestGitHubUserTokens(t *testing.T) {
+	g := newGitHubTest(t)
+	g.createApp()
+	g.do(nil, "PATCH", "/api/github/app", `{"allowed_orgs":["kiwi-org"]}`, nil)
+	if _, err := g.srv.db.Exec(`INSERT INTO sessions (token_hash, created_at, expires_at, github_login) VALUES (?, 0, ?, 'orgmember')`,
+		hashToken("sess"), nowMS()+60_000); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest("POST", g.ts.URL+"/api/tokens", strings.NewReader(`{"name":"ci"}`))
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: "sess"})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct{ Token string }
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	var mu sync.Mutex
+	now := time.Now()
+	g.srv.gh.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	later := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	me := func() string {
+		t.Helper()
+		req, _ := http.NewRequest("GET", g.ts.URL+"/api/me", nil)
+		req.Header.Set("Authorization", "Bearer "+created.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var m struct{ User string }
+		_ = json.NewDecoder(resp.Body).Decode(&m)
+		return m.User
+	}
+	checks := func() int { g.gh.mu.Lock(); defer g.gh.mu.Unlock(); return g.gh.memberChecks }
+	set := func(left, down bool) {
+		g.gh.mu.Lock()
+		g.gh.memberLeft, g.gh.membersDown = left, down
+		g.gh.mu.Unlock()
+	}
+
+	if me() != "orgmember" || me() != "orgmember" || checks() != 1 {
+		t.Fatalf("token of an organization member: %d membership checks", checks())
+	}
+	// If GitHub can't say, a recent check will do, but not an old one.
+	set(false, true)
+	later(memberCheckTime + time.Minute)
+	if me() != "orgmember" {
+		t.Error("token refused when GitHub couldn't check membership soon after a check")
+	}
+	later(memberGraceTime)
+	if me() != "" {
+		t.Error("token accepted when GitHub couldn't check membership for a day")
+	}
+	set(false, false)
+	if me() != "orgmember" {
+		t.Error("token refused once GitHub could check membership again")
+	}
+	// Leaving the organization revokes the token once it's checked again.
+	set(true, false)
+	if me() != "orgmember" {
+		t.Error("membership checked again too soon")
+	}
+	later(memberCheckTime + time.Minute)
+	if me() != "" {
+		t.Error("token of someone who left the organization accepted")
+	}
+	set(false, false)
+	if me() != "" {
+		t.Error("token of someone who left the organization wasn't revoked")
 	}
 }
 

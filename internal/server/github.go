@@ -127,6 +127,9 @@ type githubState struct {
 	tokens map[string]cachedToken
 	// Manifest flows started in the UI, by state, until they expire.
 	setups map[string]time.Time
+	// When GitHub users (by lower-case login) were last found to be allowed
+	// to sign in, for their API tokens (see apitokens.go).
+	members map[string]time.Time
 }
 
 type cachedInstall struct {
@@ -150,6 +153,7 @@ func newGitHubState() githubState {
 		installs: map[string]cachedInstall{},
 		tokens:   map[string]cachedToken{},
 		setups:   map[string]time.Time{},
+		members:  map[string]time.Time{},
 	}
 }
 
@@ -160,6 +164,7 @@ func (g *githubState) forget() {
 	defer g.mu.Unlock()
 	g.installs = map[string]cachedInstall{}
 	g.tokens = map[string]cachedToken{}
+	g.members = map[string]time.Time{}
 }
 
 // githubError is an unexpected response from GitHub.

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"net/http"
@@ -15,7 +16,8 @@ import (
 // asks GitHub who the user is and lets them in if their login is allowed or
 // they're a member of an allowed organization that the app is installed on.
 // The token isn't kept, so membership is checked when someone signs in:
-// GitHub sessions last a week rather than the admin's 30 days.
+// GitHub sessions last a week rather than the admin's 30 days. (API tokens
+// last longer, so it's checked again when they're used; see apitokens.go.)
 //
 // Everyone signed in has the admin's access; GitHub logins only change who
 // runs show as having started them.
@@ -80,7 +82,7 @@ func (s *Server) handleGitHubLoginCallback(w http.ResponseWriter, r *http.Reques
 		loginRedirect(w, r, "Signing in with GitHub failed: "+err.Error())
 		return
 	}
-	if !s.githubUserAllowed(r, a, login) {
+	if ok, _ := s.githubUserAllowed(r.Context(), a, login); !ok {
 		s.log.Warn("GitHub sign-in refused", "login", login, "client", s.clientIP(r))
 		loginRedirect(w, r, "GitHub user "+login+" may not sign in to this kiwicd.")
 		return
@@ -136,27 +138,34 @@ func (s *Server) githubUser(r *http.Request, a *githubApp, code string) (string,
 }
 
 // githubUserAllowed reports whether login may sign in: it's an allowed user,
-// or a member of an allowed organization the app is installed on.
-func (s *Server) githubUserAllowed(r *http.Request, a *githubApp, login string) bool {
+// or a member of an allowed organization the app is installed on. The error
+// says membership of some organization couldn't be checked, so a false may
+// be wrong.
+func (s *Server) githubUserAllowed(ctx context.Context, a *githubApp, login string) (bool, error) {
 	if containsFold(a.AllowedUsers, login) {
-		return true
+		return true, nil
 	}
+	var failed error
 	for _, org := range a.AllowedOrgs {
-		token, err := s.installationToken(r.Context(), a, "org:"+org, map[string]string{"members": "read"})
+		token, err := s.installationToken(ctx, a, "org:"+org, map[string]string{"members": "read"})
 		if err != nil || token == "" {
 			s.log.Warn("can't check members of an allowed organization: is the GitHub App installed on it, with members permission?",
 				"org", org, "err", err)
+			if err != nil {
+				failed = err
+			}
 			continue
 		}
-		err = s.githubAPI(r.Context(), "GET", "/orgs/"+url.PathEscape(org)+"/members/"+url.PathEscape(login), "token "+token, nil, nil)
+		err = s.githubAPI(ctx, "GET", "/orgs/"+url.PathEscape(org)+"/members/"+url.PathEscape(login), "token "+token, nil, nil)
 		if err == nil {
-			return true
+			return true, nil
 		}
 		if !isGitHubStatus(err, 404) {
 			s.log.Warn("checking organization membership", "org", org, "login", login, "err", err)
+			failed = err
 		}
 	}
-	return false
+	return false, failed
 }
 
 func firstNonEmpty(v ...string) string {

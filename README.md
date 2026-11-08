@@ -279,8 +279,9 @@ run succeeds, and list and view commands take `--json`. `kiwicd help` lists ever
 
 API tokens act as whoever made them, as a `Bearer` token or a Basic password, for the API and
 git over `/git/`. The admin's can last forever; those of people signed in with GitHub last at
-most 90 days, since organization membership is only checked when they sign in. Changing the
-admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
+most 90 days, and while they're used kiwicd checks every hour that their owner may still sign
+in, revoking them once they may not (if GitHub can't say, a check from the last day will do).
+Changing the admin password revokes the admin's tokens, as it does their sessions. Tokens are listed and
 revoked under **Settings → API tokens**, or with `kiwicd token list` and `kiwicd token revoke`;
 `kiwicd logout` revokes the saved one, but not one in `KIWICD_API_TOKEN`, which scripts or CI
 may share.

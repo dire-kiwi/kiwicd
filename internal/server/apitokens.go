@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"strings"
@@ -14,15 +15,19 @@ import (
 //
 // Tokens go with the sessions of whoever made them: the admin's are revoked
 // when the admin password changes, GitHub users' when sign-in access is
-// removed. GitHub organization membership is only checked when someone signs
-// in, so a GitHub user's token lasts at most maxGitHubTokenDays; the admin's
-// may never expire.
+// removed. A GitHub user's token lasts at most maxGitHubTokenDays (the
+// admin's may never expire), and whether they may still sign in is checked
+// again when it's used, at most every memberCheckTime: if they've left the
+// allowed organizations, their tokens are revoked. If GitHub can't say, a
+// check from the last memberGraceTime will do.
 
 const (
 	apiTokenPrefix     = "kiwicd_"
 	maxGitHubTokenDays = 90
 	// last_used_at is only written when it's this much out of date.
 	tokenUseResolution = time.Minute
+	memberCheckTime    = time.Hour
+	memberGraceTime    = 24 * time.Hour
 )
 
 type APIToken struct {
@@ -36,7 +41,7 @@ type APIToken struct {
 
 // tokenUser returns who the API token t acts as, or "" if it isn't a current
 // token.
-func (s *Server) tokenUser(t string) string {
+func (s *Server) tokenUser(ctx context.Context, t string) string {
 	if !strings.HasPrefix(t, apiTokenPrefix) {
 		return ""
 	}
@@ -53,7 +58,53 @@ func (s *Server) tokenUser(t string) string {
 	if login == "" {
 		return adminUser
 	}
+	if !s.stillAllowed(ctx, login) {
+		return ""
+	}
 	return login
+}
+
+// stillAllowed reports whether the GitHub user login may still sign in,
+// checking with GitHub at most every memberCheckTime, and revokes their
+// tokens if not.
+func (s *Server) stillAllowed(ctx context.Context, login string) bool {
+	key := strings.ToLower(login)
+	s.gh.mu.Lock()
+	at, checked := s.gh.members[key]
+	s.gh.mu.Unlock()
+	now := s.gh.now()
+	if checked && now.Sub(at) < memberCheckTime {
+		return true
+	}
+	a, err := s.githubApp()
+	if err != nil {
+		// Removing the app revokes GitHub users' tokens, so this shouldn't
+		// happen.
+		s.log.Warn("a GitHub user's API token, but no GitHub App", "login", login, "err", err)
+		return false
+	}
+	allowed, err := s.githubUserAllowed(ctx, a, login)
+	switch {
+	case allowed:
+		s.gh.mu.Lock()
+		s.gh.members[key] = now
+		s.gh.mu.Unlock()
+		return true
+	case err != nil:
+		recent := checked && now.Sub(at) < memberGraceTime
+		s.log.Warn("can't check whether a GitHub user's API token may still be used", "login", login, "allowed", recent, "err", err)
+		return recent
+	}
+	s.gh.mu.Lock()
+	delete(s.gh.members, key)
+	s.gh.mu.Unlock()
+	res, err := s.db.Exec(`DELETE FROM api_tokens WHERE github_login = ?`, login)
+	if err != nil {
+		s.log.Error("revoking a GitHub user's API tokens", "login", login, "err", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		s.log.Info("revoked API tokens: their GitHub user may no longer sign in", "login", login, "tokens", n)
+	}
+	return false
 }
 
 func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
