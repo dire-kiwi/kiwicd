@@ -1,5 +1,7 @@
 import { useMemo, useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { useMe } from "../App";
+import { isAdmin } from "../access";
 import { errorMessage, post } from "../api";
 import { StatusIcon } from "../components/StatusIcon";
 import { Empty, ErrorBox, Icon, Modal, Spinner } from "../components/ui";
@@ -13,6 +15,7 @@ export function ReposPage() {
   const repos = useFetch<Repo[]>("/api/repos");
   const runs = useFetch<Run[]>("/api/runs?limit=500");
   const [creating, setCreating] = useState(false);
+  const admin = isAdmin(useMe());
 
   const latest = useMemo(() => {
     const m = new Map<string, Run>();
@@ -27,20 +30,28 @@ export function ReposPage() {
           <h1>Repositories</h1>
           <p className="muted">Hosted repositories live on this server; mirrors follow a repository elsewhere.</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setCreating(true)}>
-          New repository
-        </button>
+        {admin && (
+          <button className="btn btn-primary" onClick={() => setCreating(true)}>
+            New repository
+          </button>
+        )}
       </div>
       {repos.error && !repos.data && <ErrorBox onRetry={repos.reload}>{repos.error}</ErrorBox>}
       {!repos.data && !repos.error && <Spinner />}
       {repos.data && repos.data.length === 0 && (
         <Empty title="No repositories yet">
-          Create a hosted repository to push to, or mirror one from GitHub or any git server.
-          <div style={{ marginTop: 12 }}>
-            <button className="btn btn-primary" onClick={() => setCreating(true)}>
-              New repository
-            </button>
-          </div>
+          {admin ? (
+            <>
+              Create a hosted repository to push to, or mirror one from GitHub or any git server.
+              <div style={{ marginTop: 12 }}>
+                <button className="btn btn-primary" onClick={() => setCreating(true)}>
+                  New repository
+                </button>
+              </div>
+            </>
+          ) : (
+            "An admin adds repositories."
+          )}
         </Empty>
       )}
       {repos.data && repos.data.length > 0 && (

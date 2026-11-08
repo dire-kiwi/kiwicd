@@ -128,6 +128,36 @@ type Me struct {
 	User      string `json:"user"`
 	Version   string `json:"version"`
 	PublicURL string `json:"public_url"`
+	Access    Access `json:"access"`
+}
+
+// Access is what the caller may do: see the server's access.go.
+type Access struct {
+	Role        string   `json:"role"` // admin, maintainer or viewer
+	Admin       bool     `json:"admin"`
+	MaintainAll bool     `json:"maintain_all"`
+	Maintain    []string `json:"maintain"` // OWNER/NAME or OWNER/*
+	Repos       []string `json:"repos"`    // the only repositories it sees; nil for all
+	Token       *Token   `json:"token,omitempty"`
+}
+
+// CanWrite reports whether the caller may change anything at all.
+func (a Access) CanWrite() bool { return a.Role == "admin" || a.Role == "maintainer" }
+
+func (a Access) String() string {
+	s := "a viewer"
+	switch {
+	case a.Admin:
+		s = "an admin"
+	case a.Role == "maintainer" && a.MaintainAll:
+		s = "a maintainer of every repository"
+	case a.Role == "maintainer":
+		s = "a maintainer of " + strings.Join(a.Maintain, ", ")
+	}
+	if a.Repos != nil {
+		s += ", seeing only " + strings.Join(a.Repos, ", ")
+	}
+	return s
 }
 
 type Repo struct {
@@ -157,6 +187,12 @@ type Workflow struct {
 		Type        string   `json:"type,omitempty"`
 		Options     []string `json:"options,omitempty"`
 	} `json:"inputs"`
+	Schedules []struct {
+		Cron      string `json:"cron"`
+		Timezone  string `json:"timezone,omitempty"`
+		NextRunAt int64  `json:"next_run_at,omitempty"`
+		Error     string `json:"error,omitempty"`
+	} `json:"schedules,omitempty"`
 	Error    string `json:"error,omitempty"`
 	Uploaded bool   `json:"uploaded,omitempty"`
 }
@@ -196,6 +232,7 @@ type Job struct {
 	RunID      int64             `json:"run_id"`
 	Key        string            `json:"key"`
 	Name       string            `json:"name"`
+	Uses       string            `json:"uses,omitempty"` // a job calling a reusable workflow
 	RunsOn     []string          `json:"runs_on"`
 	Status     string            `json:"status"`
 	Conclusion string            `json:"conclusion"`
@@ -249,20 +286,53 @@ type Runner struct {
 }
 
 type Token struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	User       string `json:"user"`
-	CreatedAt  int64  `json:"created_at"`
-	ExpiresAt  int64  `json:"expires_at"`
-	LastUsedAt int64  `json:"last_used_at"`
+	ID         int64    `json:"id"`
+	Name       string   `json:"name"`
+	User       string   `json:"user"`
+	CreatedAt  int64    `json:"created_at"`
+	ExpiresAt  int64    `json:"expires_at"`
+	LastUsedAt int64    `json:"last_used_at"`
+	Role       string   `json:"role"`  // "" for its maker's
+	Repos      []string `json:"repos"` // none for all
+}
+
+// Scope says what a token may do.
+func (t Token) Scope() string {
+	s := "full"
+	if t.Role != "" {
+		s = t.Role
+	}
+	if len(t.Repos) > 0 {
+		s += " of " + strings.Join(t.Repos, ",")
+	}
+	return s
+}
+
+// NewToken is what CreateToken makes: ExpiresInDays 0 means never (or the
+// server's limit, for GitHub users); Role ("viewer", "maintainer" or
+// "admin"; "" for its maker's) and Repos limit what it may do.
+type NewToken struct {
+	Name          string   `json:"name"`
+	ExpiresInDays int      `json:"expires_in_days"`
+	Role          string   `json:"role,omitempty"`
+	Repos         []string `json:"repos,omitempty"`
 }
 
 // ---------------------------------------------------------------- calls
 
-func (c *Client) Runs(ctx context.Context, repo string, limit int) ([]Run, error) {
+// RunFilter narrows a list of runs; empty fields don't. Workflow is a
+// workflow's file (or its name in .github/workflows), Branch a branch name or
+// full ref, Status queued, in_progress, completed or a conclusion.
+type RunFilter struct {
+	Repo, Workflow, Branch, Event, Status, Actor string
+}
+
+func (c *Client) Runs(ctx context.Context, f RunFilter, limit int) ([]Run, error) {
 	q := url.Values{}
-	if repo != "" {
-		q.Set("repo", repo)
+	for k, v := range map[string]string{"repo": f.Repo, "workflow": f.Workflow, "branch": f.Branch, "event": f.Event, "status": f.Status, "actor": f.Actor} {
+		if v != "" {
+			q.Set(k, v)
+		}
 	}
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))
@@ -326,12 +396,47 @@ func (c *Client) Dispatch(ctx context.Context, repo, workflow, ref string, input
 	return out.RunID, err
 }
 
-func (c *Client) Rerun(ctx context.Context, id int64) (int64, error) {
+// RepositoryDispatch sends a repository_dispatch event of eventType and
+// returns the runs it started.
+func (c *Client) RepositoryDispatch(ctx context.Context, repo, eventType string, payload map[string]any) ([]int64, error) {
+	p, err := repoPath(repo)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		RunIDs []int64 `json:"run_ids"`
+	}
+	err = c.Do(ctx, http.MethodPost, p+"/dispatches", map[string]any{"event_type": eventType, "client_payload": payload}, &out)
+	return out.RunIDs, err
+}
+
+// RerunOptions picks what a re-run runs again: every job by default, the
+// failed ones, or one job (each with the jobs that need them), and whether
+// with debug logging.
+type RerunOptions struct {
+	Failed bool  `json:"failed,omitempty"`
+	JobID  int64 `json:"job_id,omitempty"`
+	// Debug turns on debug logging (ACTIONS_STEP_DEBUG, ACTIONS_RUNNER_DEBUG).
+	Debug bool `json:"debug,omitempty"`
+}
+
+func (c *Client) Rerun(ctx context.Context, id int64, opts RerunOptions) (int64, error) {
 	var out struct {
 		RunID int64 `json:"run_id"`
 	}
-	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/rerun", id), struct{}{}, &out)
+	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/rerun", id), opts, &out)
 	return out.RunID, err
+}
+
+// Approve approves a run from a fork's pull request that waits for
+// approval, with the other runs of its pull request that do, and returns
+// their IDs.
+func (c *Client) Approve(ctx context.Context, id int64) ([]int64, error) {
+	var out struct {
+		Approved []int64 `json:"approved"`
+	}
+	err := c.Do(ctx, http.MethodPost, fmt.Sprintf("/api/runs/%d/approve", id), struct{}{}, &out)
+	return out.Approved, err
 }
 
 func (c *Client) Cancel(ctx context.Context, id int64) error {
@@ -449,15 +554,21 @@ func (c *Client) Tokens(ctx context.Context) ([]Token, error) {
 	return out, err
 }
 
-// CreateToken makes an API token; expiresInDays 0 means never (or the
-// server's limit, for GitHub users).
-func (c *Client) CreateToken(ctx context.Context, name string, expiresInDays int) (string, *Token, error) {
+// CreateToken makes an API token.
+func (c *Client) CreateToken(ctx context.Context, t NewToken) (string, *Token, error) {
 	var out struct {
 		Token string `json:"token"`
 		Info  Token  `json:"info"`
 	}
-	err := c.Do(ctx, http.MethodPost, "/api/tokens", map[string]any{"name": name, "expires_in_days": expiresInDays}, &out)
+	err := c.Do(ctx, http.MethodPost, "/api/tokens", t, &out)
 	return out.Token, &out.Info, err
+}
+
+// Me says who the client is and what it may do.
+func (c *Client) Me(ctx context.Context) (*Me, error) {
+	var me Me
+	err := c.Get(ctx, "/api/me", &me)
+	return &me, err
 }
 
 // RevokeToken revokes a token by ID, or the client's own with id "current".

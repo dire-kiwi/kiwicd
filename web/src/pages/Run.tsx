@@ -1,22 +1,28 @@
 import { useCallback, useMemo, useState } from "react";
-import { Link, NavLink, useNavigate, useParams } from "react-router-dom";
+import { Link, NavLink, useParams } from "react-router-dom";
+import { useMe } from "../App";
+import { canMaintain } from "../access";
 import { errorMessage, post } from "../api";
 import { JobLog } from "../components/JobLog";
 import { PlanGraph } from "../components/PlanGraph";
+import { RerunModal, type RerunWhat } from "../components/RerunModal";
+import { RunReports } from "../components/RunReports";
+import { RunTiming } from "../components/RunTiming";
 import { StatusIcon } from "../components/StatusIcon";
 import { BranchChip, CodeBlock, ErrorBox, Flash, Icon, Spinner } from "../components/ui";
 import { useDocumentTitle, useEventSource, useFetch, useNow } from "../hooks";
-import { buildGroups, jobState, type PlanGroup } from "../runmodel";
-import type { Job, Run, RunDetail } from "../types";
-import { absoluteTime, classes, elapsed, eventLabel, refName, relativeTime, shortSha, stateLabel, visualState } from "../util";
+import { buildGroups, groupJobs, jobState, type CalledItem, type PlanGroup } from "../runmodel";
+import type { CalledWorkflow, Job, Run, RunDetail } from "../types";
+import { absoluteTime, classes, elapsed, eventLabel, permissionsLabel, refName, relativeTime, shortSha, stateLabel, visualState } from "../util";
 
 export function RunPage() {
   const { id = "", jobId } = useParams();
-  const navigate = useNavigate();
+  const me = useMe();
   const detail = useFetch<RunDetail>(`/api/runs/${id}`);
   const { setData, reload } = detail;
   const [actionError, setActionError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [rerun, setRerun] = useState<RerunWhat>();
 
   const onRun = useCallback(
     (data: unknown) => {
@@ -65,8 +71,27 @@ export function RunPage() {
   const st = visualState(run.status, run.conclusion, run.cancel_requested);
   const selectedJob = jobId ? jobs.find((j) => String(j.id) === jobId) : undefined;
   const pushed = run.event === "repository_push" ? pushedTo(run.event_payload) : undefined;
-  const pull = run.event === "repository_pull_request" ? pullRequestOf(run.event_payload) : undefined;
+  const pull =
+    run.event === "repository_pull_request" || run.event === "pull_request" ? pullRequestOf(run.event_payload) : undefined;
+  const after = run.event === "workflow_run" ? workflowRunOf(run.event_payload) : undefined;
+  const dispatched = run.event === "repository_dispatch" ? dispatchOf(run.event_payload) : undefined;
+  const changedRef = run.event === "create" || run.event === "delete" ? refOf(run.event_payload) : undefined;
   const waiting = !!run.concurrency_group && run.status === "queued" && !run.cancel_requested && jobs.length === 0;
+  const awaitingApproval = run.status === "waiting" && !run.cancel_requested;
+  const author = authorOf(run.event_payload);
+
+  const approve = async () => {
+    setBusy(true);
+    setActionError(undefined);
+    try {
+      await post(`/api/runs/${run.id}/approve`);
+      reload();
+    } catch (e) {
+      setActionError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const cancel = async () => {
     setBusy(true);
@@ -80,18 +105,7 @@ export function RunPage() {
       setBusy(false);
     }
   };
-  const rerun = async () => {
-    setBusy(true);
-    setActionError(undefined);
-    try {
-      const res = await post<{ run_id: number }>(`/api/runs/${run.id}/rerun`);
-      navigate(`/runs/${res.run_id}`);
-    } catch (e) {
-      setActionError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const anyFailed = jobs.some((j) => j.conclusion === "failure" || j.conclusion === "cancelled");
 
   return (
     <div className="page page-wide">
@@ -109,14 +123,33 @@ export function RunPage() {
           </h1>
         </div>
         <div className="run-actions">
-          {run.status !== "completed" ? (
-            <button className="btn btn-danger-outline" onClick={cancel} disabled={busy || run.cancel_requested}>
-              {run.cancel_requested ? "Cancelling…" : "Cancel run"}
-            </button>
+          {jobs.length > 0 && (
+            <a className="btn" href={`/api/runs/${run.id}/logs`} download title="Download every job's log as a zip file">
+              <Icon name="download" size={14} /> Download logs
+            </a>
+          )}
+          {!canMaintain(me?.access, run.repo) ? null : run.status !== "completed" ? (
+            <>
+              {awaitingApproval && (
+                <button className="btn btn-primary" onClick={approve} disabled={busy}>
+                  Approve and run
+                </button>
+              )}
+              <button className="btn btn-danger-outline" onClick={cancel} disabled={busy || run.cancel_requested}>
+                {run.cancel_requested ? "Cancelling…" : "Cancel run"}
+              </button>
+            </>
           ) : (
-            <button className="btn" onClick={rerun} disabled={busy}>
-              Re-run all jobs
-            </button>
+            <>
+              {anyFailed && (
+                <button className="btn" onClick={() => setRerun({ kind: "failed" })}>
+                  Re-run failed jobs
+                </button>
+              )}
+              <button className="btn" onClick={() => setRerun({ kind: "all" })}>
+                Re-run all jobs
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -168,6 +201,36 @@ export function RunPage() {
             </span>
           </div>
         )}
+        {after && (
+          <div className="meta-item">
+            <span className="meta-label">After</span>
+            <span className="meta-value meta-inline">
+              <Link to={`/runs/${after.id}`}>
+                {after.name} #{after.number}
+              </Link>
+              <span>{after.action === "completed" && after.conclusion ? after.conclusion : eventLabel(after.action)}</span>
+              <BranchChip name={after.branch} />
+              <span className="mono" title={after.sha}>
+                <Icon name="commit" size={14} /> {shortSha(after.sha)}
+              </span>
+            </span>
+          </div>
+        )}
+        {dispatched && (
+          <div className="meta-item">
+            <span className="meta-label">Event type</span>
+            <span className="meta-value mono">{dispatched}</span>
+          </div>
+        )}
+        {changedRef && (
+          <div className="meta-item">
+            <span className="meta-label">{run.event === "create" ? "Created" : "Deleted"}</span>
+            <span className="meta-value meta-inline">
+              <span>{changedRef.type}</span>
+              <BranchChip name={changedRef.name} />
+            </span>
+          </div>
+        )}
         <div className="meta-item">
           <span className="meta-label">Total duration</span>
           <span className="meta-value">{elapsed(run.started_at, run.finished_at, now) || "—"}</span>
@@ -177,15 +240,57 @@ export function RunPage() {
           <span className="meta-value mono small" title={run.workflow_file}>
             {run.workflow_file.replace(/^\.github\/workflows\//, "")}
             {run.attempt > 1 && <span className="muted"> · attempt {run.attempt}</span>}
+            {run.debug && <span className="muted"> · debug logging</span>}
           </span>
         </div>
+        {run.approval === "approved" && (
+          <div className="meta-item">
+            <span className="meta-label">Approved by</span>
+            <span className="meta-value" title={run.approved_at ? absoluteTime(run.approved_at) : undefined}>
+              <strong>{run.approved_by}</strong> {run.approved_at ? relativeTime(run.approved_at, now) : null}
+            </span>
+          </div>
+        )}
+        {run.permissions && (
+          <div className="meta-item">
+            <span className="meta-label">Permissions</span>
+            <span className="meta-value mono small" title="Not enforced yet: kiwicd's job token can only read">
+              {permissionsLabel(run.permissions)}
+            </span>
+          </div>
+        )}
       </div>
-      {run.error && (
+      {run.error && run.approval !== "required" && (
         <ErrorBox>
           <span className="pre-wrap">{run.error}</span>
         </ErrorBox>
       )}
-      {!run.protected && !run.error && (
+      {run.approval === "required" && run.status === "completed" && (
+        <Flash>
+          <span className="pre-wrap">{run.error || "The run was cancelled before anyone approved it."}</span>
+        </Flash>
+      )}
+      {awaitingApproval && (
+        <Flash kind="warn">
+          <span>
+            This pull request is from a fork{author ? <> by <strong>{author.login}</strong>{associationLabel(author.association)}</> : null}, so its
+            runs wait for a maintainer of {run.repo} to approve them: their jobs would run the fork's code on this server's runners. Review
+            the pull request's changes{author?.url ? <> on <a href={author.url}>GitHub</a></> : null} first, workflow files included.{" "}
+            {canMaintain(me?.access, run.repo)
+              ? "Approving runs this event's other waiting runs too."
+              : "Only a maintainer of the repository can approve them."}
+          </span>
+        </Flash>
+      )}
+      {!run.protected && !run.error && run.event === "pull_request" && (
+        <Flash kind="warn">
+          <span>
+            This run is on a pull request, whose workflow comes from the pull request, so its jobs get no secrets except{" "}
+            <span className="mono">KIWICD_TOKEN</span>, which only fetches {run.repo}.
+          </span>
+        </Flash>
+      )}
+      {!run.protected && !run.error && run.event !== "pull_request" && (
         <Flash kind="warn">
           <span>
             <span className="mono">{refName(run.ref)}</span> isn't a protected ref of {run.repo}, so this run's jobs get no secrets except{" "}
@@ -214,17 +319,24 @@ export function RunPage() {
         <section className="run-content">
           {jobId ? (
             selectedJob ? (
-              <JobLog key={selectedJob.id} job={selectedJob} onJob={upsertJob} withheld={detail.data?.protected_labels ?? []} />
+              <JobLog
+                key={selectedJob.id}
+                job={selectedJob}
+                onJob={upsertJob}
+                withheld={detail.data?.protected_labels ?? []}
+                onRerun={run.status === "completed" && canMaintain(me?.access, run.repo) ? () => setRerun({ kind: "job", job: selectedJob }) : undefined}
+              />
             ) : (
               <ErrorBox>
                 Job {jobId} is not part of this run. <Link to={`/runs/${run.id}`}>Back to summary</Link>
               </ErrorBox>
             )
           ) : (
-            <RunSummary run={run} groups={groups} now={now} />
+            <RunSummary run={run} groups={groups} workflows={detail.data?.workflows ?? []} now={now} />
           )}
         </section>
       </div>
+      {rerun && <RerunModal run={run} what={rerun} onClose={() => setRerun(undefined)} />}
     </div>
   );
 }
@@ -233,7 +345,19 @@ function JobNav({ runId, groups, now }: { runId: number; groups: PlanGroup[]; no
   return (
     <ul className="side-jobs">
       {groups.map((g) =>
-        g.jobs.length === 0 ? (
+        g.uses && g.items.length > 0 ? (
+          <li key={g.key} className="side-group">
+            <div className="side-group-title" title={g.uses}>
+              <StatusIcon state={g.state} size={14} />
+              <span className="ellipsis">{g.name}</span>
+            </div>
+            <ul>
+              {g.items.map((item) => (
+                <CalledNavItem key={item.key} runId={runId} item={item} now={now} />
+              ))}
+            </ul>
+          </li>
+        ) : g.jobs.length === 0 ? (
           <li key={g.key}>
             <div className="side-link side-disabled" title={g.state === "pending" ? "Waiting for dependencies" : undefined}>
               <StatusIcon state={g.state} size={14} />
@@ -261,6 +385,29 @@ function JobNav({ runId, groups, now }: { runId: number; groups: PlanGroup[]; no
   );
 }
 
+function CalledNavItem({ runId, item, now }: { runId: number; item: CalledItem; now: number }) {
+  const indent = { paddingLeft: 8 + item.depth * 14 };
+  if (!item.job || item.caller) {
+    return (
+      <li>
+        <div className={classes("side-link", !item.job && "side-disabled", item.caller && "side-caller")} style={indent} title={item.job?.uses}>
+          <StatusIcon state={item.job ? jobState(item.job) : "pending"} size={14} />
+          <span className="ellipsis">{item.label}</span>
+        </div>
+      </li>
+    );
+  }
+  return (
+    <li>
+      <NavLink to={`/runs/${runId}/jobs/${item.job.id}`} className="side-link" style={indent}>
+        <StatusIcon state={jobState(item.job)} size={14} />
+        <span className="ellipsis">{item.label}</span>
+        <span className="muted small side-dur">{elapsed(item.job.started_at, item.job.finished_at, now)}</span>
+      </NavLink>
+    </li>
+  );
+}
+
 function JobNavItem({ runId, job, now }: { runId: number; job: Job; now: number }) {
   return (
     <li>
@@ -273,8 +420,9 @@ function JobNavItem({ runId, job, now }: { runId: number; job: Job; now: number 
   );
 }
 
-function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: number }) {
-  const outputs = groups.flatMap((g) => g.jobs).filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
+function RunSummary({ run, groups, workflows, now }: { run: Run; groups: PlanGroup[]; workflows: CalledWorkflow[]; now: number }) {
+  const jobs = groups.flatMap(groupJobs);
+  const outputs = jobs.filter((j) => j.outputs && Object.keys(j.outputs).length > 0);
   return (
     <div className="stack">
       <section className="box">
@@ -294,6 +442,8 @@ function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: 
           <PlanGraph runId={run.id} groups={groups} now={now} />
         )}
       </section>
+      <RunReports runId={run.id} jobs={jobs} />
+      <RunTiming run={run} groups={groups} now={now} />
       {outputs.length > 0 && (
         <section className="box">
           <div className="box-header">
@@ -331,6 +481,18 @@ function RunSummary({ run, groups, now }: { run: Run; groups: PlanGroup[]; now: 
           <CodeBlock code={run.workflow_yaml} />
         </details>
       )}
+      {workflows.map((w) => (
+        <details className="box disclosure-box" key={w.path}>
+          <summary>
+            Called by <span className="mono">{w.path.split("/").join(" / ")}</span>{" "}
+            <span className="mono muted small" title={w.sha}>
+              {w.source === "github" ? "github.com/" : ""}
+              {w.repo}/{w.file}@{shortSha(w.sha)}
+            </span>
+          </summary>
+          <CodeBlock code={w.yaml} />
+        </details>
+      ))}
     </div>
   );
 }
@@ -352,7 +514,7 @@ interface PullRequestPayload {
   };
 }
 
-// pullRequestOf reads the other repository's pull request from a repository_pull_request run's event.
+// pullRequestOf reads the pull request from a pull_request or repository_pull_request run's event.
 function pullRequestOf(
   payload: unknown,
 ): { repo: string; number: number; action: string; head: string; sha: string; headRepo?: string; fork: boolean } | undefined {
@@ -370,4 +532,63 @@ function pullRequestOf(
     headRepo,
     fork: !headRepo || !baseRepo || headRepo.toLowerCase() !== baseRepo.toLowerCase(),
   };
+}
+
+// authorOf reads who opened the pull request of a pull_request run's event.
+function authorOf(payload: unknown): { login: string; association: string; url?: string } | undefined {
+  const pr = (payload as { pull_request?: { user?: { login?: string }; author_association?: string; html_url?: string } } | undefined)
+    ?.pull_request;
+  if (!pr?.user?.login) return undefined;
+  return { login: pr.user.login, association: pr.author_association ?? "", url: pr.html_url };
+}
+
+// associationLabel describes GitHub's author_association, as a clause after the author's login.
+function associationLabel(a: string): string {
+  switch (a) {
+    case "FIRST_TIMER":
+      return ", who is new to GitHub";
+    case "FIRST_TIME_CONTRIBUTOR":
+      return ", whose first pull request to the repository this is";
+    case "NONE":
+      return ", who hasn't contributed to the repository";
+    case "CONTRIBUTOR":
+      return ", who has contributed before but isn't a collaborator";
+    default:
+      return "";
+  }
+}
+
+// workflowRunOf reads the run a workflow_run run followed from its event.
+function workflowRunOf(
+  payload: unknown,
+): { id: number; name: string; number: number; action: string; conclusion: string; branch: string; sha: string } | undefined {
+  const p = payload as
+    | {
+        action?: string;
+        workflow_run?: { id?: number; name?: string; run_number?: number; conclusion?: string | null; head_branch?: string; head_sha?: string };
+      }
+    | undefined;
+  const r = p?.workflow_run;
+  if (!r?.id) return undefined;
+  return {
+    id: r.id,
+    name: r.name ?? "",
+    number: r.run_number ?? 0,
+    action: p?.action ?? "",
+    conclusion: r.conclusion ?? "",
+    branch: r.head_branch ?? "",
+    sha: r.head_sha ?? "",
+  };
+}
+
+// dispatchOf reads a repository_dispatch run's event type.
+function dispatchOf(payload: unknown): string | undefined {
+  return (payload as { action?: string } | undefined)?.action || undefined;
+}
+
+// refOf reads the branch or tag a create or delete run is for.
+function refOf(payload: unknown): { name: string; type: string } | undefined {
+  const p = payload as { ref?: string; ref_type?: string } | undefined;
+  if (!p?.ref) return undefined;
+  return { name: p.ref, type: p.ref_type ?? "" };
 }

@@ -1,4 +1,4 @@
-import type { Conclusion, Status } from "./types";
+import type { Conclusion, Permissions, Status } from "./types";
 
 export function formatDuration(ms: number): string {
   if (!isFinite(ms) || ms < 0) ms = 0;
@@ -73,6 +73,7 @@ export type VisualState =
   | "in_progress"
   | "queued"
   | "pending"
+  | "approval"
   | "cancelling";
 
 export function visualState(status: Status | string, conclusion: Conclusion | string, cancelRequested = false): VisualState {
@@ -93,6 +94,7 @@ export function visualState(status: Status | string, conclusion: Conclusion | st
   if (cancelRequested) return "cancelling";
   if (status === "in_progress") return "in_progress";
   if (status === "queued") return "queued";
+  if (status === "waiting") return "approval";
   return "pending";
 }
 
@@ -112,6 +114,8 @@ export function stateLabel(s: VisualState): string {
       return "Queued";
     case "pending":
       return "Waiting";
+    case "approval":
+      return "Waiting for approval";
     case "cancelling":
       return "Cancelling";
   }
@@ -123,4 +127,12 @@ export function eventLabel(ev: string): string {
 
 export function classes(...xs: (string | false | null | undefined)[]): string {
   return xs.filter(Boolean).join(" ");
+}
+
+/** Describes a permissions: setting, e.g. "read-all" or "contents: read, packages: write". */
+export function permissionsLabel(p: Permissions): string {
+  if (p.all) return `${p.all}-all`;
+  const scopes = Object.entries(p.scopes ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  if (scopes.length === 0) return "none";
+  return scopes.map(([k, v]) => `${k}: ${v}`).join(", ");
 }

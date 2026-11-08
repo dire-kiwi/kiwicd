@@ -54,6 +54,14 @@ export function StatusIcon({ state, size = 16, title }: { state: VisualState; si
           <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" strokeWidth="2" />
         </svg>
       );
+    case "approval":
+      return (
+        <svg {...common}>
+          <title>{label}</title>
+          <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+          <path d="M6.3 5.4v5.2M9.7 5.4v5.2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      );
     case "pending":
     default:
       return (

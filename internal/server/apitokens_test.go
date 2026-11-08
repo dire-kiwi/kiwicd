@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -63,6 +62,9 @@ func TestAPITokens(t *testing.T) {
 	}
 
 	// GitHub users' tokens expire within maxGitHubTokenDays.
+	if err := srv.saveGrant(RoleGrant{Kind: "user", Name: "octocat", Role: "viewer"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := srv.db.Exec(`INSERT INTO sessions (token_hash, created_at, expires_at, github_login) VALUES (?, 0, ?, 'octocat')`,
 		hashToken("sess"), nowMS()+60_000); err != nil {
 		t.Fatal(err)
@@ -82,11 +84,13 @@ func TestAPITokens(t *testing.T) {
 	if gh.Info.User != "octocat" || gh.Info.ExpiresAt == 0 || gh.Info.ExpiresAt > nowMS()+maxGitHubTokenDays*86_400_000+60_000 {
 		t.Fatalf("GitHub user's token: %+v", gh.Info)
 	}
-	srv.endGitHubSessions("test")
-	if code, b := do("GET", "/api/tokens", "pw", ""); code != 200 || strings.Contains(string(b), "octocat") {
-		t.Fatalf("GitHub user's token after sign-in access was removed: %d %s", code, b)
+	if code, b := do("GET", "/api/me", gh.Token, ""); code != 200 || !strings.Contains(string(b), "octocat") {
+		t.Fatalf("me with GitHub user's token: %d %s", code, b)
 	}
-	// Using them is tested with the GitHub App in TestGitHubUserTokens.
+	srv.endGitHubSessions("test")
+	if code, _ := do("GET", "/api/me", gh.Token, ""); code != 401 {
+		t.Fatalf("GitHub user's token after sign-in access was removed: %d", code)
+	}
 
 	// Logging out revokes the token used.
 	if code, b := do("DELETE", "/api/tokens/current", created.Token, ""); code != 200 {
@@ -112,7 +116,7 @@ func TestAPITokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.db.Close()
-	if user := srv.tokenUser(context.Background(), created.Token); user != "" {
-		t.Fatalf("token survived a password change: %q", user)
+	if p := srv.tokenPrincipal(created.Token); p != nil {
+		t.Fatalf("token survived a password change: %+v", p)
 	}
 }

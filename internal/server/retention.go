@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,23 +18,24 @@ const (
 	pruneInterval  = time.Hour
 )
 
-// pruneLoop deletes runs older than the retention period, at startup and then
-// hourly.
+// pruneLoop cancels runs that have waited too long for approval (see
+// approval.go) and deletes runs older than the retention period, at startup
+// and then hourly.
 func (s *Server) pruneLoop(ctx context.Context) {
-	if s.cfg.RetentionDays <= 0 {
-		return
-	}
 	t := time.NewTicker(pruneInterval)
 	defer t.Stop()
 	for {
-		cutoff := time.Now().Add(-time.Duration(s.cfg.RetentionDays) * 24 * time.Hour)
-		if n, err := s.pruneRuns(ctx, cutoff); err != nil {
-			s.log.Error("prune runs", "err", err)
-		} else if n > 0 {
-			s.log.Info("pruned old runs", "runs", n, "older_than", cutoff.Format(time.DateOnly))
-		}
-		if err := s.incrementalVacuum(ctx); err != nil {
-			s.log.Error("incremental vacuum", "err", err)
+		s.expireWaitingRuns()
+		if s.cfg.RetentionDays > 0 {
+			cutoff := time.Now().Add(-time.Duration(s.cfg.RetentionDays) * 24 * time.Hour)
+			if n, err := s.pruneRuns(ctx, cutoff); err != nil {
+				s.log.Error("prune runs", "err", err)
+			} else if n > 0 {
+				s.log.Info("pruned old runs", "runs", n, "older_than", cutoff.Format(time.DateOnly))
+			}
+			if err := s.incrementalVacuum(ctx); err != nil {
+				s.log.Error("incremental vacuum", "err", err)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -79,8 +82,14 @@ func (s *Server) pruneRuns(ctx context.Context, cutoff time.Time) (int, error) {
 
 // deleteRun deletes a run with its jobs and their logs. All run deletion goes
 // through here, so anything stored outside the database for a job, such as
-// its log archive, is removed here too.
+// its log archive, or for the run, such as a pull_request run's ref to its
+// commit, is removed here too.
 func (s *Server) deleteRun(ctx context.Context, runID int64) error {
+	var repoName, ref string
+	if err := s.db.QueryRowContext(ctx, `SELECT repos.name, runs.ref FROM runs JOIN repos ON repos.id = runs.repo_id WHERE runs.id = ?`,
+		runID).Scan(&repoName, &ref); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs WHERE run_id = ?`, runID)
 	if err != nil {
 		return err
@@ -108,6 +117,7 @@ func (s *Server) deleteRun(ctx context.Context, runID int64) error {
 		return err
 	}
 	s.removeLogArchives(jobIDs)
+	s.dropRunCommit(ctx, repoName, runID, ref)
 	return nil
 }
 

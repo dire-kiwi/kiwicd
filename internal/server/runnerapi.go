@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dire-kiwi/kiwicd/internal/protocol"
+	"github.com/dire-kiwi/kiwicd/internal/wf"
 )
 
 type Runner struct {
@@ -92,8 +93,9 @@ func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, "bad request: %v", err)
 		return
 	}
-	if req.Protocol != protocol.Version {
-		httpError(w, 400, "agent protocol %d is not supported (server speaks %d); upgrade the agent", req.Protocol, protocol.Version)
+	if req.Protocol < protocol.MinVersion || req.Protocol > protocol.Version {
+		httpError(w, 400, "agent protocol %d is not supported (server speaks %d to %d); upgrade the agent or the server",
+			req.Protocol, protocol.MinVersion, protocol.Version)
 		return
 	}
 	var exp int64
@@ -119,6 +121,11 @@ func (s *Server) handleRunnerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	id, _ := res.LastInsertId()
 	s.log.Info("runner registered", "name", req.Name, "labels", labels)
+	how := "with a registration token"
+	if static {
+		how = "with the server's registration token"
+	}
+	s.audit(nil, "runner.register", "", fmt.Sprintf("%s (%d)", req.Name, id), how+", from "+s.clientIP(r)+", labels "+strings.Join(labels, ", "))
 	s.hub.publish("runs", "runners", nil)
 	writeJSON(w, protocol.RegisterResponse{RunnerID: id, RunnerToken: token, Name: req.Name, Labels: labels})
 }
@@ -144,8 +151,8 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	var req protocol.PollRequest
 	_ = readJSON(r, &req)
-	if req.Protocol != protocol.Version {
-		httpError(w, 400, "agent protocol %d is not supported (server speaks %d)", req.Protocol, protocol.Version)
+	if req.Protocol < protocol.MinVersion || req.Protocol > protocol.Version {
+		httpError(w, 400, "agent protocol %d is not supported (server speaks %d to %d)", req.Protocol, protocol.MinVersion, protocol.Version)
 		return
 	}
 	if req.Version != "" && req.Version != rn.Version {
@@ -155,7 +162,7 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 	defer deadline.Stop()
 	for {
 		ready := s.jobsReadyChan()
-		job, err := s.assignJob(r.Context(), rn, s.publicURL(r))
+		job, err := s.assignJob(r.Context(), rn, req.Protocol, s.publicURL(r))
 		if err != nil {
 			httpError(w, 500, "%v", err)
 			return
@@ -176,8 +183,10 @@ func (s *Server) handleRunnerPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // assignJob gives the oldest queued job whose runs-on labels the runner has
-// and whose run may use the runner's reserved and protected labels.
-func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*protocol.JobRequest, error) {
+// and whose run may use the runner's reserved and protected labels, leaving
+// a matrix's jobs queued while max-parallel of them run. Agents older than protocol.CalledJobsVersion don't get jobs of reusable
+// workflows, which they would run without their inputs.
+func (s *Server) assignJob(ctx context.Context, rn *Runner, agentProtocol int, baseURL string) (*protocol.JobRequest, error) {
 	s.mu.Lock()
 	rows, err := s.db.Query(`SELECT `+jobCols+` FROM jobs WHERE status = ? ORDER BY id`, protocol.StatusQueued)
 	if err != nil {
@@ -192,7 +201,7 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 			s.mu.Unlock()
 			return nil, err
 		}
-		if labelsMatch(j.RunsOn, rn.Labels) {
+		if labelsMatch(j.RunsOn, rn.Labels) && (j.ParentID == 0 || agentProtocol >= protocol.CalledJobsVersion) {
 			candidates = append(candidates, j)
 		}
 	}
@@ -203,7 +212,20 @@ func (s *Server) assignJob(ctx context.Context, rn *Runner, baseURL string) (*pr
 	// forever: fail them.
 	denied := map[int64]string{}
 	limited := s.reserved.reservesAny(rn.Labels) || len(s.protectedLabels.of(rn.Labels)) > 0
+	running := map[string]int{} // of a matrix with max-parallel, by run and job key
 	for _, j := range candidates {
+		if j.MaxParallel > 0 {
+			k := fmt.Sprintf("%d/%s", j.RunID, j.Key)
+			n, ok := running[k]
+			if !ok {
+				_ = s.db.QueryRow(`SELECT count(*) FROM jobs WHERE run_id = ? AND job_key = ? AND status = ?`,
+					j.RunID, j.Key, protocol.StatusInProgress).Scan(&n)
+				running[k] = n
+			}
+			if n >= j.MaxParallel {
+				continue
+			}
+		}
 		if limited {
 			run, err := s.getRun(j.RunID)
 			if err != nil {
@@ -262,17 +284,17 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 	if err != nil {
 		return nil, err
 	}
-	byKey := map[string][]*Job{}
-	for _, other := range jobs {
+	// The other jobs of its workflow feed its needs context.
+	tree := newJobTree(jobs)
+	var others []*Job
+	for _, other := range tree.children[j.ParentID] {
 		if other.Key != j.Key {
-			byKey[other.Key] = append(byKey[other.Key], other)
+			others = append(others, other)
 		}
 	}
-	results := map[string]protocol.JobResult{}
-	for key, rows := range byKey {
-		if r, done := aggregate(rows); done {
-			results[key] = protocol.JobResult{Result: r.Result, Outputs: r.Outputs}
-		}
+	needs := map[string]protocol.JobResult{}
+	for key, r := range results(others) {
+		needs[key] = protocol.JobResult{Result: r.Result, Outputs: r.Outputs}
 	}
 	owner, _, _ := strings.Cut(run.Repo, "/")
 	server := strings.TrimRight(baseURL, "/")
@@ -297,15 +319,56 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		"KIWICD_SERVER_URL":       server,
 		"KIWICD_RUN_URL":          fmt.Sprintf("%s/runs/%d", server, run.ID),
 	}
+	if ghc.HeadRef != "" {
+		env["GITHUB_HEAD_REF"], env["GITHUB_BASE_REF"] = ghc.HeadRef, ghc.BaseRef
+	}
 	secrets := map[string]string{}
 	var notices []string
 	if s.runGetsSecrets(run) {
 		if secrets, err = s.secretsFor(run.RepoID); err != nil {
 			return nil, err
 		}
+	} else if run.Event == "pull_request" {
+		notices = append(notices, "Jobs of pull_request runs get no secrets except KIWICD_TOKEN: their workflow comes from the pull request.")
 	} else {
 		notices = append(notices, fmt.Sprintf("%s is not a protected ref of %s, so this job gets no secrets except KIWICD_TOKEN. "+
 			"Protected refs are set in the repository's Settings.", run.Ref, run.Repo))
+	}
+	workflowYAML := run.WorkflowYAML
+	var inputs map[string]any
+	if parent := tree.byID[j.ParentID]; parent != nil {
+		// A job of a reusable workflow gets the inputs and the secrets its
+		// callers pass it.
+		top, err := wf.Parse([]byte(run.WorkflowYAML))
+		if err != nil {
+			return nil, err
+		}
+		called, err := s.calledWorkflows(run.ID)
+		if err != nil {
+			return nil, err
+		}
+		c := called[tree.path(parent)]
+		if c == nil {
+			return nil, fmt.Errorf("the workflow %s calls is missing", parent.Name)
+		}
+		workflowYAML = c.YAML
+		if inputs = parent.Inputs; inputs == nil {
+			inputs = map[string]any{}
+		}
+		if secrets, err = s.calledSecrets(run, top, called, tree, parent, secrets); err != nil {
+			return nil, err
+		}
+	}
+	// Debug logging is on for a re-run with it, or with the secret or
+	// variable ACTIONS_STEP_DEBUG or ACTIONS_RUNNER_DEBUG set to true, as on
+	// GitHub.
+	vars := s.varsFor(run.RepoID)
+	debugOn := func(name string) bool {
+		return run.Debug || strings.EqualFold(secrets[name], "true") || strings.EqualFold(vars[name], "true")
+	}
+	stepDebug, runnerDebug := debugOn("ACTIONS_STEP_DEBUG"), debugOn("ACTIONS_RUNNER_DEBUG")
+	if stepDebug || runnerDebug {
+		env["RUNNER_DEBUG"] = "1"
 	}
 	token, err := s.issueJobToken(j.ID)
 	if err != nil {
@@ -320,9 +383,10 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		JobKey:         j.Key,
 		DisplayName:    j.Name,
 		WorkflowFile:   run.WorkflowFile,
-		WorkflowYAML:   run.WorkflowYAML,
+		WorkflowYAML:   workflowYAML,
 		Matrix:         j.Matrix,
-		JobResults:     results,
+		JobResults:     needs,
+		Inputs:         inputs,
 		Repository:     run.Repo,
 		Sha:            run.Sha,
 		Ref:            run.Ref,
@@ -330,9 +394,12 @@ func (s *Server) buildJobRequest(j *Job, baseURL string) (*protocol.JobRequest, 
 		Event:          run.EventJSON,
 		Actor:          run.Actor,
 		Secrets:        secrets,
-		Vars:           s.varsFor(run.RepoID),
+		Vars:           vars,
 		Notices:        notices,
+		StepDebug:      stepDebug,
+		RunnerDebug:    runnerDebug,
 		Env:            env,
+		Permissions:    j.Permissions,
 		TimeoutMinutes: 360,
 		ServerURL:      server,
 		SourcePath:     fmt.Sprintf("/api/runner/jobs/%d/source", j.ID),
@@ -405,6 +472,12 @@ func (s *Server) handleRunnerComplete(w http.ResponseWriter, r *http.Request) {
 	case protocol.ResultSuccess, protocol.ResultFailure, protocol.ResultCancelled, protocol.ResultSkipped:
 	default:
 		req.Result = protocol.ResultFailure
+	}
+	if j.Status != protocol.StatusCompleted {
+		if err := s.saveJobReport(j.ID, req.Summaries, req.Annotations); err != nil {
+			httpError(w, 500, "%v", err)
+			return
+		}
 	}
 	if err := s.completeJob(r.Context(), j.ID, req.Result, "", req.Outputs, req.Steps); err != nil {
 		httpError(w, 500, "%v", err)

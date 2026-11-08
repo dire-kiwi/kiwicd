@@ -23,10 +23,14 @@ import (
 const workflow = `
 name: Deploy
 on:
+  schedule:
+    - cron: '0 0 1 1 *'
   workflow_dispatch:
     inputs:
       target:
         required: true
+  repository_dispatch:
+    types: [deploy]
 jobs:
   deploy:
     runs-on: self-hosted
@@ -183,7 +187,8 @@ func TestCLI(t *testing.T) {
 	if out := e.ok("", "repo", "list"); !strings.Contains(out, "t/app") || !strings.Contains(out, "hosted") {
 		t.Fatalf("repo list: %s", out)
 	}
-	if out := e.ok("", "workflow", "list", "t/app"); !strings.Contains(out, ".github/workflows/deploy.yml") || !strings.Contains(out, "target*") {
+	if out := e.ok("", "workflow", "list", "t/app"); !strings.Contains(out, ".github/workflows/deploy.yml") || !strings.Contains(out, "target*") ||
+		!strings.Contains(out, "schedule (0 0 1 1 *)") {
 		t.Fatalf("workflow list: %s", out)
 	}
 
@@ -228,6 +233,19 @@ func TestCLI(t *testing.T) {
 	}
 	if out := e.ok("", "api", "runs/4"); !strings.Contains(out, `"attempt": 2`) {
 		t.Fatalf("api: %s", out)
+	}
+	// repository_dispatch events.
+	if out := e.ok("", "repo", "dispatch", "t/app", "deploy", "--payload", `{"v":1}`); !strings.Contains(out, "Started run 5") {
+		t.Fatalf("repo dispatch: %s", out)
+	}
+	if out := e.ok("", "run", "watch", "5"); !strings.Contains(out, "✓ success") {
+		t.Fatalf("watching the dispatched run: %s", out)
+	}
+	if out := e.ok("", "repo", "dispatch", "t/app", "other"); !strings.Contains(out, "No workflow") {
+		t.Fatalf("repo dispatch of another type: %s", out)
+	}
+	if code, _, errOut := e.kiwicd("", "repo", "dispatch", "t/app", "deploy", "--payload", "[1]"); code != 1 || !strings.Contains(errOut, "JSON object") {
+		t.Fatalf("repo dispatch with a bad payload: %d %s", code, errOut)
 	}
 	if out := e.ok("", "runner", "list"); !strings.Contains(out, "cli-test") {
 		t.Fatalf("runner list: %s", out)
@@ -334,7 +352,7 @@ func TestMCP(t *testing.T) {
 	for _, tool := range list {
 		names[tool.(map[string]any)["name"].(string)] = true
 	}
-	for _, n := range []string{"list_runs", "get_run", "get_job_logs", "start_run", "set_secret", "wait_for_run"} {
+	for _, n := range []string{"list_runs", "get_run", "get_job_logs", "start_run", "dispatch_event", "set_secret", "wait_for_run"} {
 		if !names[n] {
 			t.Errorf("no tool %s in %v", n, names)
 		}
@@ -387,6 +405,21 @@ func TestMCP(t *testing.T) {
 	if text, isErr := s.tool("get_run", map[string]any{"run_id": 999}); !isErr || !strings.Contains(text, "no such run") {
 		t.Fatalf("get_run of a missing run: %v %s", isErr, text)
 	}
+	text, isErr = s.tool("dispatch_event", map[string]any{"repo": "t/app", "event_type": "deploy", "client_payload": map[string]any{"v": 1}})
+	var dispatched struct {
+		Runs []struct {
+			RunID int64 `json:"run_id"`
+		}
+	}
+	if err := json.Unmarshal([]byte(text), &dispatched); isErr || err != nil || len(dispatched.Runs) != 1 || dispatched.Runs[0].RunID <= started.RunID {
+		t.Fatalf("dispatch_event: %s", text)
+	}
+	if text, _ := s.tool("wait_for_run", map[string]any{"run_id": dispatched.Runs[0].RunID, "timeout_seconds": 30}); !strings.Contains(text, `"state": "success"`) {
+		t.Fatalf("the dispatched run: %s", text)
+	}
+	if text, isErr := s.tool("dispatch_event", map[string]any{"repo": "t/app", "event_type": "other"}); isErr || !strings.Contains(text, `"runs": []`) {
+		t.Fatalf("dispatch_event of another type: %s", text)
+	}
 
 	// --read-only leaves out the tools that change things.
 	ro := startMCP(t, e, "--read-only")
@@ -414,7 +447,7 @@ func TestMCPCancel(t *testing.T) {
 	defer ts.Close()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	srv := newMCPServer(&Client{URL: ts.URL, Token: "x"}, "test", false, outW, io.Discard)
+	srv := newMCPServer(&Client{URL: ts.URL, Token: "x"}, "test", false, nil, outW, io.Discard)
 	done := make(chan error, 1)
 	go func() { done <- srv.serve(context.Background(), inR) }()
 	s := &mcpSession{t: t, in: inW, out: json.NewDecoder(outR)}
@@ -447,5 +480,78 @@ func TestMCPCancel(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("kiwicd mcp didn't exit when stdin closed")
+	}
+}
+
+// TestScopedTokens checks tokens limited to a role and repositories, and
+// that kiwicd mcp offers only the tools they can use.
+func TestScopedTokens(t *testing.T) {
+	e := newTestEnv(t)
+	e.ok("pw\n", "login", "--url", e.url, "--password-stdin")
+	if out := e.ok("", "whoami"); !strings.Contains(out, ": an admin") {
+		t.Fatalf("whoami: %s", out)
+	}
+	token := strings.TrimSpace(e.ok("", "token", "create", "agent", "--role", "viewer", "--repo", "t/app"))
+	if out := e.ok("", "token", "list"); !strings.Contains(out, "viewer of t/app") || !strings.Contains(out, "full") {
+		t.Fatalf("token list: %s", out)
+	}
+	if code, _, errOut := e.kiwicd("", "token", "create", "x", "--repo", "t/none"); code != 1 || !strings.Contains(errOut, "no such repository") {
+		t.Fatalf("token for a missing repository: %d %s", code, errOut)
+	}
+
+	t.Setenv("KIWICD_API_TOKEN", token)
+	if out := e.ok("", "whoami"); !strings.Contains(out, "a viewer, seeing only t/app") || !strings.Contains(out, "scope viewer of t/app") {
+		t.Fatalf("whoami with the scoped token: %s", out)
+	}
+	if code, _, errOut := e.kiwicd("", "variable", "set", "X", "1", "--repo", "t/app"); code != 1 || !strings.Contains(errOut, "needs a maintainer of t/app") {
+		t.Fatalf("variable set with a read-only token: %d %s", code, errOut)
+	}
+	if out := e.ok("", "repo", "list"); !strings.Contains(out, "t/app") {
+		t.Fatalf("repo list: %s", out)
+	}
+
+	s := startMCP(t, e)
+	init := s.call("initialize", map[string]any{"protocolVersion": "2025-03-26", "capabilities": map[string]any{},
+		"clientInfo": map[string]any{"name": "test", "version": "1"}})
+	if instr, _ := init["result"].(map[string]any)["instructions"].(string); !strings.Contains(instr, "You are a viewer, seeing only t/app.") {
+		t.Errorf("instructions: %s", instr)
+	}
+	for _, tool := range s.call("tools/list", nil)["result"].(map[string]any)["tools"].([]any) {
+		m := tool.(map[string]any)
+		if m["annotations"].(map[string]any)["readOnlyHint"] != true || m["name"] == "list_secrets" {
+			t.Errorf("read-only token's server lists %v", m["name"])
+		}
+	}
+}
+
+func TestSelectCalledJobs(t *testing.T) {
+	jobs := []Job{
+		{ID: 1, Key: "lint", Name: "lint"},
+		{ID: 2, Key: "build", Name: "build (linux)", Uses: "./.github/workflows/build.yml"},
+		{ID: 3, Key: "compile", Name: "build (linux) / compile", Status: "completed", Conclusion: "failure"},
+		{ID: 4, Key: "test", Name: "build (linux) / test", Uses: "./.github/workflows/test.yml"},
+		{ID: 5, Key: "unit", Name: "build (linux) / test / unit"},
+	}
+	names := func(sel string) string {
+		got, err := selectJobs(jobs, sel, false)
+		if err != nil {
+			return err.Error()
+		}
+		var out []string
+		for _, j := range got {
+			out = append(out, j.Name)
+		}
+		return strings.Join(out, ", ")
+	}
+	for sel, want := range map[string]string{
+		"":                     "lint, build (linux) / compile, build (linux) / test / unit",
+		"build":                "build (linux) / compile, build (linux) / test / unit",
+		"2":                    "build (linux) / compile, build (linux) / test / unit",
+		"build (linux) / test": "build (linux) / test / unit",
+		"compile":              "build (linux) / compile",
+	} {
+		if got := names(sel); got != want {
+			t.Errorf("selectJobs(%q) = %q, want %q", sel, got, want)
+		}
 	}
 }

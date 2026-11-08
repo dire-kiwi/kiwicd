@@ -7,6 +7,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,11 +36,14 @@ import (
 
 // Credentials is the agent's registration, stored in the .runner file.
 type Credentials struct {
-	URL      string   `json:"url"`
-	Name     string   `json:"name"`
-	RunnerID int64    `json:"runner_id"`
-	Token    string   `json:"token"`
-	Labels   []string `json:"labels"` // label specs, see ParseLabel
+	URL      string `json:"url"`
+	Name     string `json:"name"`
+	RunnerID int64  `json:"runner_id"`
+	// AgentID names the agent's Docker objects. It's random, so it's unique
+	// to the registration; the runner ID is unique only on its server.
+	AgentID string   `json:"agent_id,omitempty"`
+	Token   string   `json:"token"`
+	Labels  []string `json:"labels"` // label specs, see ParseLabel
 }
 
 func LoadCredentials(path string) (*Credentials, error) {
@@ -50,6 +56,28 @@ func LoadCredentials(path string) (*Credentials, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &c, nil
+}
+
+var agentIDPattern = regexp.MustCompile(`^[0-9a-f]{8}$`)
+
+func newAgentID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// AddAgentID gives a registration made before agent IDs one and saves it.
+// The ID comes from the token, so that it's the same on the next start if
+// the file can't be written. It reports whether the registration lacked an
+// ID: the agent then removes what its jobs left under the old names (see
+// Config.RemoveOldNames).
+func (c *Credentials) AddAgentID(path string) (added bool, err error) {
+	if c.AgentID != "" {
+		return false, nil
+	}
+	h := sha256.Sum256([]byte(c.Token))
+	c.AgentID = hex.EncodeToString(h[:4])
+	return true, c.Save(path)
 }
 
 func (c *Credentials) Save(path string) error {
@@ -102,7 +130,7 @@ func Register(ctx context.Context, url, token, name string, labelSpecs []string,
 	if err != nil {
 		return nil, err
 	}
-	return &Credentials{URL: strings.TrimRight(url, "/"), Name: resp.Name, RunnerID: resp.RunnerID, Token: resp.RunnerToken, Labels: labelSpecs}, nil
+	return &Credentials{URL: strings.TrimRight(url, "/"), Name: resp.Name, RunnerID: resp.RunnerID, AgentID: newAgentID(), Token: resp.RunnerToken, Labels: labelSpecs}, nil
 }
 
 type Config struct {
@@ -129,6 +157,12 @@ type Config struct {
 	JobBridgePrefix string
 	// ActionsURL is where `uses: owner/repo@ref` actions are cloned from.
 	ActionsURL string
+	// RemoveOldNames also removes, on start, the Docker objects of jobs the
+	// agent didn't finish that are named as before registrations had agent
+	// IDs (kiwicd-r<runner ID>-j...). Agents of other servers on the same
+	// Docker daemon may use those names too, so it's only for the first
+	// start after an upgrade.
+	RemoveOldNames bool
 }
 
 type Agent struct {
@@ -151,8 +185,11 @@ func New(cfg Config) (*Agent, error) {
 	if cfg.JobBridgePrefix == "" {
 		cfg.JobBridgePrefix = "kiwicd-"
 	}
+	if !agentIDPattern.MatchString(cfg.Creds.AgentID) {
+		return nil, fmt.Errorf("the registration's agent ID %q isn't 8 hexadecimal digits", cfg.Creds.AgentID)
+	}
 	if len(cfg.JobBridgePrefix) > 7 {
-		// Interface names have at most 15 characters: 8 are for the job ID.
+		// Interface names have at most 15 characters: 8 are for the job.
 		return nil, fmt.Errorf("the job bridge prefix %q is longer than 7 characters", cfg.JobBridgePrefix)
 	}
 	abs, err := filepath.Abs(cfg.WorkDir)
@@ -186,7 +223,7 @@ func New(cfg Config) (*Agent, error) {
 
 // Run polls for jobs until ctx is cancelled. Running jobs finish first.
 func (a *Agent) Run(ctx context.Context) error {
-	a.log.Info("agent started", "name", a.cfg.Creds.Name, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels,
+	a.log.Info("agent started", "name", a.cfg.Creds.Name, "agent_id", a.cfg.Creds.AgentID, "server", a.cfg.Creds.URL, "capacity", a.cfg.Capacity, "labels", a.cfg.Creds.Labels,
 		"job_image", a.cfg.JobImage, "docker_socket", a.cfg.ContainerDaemonSocket)
 	if a.cfg.JobImage == "" {
 		a.log.Warn("jobs run on this machine, as the agent's user, and can read its registration; set --job-image to isolate them")
@@ -254,7 +291,8 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 	}
 	if err != nil {
 		_ = a.c.complete(parent, req.JobID, protocol.JobComplete{Result: protocol.ResultFailure,
-			Logs: []protocol.LogLine{{Step: 0, TS: nowMS(), Text: "##[error]" + err.Error()}}})
+			Logs:        []protocol.LogLine{{Step: 0, TS: nowMS(), Text: "##[error]" + err.Error()}},
+			Annotations: []protocol.Annotation{{Level: protocol.AnnotationError, Message: truncateUTF8(err.Error(), protocol.MaxAnnotationBytes), LogLine: 1}}})
 		return
 	}
 
@@ -288,6 +326,7 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 	ctx := common.WithJobCancelContext(forceCtx, graceful)
 
 	rep := newReporter(a.c, req.JobID, job, req.Secrets, gracefulCancel)
+	rep.stepDebug, rep.runnerDebug = req.StepDebug, req.RunnerDebug
 	flushCtx, stopFlush := context.WithCancel(parent)
 	flushDone := make(chan struct{})
 	go func() {
@@ -305,12 +344,12 @@ func (a *Agent) runJob(parent context.Context, req *protocol.JobRequest) {
 
 	stopFlush()
 	<-flushDone
-	logs, steps := rep.finish(result)
+	done := rep.finish(result)
 	// Outputs are stored and shown on the run page: mask secrets in them.
 	for k, v := range outputs {
 		outputs[k] = rep.maskSecrets(v)
 	}
-	done := protocol.JobComplete{Result: result, Outputs: outputs, Logs: logs, Steps: steps}
+	done.Outputs = outputs
 	for attempt := 0; ; attempt++ {
 		err := a.c.complete(parent, req.JobID, done)
 		if err == nil || attempt >= 10 {
@@ -330,6 +369,12 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	rep.logf(0, "Repository: %s @ %s (%s)", req.Repository, short(req.Sha), req.Ref)
 	for _, n := range req.Notices {
 		rep.logf(0, "##[warning]%s", n)
+	}
+	if msg := a.dockerNeeded(job); msg != "" {
+		if err := pingDocker(ctx); err != nil {
+			rep.logf(0, "##[error]%s, but the agent can't reach the Docker daemon: %v", msg, err)
+			return protocol.ResultFailure, nil
+		}
 	}
 
 	jobDir := filepath.Join(a.cfg.WorkDir, "jobs", strconv.FormatInt(req.JobID, 10))
@@ -394,8 +439,8 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	}
 	env["RUNNER_NAME"] = a.cfg.Creds.Name
 
-	prefix := jobPrefix(a.cfg.Creds.RunnerID, req.JobID)
-	defer a.removeJobContainers(ctx, prefix)
+	prefix := jobPrefix(a.cfg.Creds.AgentID, req.JobID)
+	defer a.removeJobContainers(ctx, prefix, a.dockerNeeded(job) != "")
 	cfg := &runner.Config{
 		Actor:                 req.Actor,
 		Workdir:               workspace,
@@ -407,6 +452,7 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 		Env:                   env,
 		Secrets:               req.Secrets,
 		Vars:                  req.Vars,
+		WorkflowCallInputs:    req.Inputs, // a reusable workflow's job: what its caller passed
 		Token:                 req.Secrets["GITHUB_TOKEN"],
 		Platforms:             a.platforms,
 		GitHubInstance:        "github.com",
@@ -415,15 +461,13 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 		ContainerDaemonSocket: a.cfg.ContainerDaemonSocket,
 		ContainerOptions:      a.cfg.JobOptions,
 		ContainerNamePrefix:   strings.TrimSuffix(prefix, "-"),
-		ConcurrentJobs:        1,
+		// Host jobs reach their services on localhost; nothing else should.
+		ServicePortHostIP: "127.0.0.1",
+		ConcurrentJobs:    1,
 	}
 	if a.cfg.JobImage != "" {
 		network := prefix + "net"
-		bridge, err := bridgeName(a.cfg.JobBridgePrefix, req.JobID)
-		if err == nil {
-			err = createJobNetwork(ctx, network, bridge)
-		}
-		if err != nil {
+		if err := createJobNetwork(ctx, network, bridgeName(a.cfg.JobBridgePrefix, network)); err != nil {
 			rep.logf(0, "##[error]Creating the job's network failed: %v", err)
 			return protocol.ResultFailure, nil
 		}
@@ -467,6 +511,23 @@ func (a *Agent) execute(ctx context.Context, req *protocol.JobRequest, workflow 
 	return result, job.Outputs
 }
 
+// dockerNeeded says why a job needs Docker, or "" if it may not: an isolated
+// job always does, a host job for its services or container. Jobs on
+// docker:// labels do too, and act says so.
+func (a *Agent) dockerNeeded(job *model.Job) string {
+	switch {
+	case a.cfg.JobImage != "":
+		return "This agent runs jobs in containers (--job-image)"
+	case len(job.Services) > 0 && job.Container() != nil:
+		return "This job's container and services run in Docker"
+	case len(job.Services) > 0:
+		return "This job's services run in Docker"
+	case job.Container() != nil:
+		return "This job's container runs in Docker"
+	}
+	return ""
+}
+
 // actTempDir matches the per-job directories act makes in the action cache
 // (its tmp, RUNNER_TEMP and GITHUB_ENV files); cloned actions are named
 // owner-repo@ref.
@@ -476,7 +537,10 @@ var actTempDir = regexp.MustCompile(`^[0-9a-f]{16}$`)
 // or crashed) left in the work directory: workspaces and act's temporary
 // files, which can hold the jobs' secrets.
 func (a *Agent) removeLeftovers(ctx context.Context) {
-	a.removeJobContainers(ctx, runnerPrefix(a.cfg.Creds.RunnerID))
+	a.removeJobContainers(ctx, agentPrefix(a.cfg.Creds.AgentID), a.cfg.JobImage != "")
+	if a.cfg.RemoveOldNames {
+		a.removeJobContainers(ctx, oldAgentPrefix(a.cfg.Creds.RunnerID), a.cfg.JobImage != "")
+	}
 	dirs := []string{filepath.Join(a.cfg.WorkDir, "jobs")}
 	entries, _ := os.ReadDir(filepath.Join(a.cfg.WorkDir, "actions"))
 	for _, e := range entries {
@@ -554,13 +618,14 @@ func extractTarGz(r io.Reader, dest string) error {
 }
 
 // removeJobContainers removes the Docker objects named with prefix: a job's,
-// or all of this runner's on start. Only isolated jobs need Docker, so
-// without --job-image a failure is no more than a debug message.
-func (a *Agent) removeJobContainers(ctx context.Context, prefix string) {
+// or all of this runner's on start. A failure is a warning if the jobs
+// used Docker (usedDocker), and otherwise no more than a debug message, as
+// host jobs without services or a container don't need Docker.
+func (a *Agent) removeJobContainers(ctx context.Context, prefix string, usedDocker bool) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	defer cancel()
 	if err := removeDockerObjects(ctx, prefix); err != nil {
-		if a.cfg.JobImage != "" {
+		if usedDocker {
 			a.log.Warn("remove jobs' Docker containers, networks, volumes and images", "prefix", prefix, "err", err)
 		} else {
 			a.log.Debug("remove jobs' Docker containers, networks, volumes and images", "prefix", prefix, "err", err)

@@ -45,10 +45,11 @@ func (s *Server) uploadedWorkflows(repoID int64) ([]uploadedWorkflow, error) {
 }
 
 // workflowsAt returns the workflows that apply to a commit: the repository's
-// own files at sha (none if sha is empty) and the uploaded ones.
+// own files at sha (none if sha is empty or the repository's repo_workflows
+// setting is off) and the uploaded ones.
 func (s *Server) workflowsAt(ctx context.Context, repo *Repo, sha string) (map[string][]byte, error) {
 	files := map[string][]byte{}
-	if sha != "" {
+	if sha != "" && repo.RepoWorkflows {
 		var err error
 		if files, err = workflowFiles(ctx, s.repoPath(repo.Name), sha); err != nil {
 			return nil, err
@@ -62,6 +63,9 @@ func (s *Server) workflowsAt(ctx context.Context, repo *Repo, sha string) (map[s
 // there in every repository, so the committed files are kept for each
 // repository's latest tip: a commit's files never change.
 func (s *Server) defaultBranchWorkflows(ctx context.Context, repo *Repo, sha string) (map[string][]byte, error) {
+	if !repo.RepoWorkflows {
+		return s.addUploadedWorkflows(repo, map[string][]byte{})
+	}
 	s.tipMu.Lock()
 	tip, ok := s.tipWorkflows[repo.ID]
 	s.tipMu.Unlock()
@@ -142,9 +146,16 @@ func (s *Server) handlePutUploadedWorkflow(w http.ResponseWriter, r *http.Reques
 		httpError(w, 400, "the workflow is empty")
 		return
 	}
-	if _, err := wf.Parse([]byte(content)); err != nil {
+	parsed, err := wf.Parse([]byte(content))
+	if err != nil {
 		httpError(w, 400, "invalid workflow: %v", err)
 		return
+	}
+	for _, sch := range wf.Schedules(parsed) {
+		if _, err := sch.Parse(); err != nil {
+			httpError(w, 400, "invalid workflow: schedule: %v", err)
+			return
+		}
 	}
 	u := uploadedWorkflow{File: file, Content: content, UpdatedAt: nowMS()}
 	_, err = s.db.Exec(`INSERT INTO uploaded_workflows (repo_id, file, content, updated_at) VALUES (?, ?, ?, ?)
@@ -153,6 +164,8 @@ func (s *Server) handlePutUploadedWorkflow(w http.ResponseWriter, r *http.Reques
 		httpError(w, 500, "%v", err)
 		return
 	}
+	s.audit(r, "workflow.upload", repo.Name, u.File, "")
+	s.schedulesChanged(repo.ID)
 	writeJSON(w, u)
 }
 
@@ -171,5 +184,7 @@ func (s *Server) handleDeleteUploadedWorkflow(w http.ResponseWriter, r *http.Req
 		httpError(w, 404, "no uploaded workflow %s", r.PathValue("file"))
 		return
 	}
+	s.audit(r, "workflow.delete", repo.Name, r.PathValue("file"), "")
+	s.schedulesChanged(repo.ID)
 	writeJSON(w, map[string]bool{"ok": true})
 }

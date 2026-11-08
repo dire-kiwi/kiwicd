@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS log_lines (
 	text TEXT NOT NULL,
 	PRIMARY KEY (job_id, seq)
 );
+-- What a finished job reported besides its log: step summaries and
+-- annotations, as JSON (see reports.go).
+CREATE TABLE IF NOT EXISTS job_reports (
+	job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+	summaries TEXT NOT NULL DEFAULT '[]',
+	annotations TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE IF NOT EXISTS runners (
 	id INTEGER PRIMARY KEY,
 	name TEXT NOT NULL,
@@ -120,6 +127,17 @@ CREATE TABLE IF NOT EXISTS uploaded_workflows (
 	updated_at INTEGER NOT NULL,
 	PRIMARY KEY (repo_id, file)
 );
+-- Scheduled workflows' cron entries on each repository's default branch,
+-- and the slot each last ran (see schedule.go).
+CREATE TABLE IF NOT EXISTS schedules (
+	repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+	workflow_file TEXT NOT NULL,
+	cron TEXT NOT NULL,
+	timezone TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,        -- first seen; earlier slots don't run
+	last_slot INTEGER NOT NULL DEFAULT 0, -- the slot it last ran; 0 if none yet
+	PRIMARY KEY (repo_id, workflow_file, cron, timezone)
+);
 CREATE TABLE IF NOT EXISTS meta (
 	name TEXT PRIMARY KEY,
 	value TEXT NOT NULL
@@ -139,6 +157,19 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 	expires_at INTEGER NOT NULL DEFAULT 0,  -- 0: never
 	last_used_at INTEGER NOT NULL DEFAULT 0
 );
+-- The reusable workflows a run's jobs call, read when it was created (see
+-- called.go).
+CREATE TABLE IF NOT EXISTS run_workflows (
+	run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	path TEXT NOT NULL,                 -- the calling jobs' keys from the run's workflow down: build/deploy
+	uses TEXT NOT NULL,                 -- as the calling job has it
+	source TEXT NOT NULL,               -- kiwicd | github
+	repo TEXT NOT NULL,                 -- owner/name there
+	file TEXT NOT NULL,                 -- .github/workflows/x.yml
+	sha TEXT NOT NULL,
+	yaml TEXT NOT NULL,
+	PRIMARY KEY (run_id, path)
+);
 -- The GitHub App (see github.go): at most one row.
 CREATE TABLE IF NOT EXISTS github_app (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -151,9 +182,63 @@ CREATE TABLE IF NOT EXISTS github_app (
 	client_secret TEXT NOT NULL,        -- encrypted, as are the next two
 	private_key TEXT NOT NULL,
 	webhook_secret TEXT NOT NULL,
-	allowed_users TEXT NOT NULL DEFAULT '[]', -- GitHub logins that may sign in
-	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- organizations whose members may
+	allowed_users TEXT NOT NULL DEFAULT '[]', -- before roles: GitHub logins that
+	allowed_orgs TEXT NOT NULL DEFAULT '[]',  -- may sign in, and organizations
 	created_at INTEGER NOT NULL
+);
+-- Roles given to GitHub logins, organizations' and teams' members (see
+-- access.go).
+CREATE TABLE IF NOT EXISTS role_grants (
+	kind TEXT NOT NULL,                 -- user | org | team
+	name TEXT NOT NULL COLLATE NOCASE,  -- login, organization or ORG/TEAM
+	role TEXT NOT NULL,                 -- admin | maintainer | viewer
+	repos TEXT NOT NULL DEFAULT '[]',   -- maintainers' OWNER/NAME or OWNER/*; [] for all
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (kind, name)
+);
+-- People who have signed in with GitHub, and the organizations and teams
+-- with roles they were members of then.
+CREATE TABLE IF NOT EXISTS github_users (
+	login TEXT PRIMARY KEY COLLATE NOCASE,
+	memberships TEXT NOT NULL DEFAULT '[]', -- org:NAME, team:ORG/TEAM
+	signed_in_at INTEGER NOT NULL
+);
+-- Who changed access and settings (see audit.go).
+CREATE TABLE IF NOT EXISTS audit_log (
+	id INTEGER PRIMARY KEY,
+	at INTEGER NOT NULL,
+	actor TEXT NOT NULL,                -- admin, a GitHub login, or kiwicd itself
+	token TEXT NOT NULL DEFAULT '',     -- the API token used, if any
+	client TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL,               -- secret.set, role.delete, ...
+	repo TEXT NOT NULL DEFAULT '',
+	target TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS audit_repo ON audit_log(repo, id) WHERE repo != '';
+-- Check runs on GitHub for runs' jobs (see checks.go): job_id 0 is a run
+-- that failed before it had jobs.
+CREATE TABLE IF NOT EXISTS github_checks (
+	run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+	job_id INTEGER NOT NULL,
+	repo TEXT NOT NULL,                 -- owner/name on GitHub
+	check_run_id INTEGER NOT NULL,
+	check_suite_id INTEGER NOT NULL DEFAULT 0,
+	state TEXT NOT NULL,                -- what was last reported: status/conclusion
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (run_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS github_checks_run ON github_checks(check_run_id);
+CREATE INDEX IF NOT EXISTS github_checks_suite ON github_checks(check_suite_id);
+-- Authors of pull requests from forks whose runs someone approved, which
+-- then run without asking again (see approval.go).
+CREATE TABLE IF NOT EXISTS approved_contributors (
+	repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+	user_id INTEGER NOT NULL,           -- GitHub's user ID: logins can be renamed and reused
+	login TEXT NOT NULL,
+	approved_by TEXT NOT NULL,
+	approved_at INTEGER NOT NULL,
+	PRIMARY KEY (repo_id, user_id)
 );
 `
 
@@ -206,8 +291,57 @@ var migrations = []struct{ table, column, sql string }{
 	// (see concurrency.go).
 	{"runs", "concurrency_group", `ALTER TABLE runs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS runs_concurrency ON runs(repo_id, concurrency_group) WHERE concurrency_group != ''`},
+	// Job-level concurrency group, evaluated when the job was created; its
+	// jobs wait as pending (see concurrency.go).
+	{"jobs", "concurrency_group", `ALTER TABLE jobs ADD COLUMN concurrency_group TEXT NOT NULL DEFAULT '';
+		CREATE INDEX IF NOT EXISTS jobs_concurrency ON jobs(concurrency_group, status) WHERE concurrency_group != ''`},
+	// The job's continue-on-error: its failure doesn't fail the run.
+	{"jobs", "continue_on_error", `ALTER TABLE jobs ADD COLUMN continue_on_error INTEGER NOT NULL DEFAULT 0`},
+	// strategy.max-parallel: how many of a matrix's jobs run at once; 0 for
+	// no limit.
+	{"jobs", "max_parallel", `ALTER TABLE jobs ADD COLUMN max_parallel INTEGER NOT NULL DEFAULT 0`},
+	// The workflow's and the job's permissions (JSON protocol.Permissions,
+	// null when not set). They have no effect yet.
+	{"runs", "permissions", `ALTER TABLE runs ADD COLUMN permissions TEXT NOT NULL DEFAULT 'null'`},
+	{"jobs", "permissions", `ALTER TABLE jobs ADD COLUMN permissions TEXT NOT NULL DEFAULT 'null'`},
+	// Re-runs of some jobs: what a run keeps from its earlier attempt, and
+	// where a kept job came from (see rerun.go).
+	{"runs", "reuse_jobs", `ALTER TABLE runs ADD COLUMN reuse_jobs TEXT NOT NULL DEFAULT ''`},
+	{"jobs", "copied_from", `ALTER TABLE jobs ADD COLUMN copied_from INTEGER NOT NULL DEFAULT 0`},
+	{"jobs", "copied_attempt", `ALTER TABLE jobs ADD COLUMN copied_attempt INTEGER NOT NULL DEFAULT 0`},
+	// A re-run with debug logging (see Run.Debug).
+	{"runs", "debug", `ALTER TABLE runs ADD COLUMN debug INTEGER NOT NULL DEFAULT 0`},
+	// Status badges anyone may fetch (see badge.go).
+	{"repos", "public_badges", `ALTER TABLE repos ADD COLUMN public_badges INTEGER NOT NULL DEFAULT 0`},
 	// The GitHub user a session is for; '' for the admin (see githublogin.go).
 	{"sessions", "github_login", `ALTER TABLE sessions ADD COLUMN github_login TEXT NOT NULL DEFAULT ''`},
+	// An API token's scope (see access.go): '' and [] for its maker's full
+	// rights.
+	{"api_tokens", "role", `ALTER TABLE api_tokens ADD COLUMN role TEXT NOT NULL DEFAULT ''`},
+	{"api_tokens", "repos", `ALTER TABLE api_tokens ADD COLUMN repos TEXT NOT NULL DEFAULT '[]'`},
+	// Jobs of reusable workflows (see called.go): the calling job's row, and
+	// for a calling job what it calls and the inputs it gives.
+	{"jobs", "parent_id", `ALTER TABLE jobs ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0`},
+	{"jobs", "uses", `ALTER TABLE jobs ADD COLUMN uses TEXT NOT NULL DEFAULT ''`},
+	{"jobs", "inputs", `ALTER TABLE jobs ADD COLUMN inputs TEXT NOT NULL DEFAULT 'null'`},
+	// Whether runs of workflows that aren't the GitHub repository's own
+	// (repository_push and repository_pull_request listeners, uploaded
+	// workflows) are reported to it as check runs (see checks.go).
+	{"repos", "report_checks", `ALTER TABLE repos ADD COLUMN report_checks INTEGER NOT NULL DEFAULT 0`},
+	// Whether pull requests from forks run the repository's pull_request
+	// workflows (see pullrequest.go).
+	{"repos", "fork_pull_requests", `ALTER TABLE repos ADD COLUMN fork_pull_requests INTEGER NOT NULL DEFAULT 0`},
+	// How many workflow_run events led to a run: 0 for others (see triggers.go).
+	{"runs", "trigger_depth", `ALTER TABLE runs ADD COLUMN trigger_depth INTEGER NOT NULL DEFAULT 0`},
+	// Whether the repository's own .github/workflows/ files run (see
+	// workflowsAt); off for mirrors whose workflows run on GitHub Actions.
+	{"repos", "repo_workflows", `ALTER TABLE repos ADD COLUMN repo_workflows INTEGER NOT NULL DEFAULT 1`},
+	// Which pull requests from forks wait for approval before their
+	// pull_request workflows run, and a run's approval (see approval.go).
+	{"repos", "fork_approval", `ALTER TABLE repos ADD COLUMN fork_approval TEXT NOT NULL DEFAULT 'first_time'`},
+	{"runs", "approval", `ALTER TABLE runs ADD COLUMN approval TEXT NOT NULL DEFAULT ''`},
+	{"runs", "approved_by", `ALTER TABLE runs ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''`},
+	{"runs", "approved_at", `ALTER TABLE runs ADD COLUMN approved_at INTEGER NOT NULL DEFAULT 0`},
 }
 
 // incrementalAutoVacuum switches the database to auto_vacuum=INCREMENTAL, so

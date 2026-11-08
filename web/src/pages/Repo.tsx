@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { useMe } from "../App";
+import { canMaintain, isAdmin } from "../access";
 import { del, errorMessage, get, patch, post, put, repoPath } from "../api";
 import { RunList } from "../components/RunList";
 import { SettingsTable } from "../components/SettingsTable";
 import { isSSHURL, KnownHostsField, SSHKeyField, sshHost, type SSHAuth } from "../components/SSHFields";
 import { Chip, CodeBlock, CopyField, Empty, ErrorBox, Flash, Icon, Modal, Spinner } from "../components/ui";
 import { useDocumentTitle, useFetch } from "../hooks";
-import type { Repo, UploadedWorkflow, Workflow, WorkflowInput } from "../types";
+import type { ApprovedContributor, ForkApproval, Repo, UploadedWorkflow, Workflow, WorkflowInput } from "../types";
 import { absoluteTime, eventLabel, relativeTime, shortSha } from "../util";
 
 function branchesOf(repo: Repo): string[] {
@@ -22,6 +24,7 @@ export function RepoPage() {
   const fullName = `${owner}/${name}`;
   useDocumentTitle(fullName);
   const repo = useFetch<Repo>(repoPath(fullName));
+  const me = useMe();
 
   if (repo.error && !repo.data)
     return (
@@ -37,6 +40,7 @@ export function RepoPage() {
     );
   const r = repo.data;
   const base = `/repos/${r.name}`;
+  const maintainer = canMaintain(me?.access, r.name);
 
   return (
     <div className="page">
@@ -52,16 +56,20 @@ export function RepoPage() {
         <span className={`badge badge-${r.kind}`}>{r.kind === "mirror" ? "Mirror" : "Hosted"}</span>
       </div>
 
-      <RepoHeader repo={r} onChanged={repo.reload} />
+      <RepoHeader repo={r} maintainer={maintainer} onChanged={repo.reload} />
 
       <nav className="tabs">
         <NavLink to={base} end>
           Runs
         </NavLink>
         <NavLink to={`${base}/workflows`}>Workflows</NavLink>
-        <NavLink to={`${base}/secrets`}>Secrets</NavLink>
-        <NavLink to={`${base}/variables`}>Variables</NavLink>
-        <NavLink to={`${base}/settings`}>Settings</NavLink>
+        {maintainer && (
+          <>
+            <NavLink to={`${base}/secrets`}>Secrets</NavLink>
+            <NavLink to={`${base}/variables`}>Variables</NavLink>
+            <NavLink to={`${base}/settings`}>Settings</NavLink>
+          </>
+        )}
       </nav>
 
       <Routes>
@@ -72,24 +80,33 @@ export function RepoPage() {
               repo={r.name}
               emptyHint={
                 <>
-                  Push a commit containing a workflow under <code>.github/workflows/</code>, or upload or start one from the{" "}
-                  <Link to={`${base}/workflows`}>Workflows</Link> tab.
+                  Push a commit containing a workflow under <code>.github/workflows/</code>
+                  {maintainer && (
+                    <>
+                      , or upload or start one from the <Link to={`${base}/workflows`}>Workflows</Link> tab
+                    </>
+                  )}
+                  .
                 </>
               }
             />
           }
         />
-        <Route path="workflows" element={<WorkflowsTab repo={r} />} />
-        <Route path="secrets" element={<SettingsTable kind="secrets" repo={r.name} />} />
-        <Route path="variables" element={<SettingsTable kind="variables" repo={r.name} />} />
-        <Route path="settings" element={<RepoSettingsTab repo={r} onChanged={repo.reload} />} />
+        <Route path="workflows" element={<WorkflowsTab repo={r} maintainer={maintainer} />} />
+        {maintainer && (
+          <>
+            <Route path="secrets" element={<SettingsTable kind="secrets" repo={r.name} />} />
+            <Route path="variables" element={<SettingsTable kind="variables" repo={r.name} />} />
+            <Route path="settings" element={<RepoSettingsTab repo={r} admin={isAdmin(me)} onChanged={repo.reload} />} />
+          </>
+        )}
         <Route path="*" element={<Empty title="Not found" />} />
       </Routes>
     </div>
   );
 }
 
-function RepoHeader({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+function RepoHeader({ repo, maintainer, onChanged }: { repo: Repo; maintainer: boolean; onChanged: () => void }) {
   const [syncing, setSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string>();
   const [showHook, setShowHook] = useState(false);
@@ -116,14 +133,16 @@ function RepoHeader({ repo, onChanged }: { repo: Repo; onChanged: () => void }) 
             <CopyField value={repo.clone_url} />
           </div>
         </div>
-        <details className="disclosure" open={!repo.refs || Object.keys(repo.refs).length === 0}>
-          <summary>Push an existing repository</summary>
-          <CodeBlock code={`git remote add kiwicd ${repo.clone_url}\ngit push kiwicd ${repo.default_branch || "main"}`} />
-          <p className="muted small">
-            Git asks for credentials: use any username with your kiwicd password. Every push runs the matching{" "}
-            <code>on: push</code> workflows.
-          </p>
-        </details>
+        {maintainer && (
+          <details className="disclosure" open={!repo.refs || Object.keys(repo.refs).length === 0}>
+            <summary>Push an existing repository</summary>
+            <CodeBlock code={`git remote add kiwicd ${repo.clone_url}\ngit push kiwicd ${repo.default_branch || "main"}`} />
+            <p className="muted small">
+              Git asks for credentials: use any username with the admin password or an API token (Settings → API tokens). Every
+              push runs the matching <code>on: push</code> workflows.
+            </p>
+          </details>
+        )}
       </section>
     );
   }
@@ -140,13 +159,15 @@ function RepoHeader({ repo, onChanged }: { repo: Repo; onChanged: () => void }) 
           <div className="sync-line">
             <span title={absoluteTime(repo.last_sync_at)}>{repo.last_sync_at ? relativeTime(repo.last_sync_at) : "never"}</span>
             {repo.last_sync_error ? <span className="text-danger">· failed</span> : repo.last_sync_at ? <span className="text-success">· ok</span> : null}
-            <button className="btn btn-sm" onClick={sync} disabled={syncing}>
-              {syncing ? "Syncing…" : "Sync now"}
-            </button>
+            {maintainer && (
+              <button className="btn btn-sm" onClick={sync} disabled={syncing}>
+                {syncing ? "Syncing…" : "Sync now"}
+              </button>
+            )}
           </div>
         </div>
       </div>
-      {repo.ssh_public_key && !repo.synced_at && (
+      {maintainer && repo.ssh_public_key && !repo.synced_at && (
         <Flash kind="info">
           <div className="stack-sm">
             <span>
@@ -163,34 +184,36 @@ function RepoHeader({ repo, onChanged }: { repo: Repo; onChanged: () => void }) 
         </ErrorBox>
       )}
       {syncError && <ErrorBox>{syncError}</ErrorBox>}
-      <details className="disclosure" open={showHook} onToggle={(e) => setShowHook((e.target as HTMLDetailsElement).open)}>
-        <summary>Trigger runs instantly with a webhook</summary>
-        <p className="muted small">
-          kiwicd polls mirrors periodically. To start runs as soon as you push, add a webhook to the upstream repository (on
-          GitHub: <em>Settings → Webhooks → Add webhook</em>):
-        </p>
-        <div className="kv">
-          <span className="label">Payload URL</span>
-          <CopyField value={repo.webhook_url} />
-          <span className="label">Content type</span>
-          <span className="mono">application/json</span>
-          <span className="label">Secret</span>
-          {repo.webhook_secret ? <CopyField value={repo.webhook_secret} secret /> : <span className="muted">unavailable</span>}
-          <span className="label">Events</span>
-          <span>Just the push event</span>
-        </div>
-        <p className="muted small">
-          Services that can't sign payloads can append <code>?secret=&lt;secret&gt;</code> to the payload URL instead. A GitHub
-          repository that kiwicd's GitHub App (<em>Settings → GitHub</em>) is installed on needs no webhook: the app sends its events.
-        </p>
-      </details>
+      {maintainer && (
+        <details className="disclosure" open={showHook} onToggle={(e) => setShowHook((e.target as HTMLDetailsElement).open)}>
+          <summary>Trigger runs instantly with a webhook</summary>
+          <p className="muted small">
+            kiwicd polls mirrors periodically. To start runs as soon as you push, add a webhook to the upstream repository (on
+            GitHub: <em>Settings → Webhooks → Add webhook</em>):
+          </p>
+          <div className="kv">
+            <span className="label">Payload URL</span>
+            <CopyField value={repo.webhook_url} />
+            <span className="label">Content type</span>
+            <span className="mono">application/json</span>
+            <span className="label">Secret</span>
+            {repo.webhook_secret ? <CopyField value={repo.webhook_secret} secret /> : <span className="muted">unavailable</span>}
+            <span className="label">Events</span>
+            <span>Just the push event</span>
+          </div>
+          <p className="muted small">
+            Services that can't sign payloads can append <code>?secret=&lt;secret&gt;</code> to the payload URL instead. A GitHub
+            repository that kiwicd's GitHub App (<em>Settings → GitHub</em>) is installed on needs no webhook: the app sends its events.
+          </p>
+        </details>
+      )}
     </section>
   );
 }
 
 const uploadedPrefix = "kiwicd:";
 
-function WorkflowsTab({ repo }: { repo: Repo }) {
+function WorkflowsTab({ repo, maintainer }: { repo: Repo; maintainer: boolean }) {
   const branches = useMemo(() => branchesOf(repo), [repo]);
   const [ref, setRef] = useState(repo.default_branch);
   const wfs = useFetch<Workflow[]>(`${repoPath(repo.name)}/workflows?ref=${encodeURIComponent(ref)}`);
@@ -243,7 +266,7 @@ function WorkflowsTab({ repo }: { repo: Repo }) {
         {committed && committed.length > 0 && (
           <ul className="list">
             {committed.map((w) => (
-              <WorkflowRow key={w.file} workflow={w} file={w.file} onRun={() => setDispatching(w)} />
+              <WorkflowRow key={w.file} workflow={w} file={w.file} defaultBranch={repo.default_branch} onRun={maintainer ? () => setDispatching(w) : undefined} />
             ))}
           </ul>
         )}
@@ -255,21 +278,28 @@ function WorkflowsTab({ repo }: { repo: Repo }) {
             <h3>Uploaded workflows</h3>
             <p className="muted small">
               Stored in kiwicd instead of the repository, for workflows you don't want to commit. They run on pushes to every
-              branch, as if they were in <code>.github/workflows/</code>, with the pushed commit checked out.
+              branch, as if they were in <code>.github/workflows/</code>, with the pushed commit checked out. Their schedules run on the
+              default branch's latest commit.
             </p>
           </div>
-          <button className="btn btn-primary" onClick={() => setEditing({ file: "", isNew: true })}>
-            Upload workflow
-          </button>
+          {maintainer && (
+            <button className="btn btn-primary" onClick={() => setEditing({ file: "", isNew: true })}>
+              Upload workflow
+            </button>
+          )}
         </div>
         {actionError && <ErrorBox>{actionError}</ErrorBox>}
         {uploaded && uploaded.length === 0 && (
           <Empty title="No uploaded workflows">
-            Upload a workflow file, or with curl:{" "}
-            <code>
-              curl -u admin -T deploy.yml {repo.clone_url.replace(/\/git\/.*$/, "")}
-              {repoPath(repo.name)}/uploaded-workflows/deploy.yml
-            </code>
+            {maintainer && (
+              <>
+                Upload a workflow file, or with curl:{" "}
+                <code>
+                  curl -u admin -T deploy.yml {repo.clone_url.replace(/\/git\/.*$/, "")}
+                  {repoPath(repo.name)}/uploaded-workflows/deploy.yml
+                </code>
+              </>
+            )}
           </Empty>
         )}
         {uploaded && uploaded.length > 0 && (
@@ -277,15 +307,17 @@ function WorkflowsTab({ repo }: { repo: Repo }) {
             {uploaded.map((w) => {
               const file = w.file.slice(uploadedPrefix.length);
               return (
-                <WorkflowRow key={w.file} workflow={w} file={file} onRun={() => setDispatching(w)}>
-                  <div className="row-actions">
-                    <button className="btn btn-sm" onClick={() => setEditing({ file, isNew: false })}>
-                      Edit
-                    </button>
-                    <button className="btn btn-sm btn-danger-outline" onClick={() => remove(file)}>
-                      Delete
-                    </button>
-                  </div>
+                <WorkflowRow key={w.file} workflow={w} file={file} defaultBranch={repo.default_branch} onRun={maintainer ? () => setDispatching(w) : undefined}>
+                  {maintainer && (
+                    <div className="row-actions">
+                      <button className="btn btn-sm" onClick={() => setEditing({ file, isNew: false })}>
+                        Edit
+                      </button>
+                      <button className="btn btn-sm btn-danger-outline" onClick={() => remove(file)}>
+                        Delete
+                      </button>
+                    </div>
+                  )}
                 </WorkflowRow>
               );
             })}
@@ -310,7 +342,19 @@ function WorkflowsTab({ repo }: { repo: Repo }) {
   );
 }
 
-function WorkflowRow({ workflow: w, file, onRun, children }: { workflow: Workflow; file: string; onRun: () => void; children?: ReactNode }) {
+function WorkflowRow({
+  workflow: w,
+  file,
+  defaultBranch,
+  onRun,
+  children,
+}: {
+  workflow: Workflow;
+  file: string;
+  defaultBranch: string;
+  onRun?: () => void;
+  children?: ReactNode;
+}) {
   return (
     <li className="list-row workflow-row">
       <div className="workflow-main">
@@ -319,13 +363,38 @@ function WorkflowRow({ workflow: w, file, onRun, children }: { workflow: Workflo
         {w.error && <div className="text-danger small pre-wrap">{w.error}</div>}
         {(w.events ?? []).length > 0 && (
           <div className="chips">
-            {(w.events ?? []).map((e) => (
-              <Chip key={e}>{eventLabel(e)}</Chip>
-            ))}
+            {(w.events ?? []).map((e) => {
+              const details = w.event_details?.[e];
+              return (
+                <Chip key={e} title={details}>
+                  {eventLabel(e)}
+                  {details && <span className="muted"> · {details}</span>}
+                </Chip>
+              );
+            })}
           </div>
         )}
+        {(w.schedules ?? []).length > 0 && (
+          <ul className="schedules small">
+            {(w.schedules ?? []).map((s) => (
+              <li key={`${s.cron} ${s.timezone ?? ""}`}>
+                <Icon name="clock" size={12} /> <code>{s.cron}</code> <span className="muted">{s.timezone || "UTC"}</span>
+                {" · "}
+                {s.error ? (
+                  <span className="text-danger">{s.error}</span>
+                ) : s.next_run_at ? (
+                  <span title={absoluteTime(s.next_run_at)}>next run {relativeTime(s.next_run_at)}</span>
+                ) : (
+                  <span className="muted">
+                    runs only from <code>{defaultBranch}</code>
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
-      {w.dispatch && !w.error && (
+      {onRun && w.dispatch && !w.error && (
         <button className="btn" onClick={onRun}>
           <Icon name="play" size={12} /> Run workflow
         </button>
@@ -603,7 +672,7 @@ function useMirrorUpdate(repo: Repo, onChanged: () => void) {
   return { busy, error, notice, save };
 }
 
-function MirrorSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+function MirrorSettings({ repo, admin, onChanged }: { repo: Repo; admin: boolean; onChanged: () => void }) {
   const { busy, error, notice, save } = useMirrorUpdate(repo, onChanged);
   const [url, setUrl] = useState(repo.url ?? "");
   const [keyModal, setKeyModal] = useState(false);
@@ -630,11 +699,19 @@ function MirrorSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void
             void save({ url: url.trim() }, "URL changed.");
           }}
         >
-          <input className="input mono" value={url} onChange={(e) => setUrl(e.target.value)} required />
-          <button type="submit" className="btn btn-sm" disabled={busy || !url.trim() || url === (repo.url ?? "")}>
-            Save
-          </button>
+          <input className="input mono" value={url} onChange={(e) => setUrl(e.target.value)} readOnly={!admin} required />
+          {admin && (
+            <button type="submit" className="btn btn-sm" disabled={busy || !url.trim() || url === (repo.url ?? "")}>
+              Save
+            </button>
+          )}
         </form>
+        {!admin && (
+          <>
+            <span />
+            <span className="hint">Only an admin can change the URL.</span>
+          </>
+        )}
         {(repo.url ?? "").includes("***@") && (
           <>
             <span />
@@ -996,7 +1073,247 @@ function ProtectedRefsSettings({ repo, onChanged }: { repo: Repo; onChanged: () 
   );
 }
 
-function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+/** The badge of a workflow file: ci.yml for .github/workflows/ci.yml. */
+function badgeName(file: string): string {
+  return file.replace(/^\.github\/workflows\//, "");
+}
+
+function BadgeSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const me = useMe();
+  const workflows = useFetch<Workflow[]>(`${repoPath(repo.name)}/workflows`);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const base = me?.public_url ?? window.location.origin;
+
+  const setPublic = async (on: boolean) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { public_badges: on });
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Status badges</h3>
+          <p className="muted small">
+            A badge shows how the latest finished run of a workflow on the default branch ended; add{" "}
+            <span className="mono">?branch=NAME</span> for another branch or <span className="mono">&amp;event=push</span> for one event.
+            Badges need signing in unless they're public, so to show one in a README elsewhere make them public: then anyone can see this
+            repository's workflow names and whether their runs pass.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv kv-pad">
+        <span className="label">Public</span>
+        <label className="check">
+          <input type="checkbox" checked={repo.public_badges ?? false} disabled={busy} onChange={(e) => setPublic(e.target.checked)} />
+          Anyone can see this repository's status badges
+        </label>
+        {(workflows.data ?? []).map((w) => {
+          const url = `${base}${repoPath(repo.name)}/badge/${encodeURIComponent(badgeName(w.file))}.svg`;
+          const runs = `${base}/repos/${repo.name}?workflow=${encodeURIComponent(w.file)}`;
+          return (
+            <Fragment key={w.file}>
+              <span className="label">
+                <img src={url} alt={`${w.name || w.file} status`} className="badge-preview" />
+              </span>
+              <CopyField value={`[![${w.name || badgeName(w.file)}](${url})](${runs})`} />
+            </Fragment>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+/** How strict each fork policy is: approving fewer pull requests needs an admin. */
+const forkPolicies: { value: "off" | ForkApproval; label: string; strictness: number }[] = [
+  { value: "off", label: "Don't run them", strictness: 3 },
+  { value: "outside", label: "Run them once approved, unless the author is a member or collaborator", strictness: 2 },
+  { value: "first_time", label: "Run them once approved, for first-time contributors", strictness: 1 },
+  { value: "none", label: "Run them without approval", strictness: 0 },
+];
+
+/** Whether pull requests from forks run the repository's own pull_request workflows, and which wait for approval. */
+function PullRequestSettings({ repo, admin, onChanged }: { repo: Repo; admin: boolean; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const approval = repo.fork_approval ?? "first_time";
+  const policy = repo.fork_pull_requests ? approval : "off";
+  const strictness = (v: string) => forkPolicies.find((p) => p.value === v)?.strictness ?? 1;
+  const contributors = useFetch<ApprovedContributor[]>(`${repoPath(repo.name)}/approved-contributors`);
+  const set = async (v: string) => {
+    if (v === "none" && !confirm(`Run ${repo.name}'s pull_request workflows on every pull request from a fork without approval? Anyone can open one on a public repository.`))
+      return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), v === "off" ? { fork_pull_requests: false } : { fork_pull_requests: true, fork_approval: v });
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const forget = async (c: ApprovedContributor) => {
+    if (!confirm(`Forget ${c.login}? Their pull requests from forks will wait for approval again.`)) return;
+    setError(undefined);
+    try {
+      await del(`${repoPath(repo.name)}/approved-contributors/${c.user_id}`);
+      contributors.reload();
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Pull requests</h3>
+          <p className="muted small">
+            GitHub's <span className="mono">pull_request</span> webhook runs this repository's{" "}
+            <span className="mono">on: pull_request</span> workflows on a merge of the pull request into its base branch. Their workflow
+            comes from the pull request, so their jobs get no secrets except <span className="mono">KIWICD_TOKEN</span> and can't use
+            protected or reserved runners. Pull requests from forks only run them if allowed here; their jobs run the fork's code on
+            your runners, so runs of authors you don't know can wait until a maintainer approves them on the run's page.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv kv-pad">
+        <span className="label">Forks</span>
+        <select className="input" value={policy} disabled={busy} onChange={(e) => void set(e.target.value)}>
+          {forkPolicies.map((p) => (
+            <option key={p.value} value={p.value} disabled={!admin && p.strictness < strictness(policy)}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      {!admin && <p className="muted small">Only an admin can approve fewer pull requests from forks.</p>}
+      {contributors.data && contributors.data.length > 0 && (
+        <>
+          <p className="muted small">
+            Approved contributors: someone approved a run of theirs, so with first-time contributors' approval their pull requests run
+            straight away.
+          </p>
+          <ul className="list">
+            {contributors.data.map((c) => (
+              <li key={c.user_id} className="list-row setting-row">
+                <div className="setting-main">
+                  <span className="setting-name">{c.login}</span>
+                  <span className="muted small" title={absoluteTime(c.approved_at)}>
+                    approved by {c.approved_by} {relativeTime(c.approved_at)}
+                  </span>
+                </div>
+                <div className="row-actions">
+                  <button className="btn btn-sm btn-danger-outline" onClick={() => void forget(c)}>
+                    Forget
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </section>
+  );
+}
+
+/** Whether the repository's own .github/workflows/ files run here. */
+function RepoWorkflowsSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const set = async (on: boolean) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { repo_workflows: on });
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>Workflows</h3>
+          <p className="muted small">
+            Turn this off for a mirror whose <span className="mono">.github/workflows/</span> run on GitHub Actions: their jobs ask
+            for runners like <span className="mono">ubuntu-latest</span> that kiwicd doesn't have, and would wait forever. Uploaded
+            workflows still run, and other repositories can still listen to this one and call its reusable workflows.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv-pad">
+        <label className="check">
+          <input type="checkbox" checked={repo.repo_workflows ?? true} disabled={busy} onChange={(e) => void set(e.target.checked)} />
+          Run this repository's workflows
+        </label>
+      </div>
+    </section>
+  );
+}
+
+/** Whether runs of workflows that aren't the GitHub repository's own are reported to it. */
+function ChecksSettings({ repo, onChanged }: { repo: Repo; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const set = async (on: boolean) => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      await patch(repoPath(repo.name), { report_checks: on });
+      onChanged();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="box">
+      <div className="box-header">
+        <div>
+          <h3>GitHub checks</h3>
+          <p className="muted small">
+            With the GitHub App installed, runs of mirrors of GitHub repositories show on their commits and pull requests as check
+            runs, one per job, linking back here. Runs of this repository's <span className="mono">repository_push</span> and{" "}
+            <span className="mono">repository_pull_request</span> workflows go on the commit of the repository they listen to, and
+            uploaded workflows' runs on this mirror's commit, only if this is on: it shows their workflow and job names, and links to
+            this server, to everyone who can see that repository on GitHub.
+          </p>
+        </div>
+      </div>
+      {error && <Flash kind="error">{error}</Flash>}
+      <div className="kv-pad">
+        <label className="check">
+          <input type="checkbox" checked={!!repo.report_checks} disabled={busy} onChange={(e) => void set(e.target.checked)} />
+          Report listener and uploaded workflows' runs to GitHub
+        </label>
+      </div>
+    </section>
+  );
+}
+
+function RepoSettingsTab({ repo, admin, onChanged }: { repo: Repo; admin: boolean; onChanged: () => void }) {
   const navigate = useNavigate();
   const [confirm, setConfirm] = useState(false);
   const [typed, setTyped] = useState("");
@@ -1038,22 +1355,28 @@ function RepoSettingsTab({ repo, onChanged }: { repo: Repo; onChanged: () => voi
           <span title={absoluteTime(repo.created_at)}>{relativeTime(repo.created_at)}</span>
         </div>
       </section>
-      {repo.kind === "mirror" && <MirrorSettings repo={repo} onChanged={onChanged} />}
+      {repo.kind === "mirror" && <MirrorSettings repo={repo} admin={admin} onChanged={onChanged} />}
+      {repo.kind === "mirror" && <PullRequestSettings repo={repo} admin={admin} onChanged={onChanged} />}
+      <RepoWorkflowsSettings repo={repo} onChanged={onChanged} />
       <ProtectedRefsSettings repo={repo} onChanged={onChanged} />
       <ReadersSettings repo={repo} onChanged={onChanged} />
-      <section className="box box-danger">
-        <div className="box-header">
-          <div>
-            <h3>Danger zone</h3>
-            <p className="muted small">
-              Deleting a repository removes its git data, runs, logs, secrets and variables. This can't be undone.
-            </p>
+      <BadgeSettings repo={repo} onChanged={onChanged} />
+      <ChecksSettings repo={repo} onChanged={onChanged} />
+      {admin && (
+        <section className="box box-danger">
+          <div className="box-header">
+            <div>
+              <h3>Danger zone</h3>
+              <p className="muted small">
+                Deleting a repository removes its git data, runs, logs, secrets and variables. This can't be undone.
+              </p>
+            </div>
+            <button className="btn btn-danger" onClick={() => setConfirm(true)}>
+              Delete repository
+            </button>
           </div>
-          <button className="btn btn-danger" onClick={() => setConfirm(true)}>
-            Delete repository
-          </button>
-        </div>
-      </section>
+        </section>
+      )}
       {confirm && (
         <Modal title="Delete repository" onClose={() => setConfirm(false)}>
           <form className="form" onSubmit={remove}>

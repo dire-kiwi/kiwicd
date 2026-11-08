@@ -156,7 +156,9 @@ export function Modal({ title, onClose, children, wide }: { title: string; onClo
   );
 }
 
-export function Icon({ name, size = 16 }: { name: "clock" | "calendar" | "branch" | "repo" | "commit" | "user" | "chevron" | "play" | "bolt"; size?: number }) {
+export type IconName = "clock" | "calendar" | "branch" | "repo" | "commit" | "user" | "chevron" | "chevron-up" | "chevron-down" | "play" | "bolt" | "search" | "download";
+
+export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   const p = { width: size, height: size, viewBox: "0 0 16 16", className: "icon", "aria-hidden": true } as const;
   switch (name) {
     case "clock":
@@ -206,6 +208,31 @@ export function Icon({ name, size = 16 }: { name: "clock" | "calendar" | "branch
       return (
         <svg {...p}>
           <path d="M6 3.5L10.5 8 6 12.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "chevron-up":
+      return (
+        <svg {...p}>
+          <path d="M3.5 10L8 5.5 12.5 10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "chevron-down":
+      return (
+        <svg {...p}>
+          <path d="M3.5 6L8 10.5 12.5 6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "search":
+      return (
+        <svg {...p}>
+          <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+          <path d="M10.5 10.5L14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+      );
+    case "download":
+      return (
+        <svg {...p}>
+          <path d="M8 2.5v8M4.5 7L8 10.5 11.5 7M3 13.5h10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       );
     case "play":

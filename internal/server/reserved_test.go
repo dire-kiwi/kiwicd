@@ -104,7 +104,7 @@ func TestReservedLabels(t *testing.T) {
 	plainRunner := &Runner{ID: 2, Name: "plain", Labels: normalizeLabels(nil, "linux", "amd64")}
 	assign := func(rn *Runner) int64 {
 		t.Helper()
-		req, err := srv.assignJob(ctx, rn, ts.URL)
+		req, err := srv.assignJob(ctx, rn, protocol.Version, ts.URL)
 		if err != nil {
 			t.Fatal(err)
 		}

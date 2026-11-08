@@ -31,6 +31,11 @@ type mcpTool struct {
 	Annotations map[string]any `json:"annotations,omitempty"`
 
 	readOnly bool
+	// maintainer: the tool needs a maintainer even if it changes nothing.
+	maintainer bool
+	// settings: the tool is about global secrets or variables without a
+	// repository, which only admins may use.
+	settings bool
 	call     func(ctx context.Context, c *Client, args map[string]any) (any, error)
 }
 
@@ -109,6 +114,11 @@ func runSummary(c *Client, d *RunDetail) map[string]any {
 		if j.RunnerName != "" {
 			job["runner"] = j.RunnerName
 		}
+		if j.Uses != "" {
+			// It runs the jobs named "<its name> / ...".
+			job["calls"] = j.Uses
+			delete(job, "runs_on")
+		}
 		if j.Error != "" {
 			job["error"] = j.Error
 		}
@@ -174,7 +184,7 @@ func mcpTools() []*mcpTool {
 		},
 		{
 			Name: "list_workflows", Title: "List workflows", readOnly: true,
-			Description: "List a repository's workflows at a ref: file, name, events, and for workflow_dispatch ones their inputs. Files starting kiwicd: are stored in kiwicd rather than the repository.",
+			Description: "List a repository's workflows at a ref: file, name, events, schedules (cron entries, and when they next run on the default branch), and for workflow_dispatch ones their inputs. Files starting kiwicd: are stored in kiwicd rather than the repository.",
 			InputSchema: schema(map[string]any{"repo": repoProp, "ref": prop("string", "Branch, tag or full ref; default the default branch")}, "repo"),
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
 				repo, err := argString(args, "repo", true)
@@ -190,19 +200,28 @@ func mcpTools() []*mcpTool {
 		},
 		{
 			Name: "list_runs", Title: "List runs", readOnly: true,
-			Description: "List recent runs, newest first, optionally for one repository.",
+			Description: "List recent runs, newest first, optionally only some: of a repository, workflow, branch, event, status or actor.",
 			InputSchema: schema(map[string]any{"repo": prop("string", "Only this repository's runs, OWNER/NAME"),
-				"limit": prop("integer", "How many (default 20, at most 500)")}),
+				"workflow": prop("string", "Only this workflow's runs: its file, e.g. ci.yml"),
+				"branch":   prop("string", "Only runs of this branch (or full ref)"),
+				"event":    prop("string", "Only runs started by this event, e.g. push or workflow_dispatch"),
+				"status":   prop("string", "waiting (for approval), queued, in_progress or completed, or a conclusion: success, failure, cancelled or skipped"),
+				"actor":    prop("string", "Only runs started by this user"),
+				"limit":    prop("integer", "How many (default 20, at most 500)")}),
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
-				repo, err := argString(args, "repo", false)
-				if err != nil {
-					return nil, err
+				var f RunFilter
+				for name, to := range map[string]*string{"repo": &f.Repo, "workflow": &f.Workflow, "branch": &f.Branch, "event": &f.Event, "status": &f.Status, "actor": &f.Actor} {
+					v, err := argString(args, name, false)
+					if err != nil {
+						return nil, err
+					}
+					*to = v
 				}
 				limit, err := argInt(args, "limit", false, 20)
 				if err != nil {
 					return nil, err
 				}
-				runs, err := c.Runs(ctx, repo, int(limit))
+				runs, err := c.Runs(ctx, f, int(limit))
 				if err != nil {
 					return nil, err
 				}
@@ -295,13 +314,13 @@ func mcpTools() []*mcpTool {
 			},
 		},
 		{
-			Name: "list_secrets", Title: "List secrets", readOnly: true,
+			Name: "list_secrets", Title: "List secrets", readOnly: true, maintainer: true, settings: true,
 			Description: "List secrets' names (values can't be read), global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp}),
 			call:        listSettingsTool("secrets"),
 		},
 		{
-			Name: "list_variables", Title: "List variables", readOnly: true,
+			Name: "list_variables", Title: "List variables", readOnly: true, maintainer: true, settings: true,
 			Description: "List variables with their values, global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp}),
 			call:        listSettingsTool("variables"),
@@ -350,16 +369,57 @@ func mcpTools() []*mcpTool {
 			},
 		},
 		{
+			Name: "dispatch_event", Title: "Send a repository_dispatch event",
+			Description: "Send a repository_dispatch event to a repository, which starts the workflows on its default branch that listen for repository_dispatch with the event type (on.repository_dispatch.types, or any type without one). Returns the runs it started, which may be none.",
+			InputSchema: schema(map[string]any{
+				"repo":           repoProp,
+				"event_type":     prop("string", "The event type, github.event.action in the runs"),
+				"client_payload": map[string]any{"type": "object", "description": "Any JSON object, github.event.client_payload in the runs"},
+			}, "repo", "event_type"),
+			Annotations: map[string]any{"destructiveHint": false, "openWorldHint": true},
+			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
+				repo, err := argString(args, "repo", true)
+				if err != nil {
+					return nil, err
+				}
+				eventType, err := argString(args, "event_type", true)
+				if err != nil {
+					return nil, err
+				}
+				payload, _ := args["client_payload"].(map[string]any)
+				ids, err := c.RepositoryDispatch(ctx, repo, eventType, payload)
+				if err != nil {
+					return nil, err
+				}
+				runs := []map[string]any{}
+				for _, id := range ids {
+					runs = append(runs, map[string]any{"run_id": id, "url": fmt.Sprintf("%s/runs/%d", strings.TrimRight(c.URL, "/"), id)})
+				}
+				return map[string]any{"runs": runs}, nil
+			},
+		},
+		{
 			Name: "rerun", Title: "Re-run a run",
-			Description: "Start a new attempt of a run, with the same workflow, commit and event. Returns the new run's ID.",
-			InputSchema: schema(map[string]any{"run_id": runIDProp}, "run_id"),
+			Description: "Start a new attempt of a run, with the same workflow, commit and event. By default every job runs again; " +
+				"failed re-runs the jobs that failed or were cancelled and job_id one job, each with the jobs that need them, " +
+				"keeping the other jobs' results. Returns the new run's ID.",
+			InputSchema: schema(map[string]any{
+				"run_id": runIDProp,
+				"failed": map[string]any{"type": "boolean", "description": "Re-run only the jobs that failed or were cancelled (the run must have finished)."},
+				"job_id": map[string]any{"type": "integer", "description": "Re-run only this job of the run (the run must have finished)."},
+				"debug":  map[string]any{"type": "boolean", "description": "Turn on debug logging: ::debug:: messages and the runner's own."},
+			}, "run_id"),
 			Annotations: map[string]any{"destructiveHint": false, "openWorldHint": true},
 			call: func(ctx context.Context, c *Client, args map[string]any) (any, error) {
 				id, err := argInt(args, "run_id", true, 0)
 				if err != nil {
 					return nil, err
 				}
-				newID, err := c.Rerun(ctx, id)
+				jobID, err := argInt(args, "job_id", false, 0)
+				if err != nil {
+					return nil, err
+				}
+				newID, err := c.Rerun(ctx, id, RerunOptions{Failed: argBool(args, "failed"), JobID: jobID, Debug: argBool(args, "debug")})
 				if err != nil {
 					return nil, err
 				}
@@ -383,28 +443,28 @@ func mcpTools() []*mcpTool {
 			},
 		},
 		{
-			Name: "set_secret", Title: "Set a secret",
+			Name: "set_secret", Title: "Set a secret", settings: true,
 			Description: "Create or replace a secret, global or a repository's. Only runs from protected refs (the default branch and the repository's protected_refs) get secrets.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp, "value": prop("string", "The secret value")}, "name", "value"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
 			call:        setSettingTool("secrets"),
 		},
 		{
-			Name: "delete_secret", Title: "Delete a secret",
+			Name: "delete_secret", Title: "Delete a secret", settings: true,
 			Description: "Delete a secret, global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp}, "name"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
 			call:        deleteSettingTool("secrets"),
 		},
 		{
-			Name: "set_variable", Title: "Set a variable",
+			Name: "set_variable", Title: "Set a variable", settings: true,
 			Description: "Create or replace a variable (vars.NAME in workflows), global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp, "value": prop("string", "The value")}, "name", "value"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
 			call:        setSettingTool("variables"),
 		},
 		{
-			Name: "delete_variable", Title: "Delete a variable",
+			Name: "delete_variable", Title: "Delete a variable", settings: true,
 			Description: "Delete a variable, global or a repository's.",
 			InputSchema: schema(map[string]any{"repo": optRepoProp, "name": settingNameProp}, "name"),
 			Annotations: map[string]any{"destructiveHint": true, "idempotentHint": true},
@@ -571,21 +631,36 @@ type rpcError struct {
 }
 
 type mcpServer struct {
-	client  *Client
-	version string
-	tools   []*mcpTool
-	byName  map[string]*mcpTool
+	client       *Client
+	version      string
+	instructions string
+	tools        []*mcpTool
+	byName       map[string]*mcpTool
 
 	outMu sync.Mutex
 	out   io.Writer
 	log   io.Writer
 }
 
-func newMCPServer(c *Client, version string, readOnly bool, out, log io.Writer) *mcpServer {
-	s := &mcpServer{client: c, version: version, byName: map[string]*mcpTool{}, out: out, log: log}
+// newMCPServer serves the tools that access (nil if unknown) allows, or
+// only those that change nothing if readOnly.
+func newMCPServer(c *Client, version string, readOnly bool, access *Access, out, log io.Writer) *mcpServer {
+	s := &mcpServer{client: c, version: version, instructions: mcpInstructions, byName: map[string]*mcpTool{}, out: out, log: log}
+	if access != nil {
+		s.instructions += " You are " + access.String() + "."
+		if !access.CanWrite() {
+			readOnly = true
+		}
+	}
 	for _, t := range mcpTools() {
-		if readOnly && !t.readOnly {
+		if readOnly && !t.readOnly || t.maintainer && access != nil && !access.CanWrite() {
 			continue
+		}
+		if t.settings && access != nil && !access.Admin {
+			// Global secrets and variables are for admins.
+			props := t.InputSchema["properties"].(map[string]any)
+			props["repo"] = repoProp
+			t.InputSchema["required"] = append([]string{"repo"}, toStrings(t.InputSchema["required"])...)
 		}
 		if t.readOnly {
 			if t.Annotations == nil {
@@ -706,7 +781,7 @@ func (s *mcpServer) handle(ctx context.Context, m rpcMessage) rpcMessage {
 			"protocolVersion": version,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "kiwicd", "title": "kiwicd", "version": s.version},
-			"instructions":    mcpInstructions,
+			"instructions":    s.instructions,
 		}
 	case "ping":
 		reply.Result = map[string]any{}
@@ -765,5 +840,17 @@ func mcpCommand(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	return newMCPServer(c, a.Version, *readOnly, a.Stdout, a.Stderr).serve(ctx, a.Stdin)
+	// Tools the token can't use are left out.
+	var access *Access
+	if me, err := c.Me(ctx); err != nil {
+		fmt.Fprintln(a.Stderr, "kiwicd mcp: can't tell what the token may do, so offering every tool:", err)
+	} else {
+		access = &me.Access
+	}
+	return newMCPServer(c, a.Version, *readOnly, access, a.Stdout, a.Stderr).serve(ctx, a.Stdin)
+}
+
+func toStrings(v any) []string {
+	s, _ := v.([]string)
+	return s
 }

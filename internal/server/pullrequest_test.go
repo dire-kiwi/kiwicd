@@ -383,3 +383,458 @@ func TestConcurrencyQueue(t *testing.T) {
 		t.Errorf("bad group: %+v", bad)
 	}
 }
+
+// The repository's own pull request workflow, on its main branch.
+const ownPullRequestWorkflow = `name: PR
+on:
+  pull_request:
+    branches: [main]
+    paths: ['src/**']
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - run: echo test
+  trusted:
+    runs-on: [self-hosted, trusted]
+    steps:
+      - run: echo trusted
+  prod:
+    runs-on: [self-hosted, prod]
+    steps:
+      - run: echo prod
+`
+
+// TestPullRequest: GitHub's pull_request webhook runs the mirror's own
+// pull_request workflows on a merge commit, without secrets or protected
+// runners, and only for forks if the repository allows it.
+func TestPullRequest(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	defer func(d time.Duration) { pullRequestFetchRetry = d }(pullRequestFetchRetry)
+	pullRequestFetchRetry = 10 * time.Millisecond
+	tmp := t.TempDir()
+	srv, err := New(Config{DataDir: filepath.Join(tmp, "data"), AdminPassword: "pw", Version: "test",
+		ProtectedLabels: []string{"trusted"}, ReservedLabels: []string{"prod=t/app"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	ctx := context.Background()
+	api := func(method, path, body string, out any) int {
+		t.Helper()
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.SetBasicAuth("admin", "pw")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if out != nil {
+			_ = json.Unmarshal(b, out)
+		}
+		return resp.StatusCode
+	}
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+			"GIT_TERMINAL_PROMPT=0")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(dir, file, content string) {
+		t.Helper()
+		_ = os.MkdirAll(filepath.Dir(filepath.Join(dir, file)), 0o755)
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// t/app mirrors a repository whose main branch has the workflow.
+	origin := filepath.Join(tmp, "origin")
+	git(tmp, "init", "-q", "-b", "main", origin)
+	write(origin, ".github/workflows/pr.yml", ownPullRequestWorkflow)
+	write(origin, "notes.txt", "one\n")
+	git(origin, "add", "-A")
+	git(origin, "commit", "-qm", "init")
+	if code := api("POST", "/api/repos", `{"name":"t/app","url":"`+origin+`"}`, nil); code != 200 {
+		t.Fatalf("create mirror: %d", code)
+	}
+	var app Repo
+	api("GET", "/api/repos/t/app", "", &app)
+
+	// newPullRequest commits files on a branch off from and makes it pull
+	// request number's head, as GitHub does.
+	newPullRequest := func(number int, branch, from string, files map[string]string) string {
+		t.Helper()
+		git(origin, "checkout", "-q", "-b", branch, from)
+		for f, c := range files {
+			write(origin, f, c)
+		}
+		git(origin, "add", "-A")
+		git(origin, "commit", "-qm", branch)
+		sha := git(origin, "rev-parse", "HEAD")
+		git(origin, "update-ref", fmt.Sprintf("refs/pull/%d/head", number), sha)
+		git(origin, "checkout", "-q", "main")
+		return sha
+	}
+	prEvent := func(action string, number int, branch, sha, headRepo string) string {
+		return fmt.Sprintf(`{"action":%q,"number":%d,"pull_request":{"number":%d,"title":"Change %s",`+
+			`"head":{"ref":%q,"sha":%q,"repo":{"full_name":%q}},"base":{"ref":"main","sha":"x","repo":{"full_name":"gh/app"}}},`+
+			`"sender":{"login":"someone"},"repository":{"full_name":"gh/app"}}`, action, number, number, branch, branch, sha, headRepo)
+	}
+	runs := func() []*Run {
+		t.Helper()
+		var out []*Run
+		api("GET", "/api/runs?repo=t/app", "", &out)
+		for i, r := range out {
+			if out[i], err = srv.getRun(r.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return out // newest first
+	}
+	deliver := func(body string) {
+		t.Helper()
+		if err := srv.onPullRequest(ctx, app.ID, []byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The pull request changes src/ and adds a workflow; main moves on after
+	// it branched off.
+	head := newPullRequest(1, "feature", "main", map[string]string{
+		"src/a.go":                    "package a\n",
+		".github/workflows/added.yml": "on: pull_request\njobs:\n  x: {runs-on: self-hosted, steps: [{run: echo}]}\n",
+	})
+	write(origin, "notes.txt", "two\n")
+	git(origin, "commit", "-qam", "main moves on")
+	base := git(origin, "rev-parse", "HEAD")
+
+	// A push to main holds the deploy group.
+	r, _ := srv.getRepo("t/app")
+	pushID, err := srv.createRun(ctx, runSpec{repo: r, file: ".github/workflows/pr.yml", yaml: ownPullRequestWorkflow, name: "PR",
+		event: "push", payload: map[string]any{}, ref: "refs/heads/main", sha: base, actor: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The webhook runs both workflows, from the merge commit.
+	mac := hmac.New(sha256.New, []byte(app.WebhookSecret))
+	body := prEvent("opened", 1, "feature", head, "gh/app")
+	mac.Write([]byte(body))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/hooks/t/app", strings.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("webhook: %d", resp.StatusCode)
+	}
+	var opened []*Run
+	waitFor(t, "the pull request's runs", func() bool {
+		opened = runs()
+		if len(opened) != 3 {
+			return false
+		}
+		for _, r := range opened[:2] {
+			if jobs, _ := srv.runJobs(r.ID); len(jobs) == 0 {
+				return false
+			}
+		}
+		return true
+	})
+	var pr *Run
+	files := []string{}
+	for _, r := range opened[:2] {
+		files = append(files, r.WorkflowFile)
+		if r.WorkflowFile == ".github/workflows/pr.yml" {
+			pr = r
+		}
+	}
+	if pr == nil {
+		t.Fatalf("runs of %v", files)
+	}
+	mirror := srv.repoPath("t/app")
+	merge, err := resolveRef(ctx, mirror, "refs/pull/1/merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parents := git(mirror, "log", "-1", "--format=%P", merge); parents != base+" "+head {
+		t.Errorf("merge commit's parents: %s, want %s %s", parents, base, head)
+	}
+	if notes := git(mirror, "show", merge+":notes.txt"); notes != "two" {
+		t.Errorf("the merge commit has main's notes.txt %q", notes)
+	}
+	if pr.Event != "pull_request" || pr.Ref != "refs/pull/1/merge" || pr.Sha != merge || pr.Actor != "someone" ||
+		pr.Title != "#1 opened: Change feature" || pr.Protected || pr.EventJSON["number"] != 1.0 {
+		t.Fatalf("run: %+v", pr)
+	}
+	ghc := srv.githubContext(pr)
+	if ghc.HeadRef != "feature" || ghc.BaseRef != "main" || ghc.RefName != "1/merge" {
+		t.Errorf("github context: head_ref %q, base_ref %q, ref_name %q", ghc.HeadRef, ghc.BaseRef, ghc.RefName)
+	}
+	// Its jobs get no secrets, and can't use protected or reserved runners.
+	if _, err := srv.db.Exec(`INSERT INTO secrets (repo_id, name, value, updated_at) VALUES (0, 'DEPLOY_KEY', ?, 0)`, srv.box.seal(purposeSecret, "s3cret")); err != nil {
+		t.Fatal(err)
+	}
+	jobs := map[string]*Job{}
+	all, _ := srv.runJobs(pr.ID)
+	for _, j := range all {
+		jobs[j.Key] = j
+	}
+	if j := jobs["trusted"]; j == nil || j.Conclusion != protocol.ResultFailure || !strings.Contains(j.Error, "comes from the pull request") {
+		t.Errorf("job on a protected runner: %+v", j)
+	}
+	if j := jobs["prod"]; j == nil || j.Conclusion != protocol.ResultFailure || !strings.Contains(j.Error, "reserved") {
+		t.Errorf("job on a reserved runner: %+v", j)
+	}
+	test := jobs["test"]
+	if test == nil || test.Status != protocol.StatusQueued {
+		t.Fatalf("test job: %+v", test)
+	}
+	jobReq, err := srv.buildJobRequest(test, ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobReq.Secrets) != 1 || jobReq.Secrets["KIWICD_TOKEN"] == "" || jobReq.Sha != merge || jobReq.EventName != "pull_request" ||
+		jobReq.Env["GITHUB_HEAD_REF"] != "feature" || jobReq.Env["GITHUB_BASE_REF"] != "main" ||
+		len(jobReq.Notices) != 1 || !strings.Contains(jobReq.Notices[0], "pull_request runs get no secrets") {
+		t.Errorf("job request: secrets %v, sha %s, event %s, env %v", sortedKeys(jobReq.Secrets), jobReq.Sha, jobReq.EventName, jobReq.Env)
+	}
+	// Its deploy group is apart from the push's, which keeps running.
+	if push, _ := srv.getRun(pushID); push.Cancel || push.Status == protocol.StatusCompleted {
+		t.Errorf("the pull request cancelled the push: %+v", push)
+	}
+
+	// Changes outside src/ don't run pr.yml.
+	deliver(prEvent("opened", 2, "docs", newPullRequest(2, "docs", "main", map[string]string{"docs.md": "x"}), "gh/app"))
+	if got := runs(); len(got) != 3 {
+		t.Errorf("a pull request outside paths ran %s", got[0].WorkflowFile)
+	}
+
+	// A pull request that conflicts with main runs nothing, as on GitHub.
+	deliver(prEvent("opened", 3, "conflict", newPullRequest(3, "conflict", "main~1", map[string]string{"notes.txt": "three\n", "src/b.go": "x"}), "gh/app"))
+	if got := runs(); len(got) != 3 {
+		t.Errorf("a conflicting pull request ran %s", got[0].WorkflowFile)
+	}
+
+	// A fork's pull request runs only once the repository allows it.
+	forkEvent := func(action string, number int, sha, login string, uid int, assoc string) string {
+		return fmt.Sprintf(`{"action":%q,"number":%d,"pull_request":{"number":%d,"title":"Fork change","user":{"login":%q,"id":%d},`+
+			`"author_association":%q,"head":{"ref":"fork","sha":%q,"repo":{"full_name":%q}},"base":{"ref":"main","repo":{"full_name":"gh/app"}}},`+
+			`"sender":{"login":%q},"repository":{"full_name":"gh/app"}}`, action, number, number, login, uid, assoc, sha, login+"/app", login)
+	}
+	forkHead := newPullRequest(4, "fork", "main", map[string]string{"src/c.go": "x"})
+	fork := forkEvent("opened", 4, forkHead, "newbie", 101, "FIRST_TIME_CONTRIBUTOR")
+	deliver(fork)
+	if got := runs(); len(got) != 3 {
+		t.Errorf("a fork's pull request ran %s", got[0].WorkflowFile)
+	}
+	if code := api("PATCH", "/api/repos/t/app", `{"fork_pull_requests":true}`, nil); code != 200 {
+		t.Fatalf("allow forks: %d", code)
+	}
+	if api("GET", "/api/repos/t/app", "", &app); !app.ForkPullRequests || app.ForkApproval != forkApprovalFirstTime {
+		t.Errorf("fork_pull_requests wasn't saved, or fork_approval isn't first_time: %+v", app)
+	}
+
+	// A first-time contributor's pull request waits for approval, outside
+	// its concurrency group.
+	deliver(fork)
+	got := runs()
+	waiting := got[0]
+	if len(got) != 4 || waiting.Ref != "refs/pull/4/merge" || waiting.Protected || waiting.Status != protocol.StatusWaiting ||
+		waiting.Approval != approvalRequired || waiting.ConcurrencyGroup != "deploy" {
+		t.Fatalf("a first-time contributor's run: %+v", waiting)
+	}
+	if jobs, _ := srv.runJobs(waiting.ID); len(jobs) != 0 {
+		t.Errorf("a waiting run has jobs: %+v", jobs)
+	}
+	if pr, _ = srv.getRun(pr.ID); pr.Cancel {
+		t.Error("a run waiting for approval cancelled the first pull request's run")
+	}
+	var waitingRuns []*Run
+	if api("GET", "/api/runs?repo=t/app&status=waiting", "", &waitingRuns); len(waitingRuns) != 1 {
+		t.Errorf("runs with status=waiting: %+v", waitingRuns)
+	}
+	// Re-running it makes an attempt that waits too.
+	var rerun struct {
+		RunID int64 `json:"run_id"`
+	}
+	api("POST", fmt.Sprintf("/api/runs/%d/rerun", waiting.ID), "", &rerun)
+	if again, err := srv.getRun(rerun.RunID); err != nil || again.Status != protocol.StatusWaiting {
+		t.Fatalf("re-run of a waiting run: %+v, %v", again, err)
+	}
+
+	// Approving starts both, which now cancel the first pull request's run
+	// in their group, and remembers the author.
+	var approved struct {
+		Approved []int64 `json:"approved"`
+	}
+	if code := api("POST", fmt.Sprintf("/api/runs/%d/approve", waiting.ID), "", &approved); code != 200 || len(approved.Approved) != 2 {
+		t.Fatalf("approve: %d %+v", code, approved)
+	}
+	if code := api("POST", fmt.Sprintf("/api/runs/%d/approve", waiting.ID), "", nil); code != 409 {
+		t.Errorf("approving again: %d", code)
+	}
+	waiting, _ = srv.getRun(waiting.ID)
+	if waiting.Status == protocol.StatusWaiting || waiting.Approval != approvalApproved || waiting.ApprovedBy != "admin" || waiting.ApprovedAt == 0 {
+		t.Errorf("approved run: %+v", waiting)
+	}
+	if again, _ := srv.getRun(rerun.RunID); again.Status == protocol.StatusWaiting {
+		t.Error("the re-run wasn't approved with it")
+	}
+	if jobs, _ := srv.runJobs(rerun.RunID); len(jobs) == 0 {
+		t.Error("the approved run has no jobs")
+	}
+	if pr, _ = srv.getRun(pr.ID); !pr.Cancel {
+		t.Error("the first pull request's run wasn't cancelled")
+	}
+	if push, _ := srv.getRun(pushID); push.Cancel {
+		t.Error("a pull request cancelled the push")
+	}
+	var contributors []ApprovedContributor
+	if api("GET", "/api/repos/t/app/approved-contributors", "", &contributors); len(contributors) != 1 ||
+		contributors[0].Login != "newbie" || contributors[0].UserID != 101 || contributors[0].ApprovedBy != "admin" {
+		t.Errorf("approved contributors: %+v", contributors)
+	}
+	// Their next push runs straight away.
+	deliver(forkEvent("synchronize", 4, forkHead, "newbie", 101, "FIRST_TIME_CONTRIBUTOR"))
+	if got := runs(); len(got) != 6 || got[0].Status == protocol.StatusWaiting || got[0].Approval != "" {
+		t.Errorf("an approved contributor's run: %+v", got[0])
+	}
+	count := 6
+
+	// expect delivers an event and checks whether its run waits.
+	expect := func(what, event string, wait bool) *Run {
+		t.Helper()
+		deliver(event)
+		got := runs()
+		if len(got) != count+1 {
+			t.Fatalf("%s: %d runs, want %d", what, len(got), count+1)
+		}
+		count++
+		if (got[0].Status == protocol.StatusWaiting) != wait {
+			t.Errorf("%s: status %s", what, got[0].Status)
+		}
+		return got[0]
+	}
+	other := newPullRequest(5, "other", "main", map[string]string{"src/d.go": "x"})
+	expect("a contributor", forkEvent("opened", 5, other, "helper", 103, "CONTRIBUTOR"), false)
+	expect("a member", forkEvent("opened", 5, other, "insider", 104, "MEMBER"), false)
+	first := expect("another first-time contributor", forkEvent("opened", 5, other, "stranger", 102, "NONE"), true)
+	// A newer event of the pull request replaces its waiting run.
+	second := expect("a newer event", forkEvent("synchronize", 5, other, "stranger", 102, "NONE"), true)
+	if first, _ = srv.getRun(first.ID); first.Status != protocol.StatusCompleted || first.Conclusion != protocol.ResultCancelled ||
+		first.Error != replacedWhileWaiting {
+		t.Errorf("the replaced run: %+v", first)
+	}
+	// Cancelling one finishes it without jobs.
+	if code := api("POST", fmt.Sprintf("/api/runs/%d/cancel", second.ID), "", nil); code != 200 {
+		t.Fatalf("cancel: %d", code)
+	}
+	if second, _ = srv.getRun(second.ID); second.Status != protocol.StatusCompleted || second.Conclusion != protocol.ResultCancelled {
+		t.Errorf("the cancelled waiting run: %+v", second)
+	}
+	if jobs, _ := srv.runJobs(second.ID); len(jobs) != 0 {
+		t.Errorf("a run cancelled while waiting has jobs: %+v", jobs)
+	}
+	// A re-run of a run nobody approved waits too.
+	api("POST", fmt.Sprintf("/api/runs/%d/rerun", second.ID), "", &rerun)
+	count++
+	if again, _ := srv.getRun(rerun.RunID); again.Status != protocol.StatusWaiting {
+		t.Errorf("re-run of an unapproved run: %+v", again)
+	}
+	// Closing the pull request cancels its waiting runs.
+	third := expect("synchronize", forkEvent("synchronize", 5, other, "stranger", 102, "NONE"), true)
+	deliver(forkEvent("closed", 5, other, "stranger", 102, "NONE"))
+	if third, _ = srv.getRun(third.ID); third.Status != protocol.StatusCompleted || !strings.Contains(third.Error, "closed") {
+		t.Errorf("a waiting run of a closed pull request: %+v", third)
+	}
+	// As do 30 days.
+	fourth := expect("reopened", forkEvent("reopened", 5, other, "stranger", 102, "NONE"), true)
+	if _, err := srv.db.Exec(`UPDATE runs SET created_at = ? WHERE id = ?`, time.Now().Add(-31*24*time.Hour).UnixMilli(), fourth.ID); err != nil {
+		t.Fatal(err)
+	}
+	srv.expireWaitingRuns()
+	if fourth, _ = srv.getRun(fourth.ID); fourth.Status != protocol.StatusCompleted || !strings.Contains(fourth.Error, "30 days") {
+		t.Errorf("a run waiting for 31 days: %+v", fourth)
+	}
+
+	// outside: everyone who isn't a member or collaborator waits, every time.
+	if code := api("PATCH", "/api/repos/t/app", `{"fork_approval":"sometimes"}`, nil); code != 400 {
+		t.Errorf("bad fork_approval: %d", code)
+	}
+	if code := api("PATCH", "/api/repos/t/app", `{"fork_approval":"outside"}`, nil); code != 200 {
+		t.Fatalf("fork_approval outside: %d", code)
+	}
+	expect("a contributor, outside", forkEvent("opened", 4, forkHead, "helper", 103, "CONTRIBUTOR"), true)
+	expect("an approved contributor, outside", forkEvent("opened", 4, forkHead, "newbie", 101, "FIRST_TIME_CONTRIBUTOR"), true)
+	expect("a collaborator, outside", forkEvent("opened", 4, forkHead, "friend", 105, "COLLABORATOR"), false)
+	// none: nobody waits.
+	if code := api("PATCH", "/api/repos/t/app", `{"fork_approval":"none"}`, nil); code != 200 {
+		t.Fatalf("fork_approval none: %d", code)
+	}
+	expect("a first-time contributor, none", forkEvent("opened", 4, forkHead, "stranger", 102, "FIRST_TIMER"), false)
+
+	// Forgetting an approved contributor makes them wait again.
+	api("PATCH", "/api/repos/t/app", `{"fork_approval":"first_time"}`, nil)
+	if code := api("DELETE", "/api/repos/t/app/approved-contributors/101", "", nil); code != 200 {
+		t.Fatalf("forget: %d", code)
+	}
+	if code := api("DELETE", "/api/repos/t/app/approved-contributors/101", "", nil); code != 404 {
+		t.Errorf("forget again: %d", code)
+	}
+	expect("a forgotten contributor", forkEvent("synchronize", 4, forkHead, "newbie", 101, "FIRST_TIME_CONTRIBUTOR"), true)
+
+	// A run keeps its merge commit reachable after refs/pull/N/merge moves
+	// on, until it's deleted.
+	if kept, err := resolveRef(ctx, mirror, runCommitRef(pr.ID)); err != nil || kept != merge {
+		t.Errorf("the first run's commit ref: %q, %v; want %s", kept, err, merge)
+	}
+
+	// No workflow listens for labeled, so the event fetches the head but
+	// makes no merge commit.
+	labeledHead := newPullRequest(6, "labels", "main", map[string]string{"src/d.go": "x"})
+	labeled := prEvent("labeled", 6, "labels", labeledHead, "gh/app")
+	deliver(labeled)
+	if _, err := resolveRef(ctx, mirror, labeledHead); err != nil {
+		t.Errorf("the labeled event didn't fetch the head: %v", err)
+	}
+	if _, err := resolveRef(ctx, mirror, "refs/pull/6/merge"); err == nil {
+		t.Error("the labeled event made a merge commit")
+	}
+	// Once main has a workflow that does, it runs on the merge commit, though
+	// the pull request's head doesn't have it.
+	write(origin, ".github/workflows/labels.yml", "on:\n  pull_request:\n    types: [labeled]\njobs:\n  x: {runs-on: self-hosted, steps: [{run: echo}]}\n")
+	git(origin, "add", "-A")
+	git(origin, "commit", "-qm", "labels")
+	if err := srv.syncRepo(ctx, app.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	deliver(labeled)
+	got = runs()
+	if len(got) != count+1 || got[0].WorkflowFile != ".github/workflows/labels.yml" || got[0].Ref != "refs/pull/6/merge" {
+		t.Fatalf("a labeled event with a workflow for it ran %+v", got[0])
+	}
+	if err := srv.deleteRun(ctx, got[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveRef(ctx, mirror, runCommitRef(got[0].ID)); err == nil {
+		t.Error("a deleted run's commit ref is still there")
+	}
+}

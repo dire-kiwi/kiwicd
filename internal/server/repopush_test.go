@@ -223,7 +223,7 @@ func TestRepositoryPush(t *testing.T) {
 	deployRun := func(event, ref string) *Run {
 		return &Run{Repo: "t/deploy", RepoID: run.RepoID, Event: event, Ref: ref, Protected: ref == "refs/heads/main", WorkflowYAML: listenerWorkflow}
 	}
-	for event, want := range map[string]int{"push": 1, "workflow_dispatch": 2, "repository_push": 2} {
+	for event, want := range map[string]int{"push": 1, "workflow_dispatch": 2, "repository_push": 2, "schedule": 2} {
 		if got := srv.jobReadableRepos(deployRun(event, "refs/heads/main")); len(got) != want {
 			t.Errorf("%s run reads %v", event, got)
 		}

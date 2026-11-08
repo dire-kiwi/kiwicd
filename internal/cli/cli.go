@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,21 +25,24 @@ const usage = `kiwicd: inspect and start kiwicd runs, and configure secrets and 
 
 Usage:
   kiwicd login [--url URL] [--token TOKEN | --password-stdin] [--name NAME] [--expires DAYS]
+               [--role ROLE] [--repo OWNER/NAME]...
   kiwicd logout
   kiwicd whoami
 
   kiwicd repo list
   kiwicd repo view OWNER/NAME
   kiwicd repo sync OWNER/NAME
+  kiwicd repo dispatch OWNER/NAME EVENT_TYPE [--payload JSON]
   kiwicd workflow list OWNER/NAME [--ref REF]
 
-  kiwicd run list [--repo OWNER/NAME] [--limit N]
+  kiwicd run list [--repo OWNER/NAME] [--workflow FILE] [--branch B] [--event E] [--status S] [--actor A] [--limit N]
   kiwicd run view RUN
   kiwicd run start OWNER/NAME WORKFLOW [--ref REF] [-i NAME=VALUE]... [--watch]
   kiwicd run watch RUN
   kiwicd run logs RUN [--job JOB] [--failed] [--follow] [--timestamps]
   kiwicd run cancel RUN
-  kiwicd run rerun RUN [--watch]
+  kiwicd run approve RUN
+  kiwicd run rerun RUN [--failed | --job JOB] [--debug] [--watch]
 
   kiwicd secret list [--repo OWNER/NAME]
   kiwicd secret set NAME [--repo OWNER/NAME] [--value VALUE | --from-file PATH]
@@ -49,7 +53,7 @@ Usage:
 
   kiwicd runner list
   kiwicd token list
-  kiwicd token create NAME [--expires DAYS]
+  kiwicd token create NAME [--expires DAYS] [--role ROLE] [--repo OWNER/NAME]...
   kiwicd token revoke ID
 
   kiwicd mcp [--read-only]     serve the API to agents over MCP (stdio)
@@ -60,6 +64,13 @@ Without --repo, secrets and variables are the global ones, which every
 repository gets. List and view commands take --json. kiwicd login saves the
 server and an API token in ~/.config/kiwicd/cli.json; KIWICD_URL and
 KIWICD_API_TOKEN override them.
+
+What you may do depends on your role, which kiwicd whoami shows: viewers see
+repositories, runs, logs and runners; maintainers of a repository also start,
+re-run, cancel and approve its runs and set its secrets and variables; admins can do
+everything, including global secrets and variables. A token can be limited
+with --role viewer|maintainer|admin (no higher than yours) and with --repo,
+which it then sees alone.
 `
 
 // App is one invocation of the command.
@@ -78,10 +89,10 @@ type App struct {
 type command func(ctx context.Context, a *App, args []string) error
 
 var commands = map[string]map[string]command{
-	"repo":     {"list": repoList, "view": repoView, "sync": repoSync},
+	"repo":     {"list": repoList, "view": repoView, "sync": repoSync, "dispatch": repoDispatch},
 	"workflow": {"list": workflowList},
 	"run": {"list": runList, "view": runView, "start": runStart, "watch": runWatch, "logs": runLogs,
-		"cancel": runCancel, "rerun": runRerun},
+		"cancel": runCancel, "approve": runApprove, "rerun": runRerun},
 	"secret":   {"list": settingList("secrets"), "set": secretSet, "delete": settingDelete("secrets")},
 	"variable": {"list": settingList("variables"), "set": variableSet, "delete": settingDelete("variables")},
 	"runner":   {"list": runnerList},
@@ -164,7 +175,7 @@ func (a *App) run(ctx context.Context, args []string) error {
 	rest := args[1:]
 	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
 		v := rest[0]
-		if a, ok := aliases[v]; ok {
+		if a, ok := aliases[v]; ok && verbs[v] == nil {
 			v = a
 		}
 		if _, ok := verbs[v]; ok || !plural {
@@ -276,8 +287,12 @@ func login(ctx context.Context, a *App, args []string) error {
 	host, _ := os.Hostname()
 	name := fs.String("name", "kiwicd CLI on "+orDash(host), "the new token's name")
 	expires := fs.Int("expires", 0, "days until the new token expires (0: never)")
+	role, repos := scopeFlags(fs)
 	if _, err := flags(fs, args, 0, 0); err != nil {
 		return err
+	}
+	if *token != "" && (*role != "" || len(*repos) > 0) {
+		return errors.New("--role and --repo are for the token login makes, not one given with --token")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -307,15 +322,15 @@ func login(ctx context.Context, a *App, args []string) error {
 			return err
 		}
 		c := &Client{URL: cfg.URL, Token: password}
-		t, _, err := c.CreateToken(ctx, *name, *expires)
+		t, _, err := c.CreateToken(ctx, NewToken{Name: *name, ExpiresInDays: *expires, Role: *role, Repos: *repos})
 		if err != nil {
 			return err
 		}
 		*token = t
 	}
 	c := &Client{URL: cfg.URL, Token: *token}
-	var me Me
-	if err := c.Get(ctx, "/api/me", &me); err != nil {
+	me, err := c.Me(ctx)
+	if err != nil {
 		return err
 	}
 	cfg.Token = *token
@@ -323,8 +338,22 @@ func login(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Stdout, "Logged in to %s as %s (server %s); saved to %s\n", cfg.URL, me.User, me.Version, p)
+	fmt.Fprintf(a.Stdout, "Logged in to %s as %s, %s (server %s); saved to %s\n", cfg.URL, me.User, me.Access, me.Version, p)
 	return nil
+}
+
+// repeated is a flag that may be given more than once.
+type repeated []string
+
+func (r *repeated) String() string     { return strings.Join(*r, ",") }
+func (r *repeated) Set(v string) error { *r = append(*r, v); return nil }
+
+// scopeFlags adds --role and --repo, for limiting a new token.
+func scopeFlags(fs *flag.FlagSet) (*string, *[]string) {
+	role := fs.String("role", "", "limit the token to a role: viewer (read-only), maintainer or admin")
+	var repos repeated
+	fs.Var(&repos, "repo", "limit the token to a repository, OWNER/NAME (repeatable); it sees no others")
+	return role, (*[]string)(&repos)
 }
 
 func logout(ctx context.Context, a *App, args []string) error {
@@ -369,11 +398,14 @@ func whoami(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	var me Me
-	if err := c.Get(ctx, "/api/me", &me); err != nil {
+	me, err := c.Me(ctx)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Stdout, "%s on %s (server %s)\n", me.User, c.URL, me.Version)
+	fmt.Fprintf(a.Stdout, "%s on %s (server %s): %s\n", me.User, c.URL, me.Version, me.Access)
+	if t := me.Access.Token; t != nil {
+		fmt.Fprintf(a.Stdout, "with API token %d, %s, scope %s\n", t.ID, t.Name, t.Scope())
+	}
 	return nil
 }
 
@@ -470,6 +502,38 @@ func repoSync(ctx context.Context, a *App, args []string) error {
 	return nil
 }
 
+// repoDispatch sends a repository_dispatch event, which starts the default
+// branch's workflows that listen for its type.
+func repoDispatch(ctx context.Context, a *App, args []string) error {
+	fs := flag.NewFlagSet("repo dispatch", flag.ContinueOnError)
+	raw := fs.String("payload", "", "the event's client_payload, a JSON object")
+	pos, err := flags(fs, args, 2, 2)
+	if err != nil {
+		return err
+	}
+	var payload map[string]any
+	if *raw != "" {
+		if err := json.Unmarshal([]byte(*raw), &payload); err != nil {
+			return fmt.Errorf("--payload must be a JSON object: %v", err)
+		}
+	}
+	c, err := a.api()
+	if err != nil {
+		return err
+	}
+	ids, err := c.RepositoryDispatch(ctx, pos[0], pos[1], payload)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		fmt.Fprintf(a.Stdout, "No workflow on %s's default branch listens for repository_dispatch %s\n", pos[0], pos[1])
+	}
+	for _, id := range ids {
+		fmt.Fprintf(a.Stdout, "Started run %d: %s/runs/%d\n", id, strings.TrimRight(c.URL, "/"), id)
+	}
+	return nil
+}
+
 func workflowList(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("workflow list", flag.ContinueOnError)
 	ref := fs.String("ref", "", "branch, tag or ref (default: the default branch)")
@@ -491,7 +555,22 @@ func workflowList(ctx context.Context, a *App, args []string) error {
 	}
 	var rows [][]string
 	for _, w := range ws {
-		on := strings.Join(w.Events, ", ")
+		events := slices.Clone(w.Events)
+		for i, e := range events {
+			if e != "schedule" || len(w.Schedules) == 0 {
+				continue
+			}
+			var crons []string
+			for _, sch := range w.Schedules {
+				c := sch.Cron
+				if sch.Timezone != "" {
+					c += " " + sch.Timezone
+				}
+				crons = append(crons, c)
+			}
+			events[i] = "schedule (" + strings.Join(crons, "; ") + ")"
+		}
+		on := strings.Join(events, ", ")
 		if w.Error != "" {
 			on = "invalid: " + truncate(w.Error, 60)
 		}
@@ -512,7 +591,13 @@ func workflowList(ctx context.Context, a *App, args []string) error {
 
 func runList(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("run list", flag.ContinueOnError)
-	repo := fs.String("repo", "", "only this repository's runs (OWNER/NAME)")
+	var f RunFilter
+	fs.StringVar(&f.Repo, "repo", "", "only this repository's runs (OWNER/NAME)")
+	fs.StringVar(&f.Workflow, "workflow", "", "only this workflow's runs (its file, e.g. ci.yml)")
+	fs.StringVar(&f.Branch, "branch", "", "only runs of this branch (or full ref)")
+	fs.StringVar(&f.Event, "event", "", "only runs started by this event (push, workflow_dispatch, ...)")
+	fs.StringVar(&f.Status, "status", "", "only runs that are waiting (for approval), queued, in_progress or completed, or ended in success, failure, cancelled or skipped")
+	fs.StringVar(&f.Actor, "actor", "", "only runs started by this user")
 	limit := fs.Int("limit", 20, "how many runs, newest first (at most 500)")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if _, err := flags(fs, args, 0, 0); err != nil {
@@ -522,7 +607,7 @@ func runList(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	runs, err := c.Runs(ctx, *repo, *limit)
+	runs, err := c.Runs(ctx, f, *limit)
 	if err != nil {
 		return err
 	}
@@ -728,10 +813,10 @@ func runCancel(ctx context.Context, a *App, args []string) error {
 	return nil
 }
 
-func runRerun(ctx context.Context, a *App, args []string) error {
-	fs := flag.NewFlagSet("run rerun", flag.ContinueOnError)
-	watch := fs.Bool("watch", false, "wait for the new run to finish, and fail if it does")
-	pos, err := flags(fs, args, 1, 1)
+// runApprove approves a run from a fork's pull request that waits for
+// approval, after you've read the pull request: its jobs run the fork's code.
+func runApprove(ctx context.Context, a *App, args []string) error {
+	pos, err := flags(flag.NewFlagSet("run approve", flag.ContinueOnError), args, 1, 1)
 	if err != nil {
 		return err
 	}
@@ -743,7 +828,51 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	newID, err := c.Rerun(ctx, id)
+	ids, err := c.Approve(ctx, id)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Stdout, "Approved %d run(s) of the pull request: %v\n", len(ids), ids)
+	return nil
+}
+
+func runRerun(ctx context.Context, a *App, args []string) error {
+	fs := flag.NewFlagSet("run rerun", flag.ContinueOnError)
+	watch := fs.Bool("watch", false, "wait for the new run to finish, and fail if it does")
+	failed := fs.Bool("failed", false, "re-run only the jobs that failed or were cancelled, and the jobs that need them")
+	job := fs.String("job", "", "re-run only this job (its ID, key or name) and the jobs that need it")
+	debug := fs.Bool("debug", false, "turn on debug logging (ACTIONS_STEP_DEBUG and ACTIONS_RUNNER_DEBUG)")
+	pos, err := flags(fs, args, 1, 1)
+	if err != nil {
+		return err
+	}
+	id, err := parseID("run", pos[0])
+	if err != nil {
+		return err
+	}
+	if *failed && *job != "" {
+		return errors.New("--failed and --job don't go together")
+	}
+	c, err := a.api()
+	if err != nil {
+		return err
+	}
+	opts := RerunOptions{Failed: *failed, Debug: *debug}
+	if *job != "" {
+		d, err := c.Run(ctx, id)
+		if err != nil {
+			return err
+		}
+		jobs, err := selectJobs(d.Jobs, *job, false)
+		if err != nil {
+			return err
+		}
+		if len(jobs) > 1 {
+			return fmt.Errorf("%q is %d jobs (a matrix?); pick one by its ID or full name", *job, len(jobs))
+		}
+		opts.JobID = jobs[0].ID
+	}
+	newID, err := c.Rerun(ctx, id, opts)
 	if err != nil {
 		return err
 	}
@@ -755,12 +884,17 @@ func runRerun(ctx context.Context, a *App, args []string) error {
 }
 
 // selectJobs picks a run's jobs by ID, key or name (sel "" for all), and
-// only failed ones if failed.
+// only failed ones if failed. Jobs that call a reusable workflow have no
+// logs of their own: selecting one selects the jobs of the workflow it calls.
 func selectJobs(jobs []Job, sel string, failed bool) ([]Job, error) {
 	var out []Job
 	id, _ := strconv.ParseInt(sel, 10, 64)
 	for _, j := range jobs {
-		if sel != "" && j.ID != id && j.Key != sel && j.Name != sel && !strings.HasPrefix(j.Name, sel+" (") {
+		if j.Uses != "" {
+			continue
+		}
+		if sel != "" && j.ID != id && j.Key != sel && j.Name != sel && !strings.HasPrefix(j.Name, sel+" (") &&
+			!strings.HasPrefix(j.Name, sel+" / ") && !calledBy(jobs, j.Name, id) {
 			continue
 		}
 		if failed && (j.Status != "completed" || j.Conclusion == "success" || j.Conclusion == "skipped") {
@@ -772,6 +906,17 @@ func selectJobs(jobs []Job, sel string, failed bool) ([]Job, error) {
 		return nil, fmt.Errorf("the run has no job %q", sel)
 	}
 	return out, nil
+}
+
+// calledBy reports whether the job named name is in a workflow the calling
+// job with ID id calls.
+func calledBy(jobs []Job, name string, id int64) bool {
+	for _, c := range jobs {
+		if c.ID == id && c.Uses != "" && strings.HasPrefix(name, c.Name+" / ") {
+			return true
+		}
+	}
+	return false
 }
 
 // planned says whether the run's workflow has a job sel (its key or name),
@@ -1108,14 +1253,15 @@ func tokenList(ctx context.Context, a *App, args []string) error {
 		if t.ExpiresAt != 0 {
 			exp = timestamp(t.ExpiresAt)
 		}
-		rows = append(rows, []string{strconv.FormatInt(t.ID, 10), t.Name, t.User, timestamp(t.CreatedAt), exp, ago(t.LastUsedAt)})
+		rows = append(rows, []string{strconv.FormatInt(t.ID, 10), t.Name, t.User, t.Scope(), timestamp(t.CreatedAt), exp, ago(t.LastUsedAt)})
 	}
-	return table(a.Stdout, "ID\tNAME\tUSER\tCREATED\tEXPIRES\tLAST USED", rows)
+	return table(a.Stdout, "ID\tNAME\tUSER\tSCOPE\tCREATED\tEXPIRES\tLAST USED", rows)
 }
 
 func tokenCreate(ctx context.Context, a *App, args []string) error {
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	expires := fs.Int("expires", 0, "days until it expires (0: never)")
+	role, repos := scopeFlags(fs)
 	pos, err := flags(fs, args, 1, 1)
 	if err != nil {
 		return err
@@ -1124,15 +1270,15 @@ func tokenCreate(ctx context.Context, a *App, args []string) error {
 	if err != nil {
 		return err
 	}
-	token, info, err := c.CreateToken(ctx, pos[0], *expires)
+	token, info, err := c.CreateToken(ctx, NewToken{Name: pos[0], ExpiresInDays: *expires, Role: *role, Repos: *repos})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintln(a.Stdout, token)
 	if info.ExpiresAt != 0 {
-		fmt.Fprintf(a.Stderr, "Token %d expires %s. It's shown only once.\n", info.ID, timestamp(info.ExpiresAt))
+		fmt.Fprintf(a.Stderr, "Token %d (scope %s) expires %s. It's shown only once.\n", info.ID, info.Scope(), timestamp(info.ExpiresAt))
 	} else {
-		fmt.Fprintf(a.Stderr, "Token %d doesn't expire. It's shown only once.\n", info.ID)
+		fmt.Fprintf(a.Stderr, "Token %d (scope %s) doesn't expire. It's shown only once.\n", info.ID, info.Scope())
 	}
 	return nil
 }
